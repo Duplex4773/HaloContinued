@@ -1,0 +1,12 @@
+[package]
+name = "hb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+hb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+[dev-dependencies]
+tempfile = "3.24.0"

@@ -1,0 +1,17 @@
+# Rust/build outputs
+/target/
+/dist/
+# Local validation, reference work and device diagnostics
+/validation-local/
+/*-probe.json
+*.log
+diagnostics.txt
+# Python development tools
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# OS/editor files
+.DS_Store
+Thumbs.db
+desktop.ini

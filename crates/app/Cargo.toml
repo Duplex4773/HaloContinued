@@ -1,0 +1,25 @@
+[package]
+name = "halo-continued"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "HaloContinued"
+path = "src/main.rs"
+
+[dependencies]
+hb-core.workspace = true
+hb-providers.workspace = true
+hb-windows.workspace = true
+hb-storage.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+windows = { workspace = true, features = ["Win32_System_Time"] }
+windows-numerics = "0.2.0"
+
+[build-dependencies]
+embed-resource = "3.0.11"
+
+[dev-dependencies]
+tempfile = "3.24.0"
