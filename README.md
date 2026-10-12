@@ -108,7 +108,7 @@ HID discovery and tray graphics, event-driven waits and batched SQLite writes
 limit background work. Charging frames are pre-rendered; the animation timer
 stops when no icons need it. Dashboard graphics are released when it closes,
 and hovering an icon does not query hardware. The standard executable is about
-**3.22 MiB**, including HIDAPI, SQLite and the MSVC runtime.
+**3.24 MiB**, including HIDAPI, SQLite and the MSVC runtime.
 
 **Controlled comparison, 10 October 2026:** one simulated mouse, three-minute
 samples after warm-up, fresh data and dashboard never opened. CPU percentages
@@ -142,6 +142,25 @@ speedup comparison with the table. The audit also removed work on unchanged empt
 provider results, reduced temporary allocations when loading saved estimates,
 and eliminated repeated string allocations in Insights queries.
 
+The **12 October performance audit** removed two-second Bluetooth checks when
+there are no links to monitor, and pauses configuration-device discovery while
+the dashboard is minimized or hidden. Repeated window visibility messages no
+longer enqueue duplicate work. Battery monitoring and automatic boost continue.
+History sampling now reuses bounded buffers and decodes full readings only for
+the graph points it keeps. A synthetic 43,200-row query was **21% faster**
+(78.76 to 62.38 ms, median of nine interleaved runs on the same warmed SQLite
+connection). A separate allocation fixture reduced temporary Rust allocation traffic
+from **4.63 MiB to 0.62 MiB**, with identical output. Those allocation totals are
+not resident RAM measurements; history processing runs only when requested.
+
+Background regression checks on 12 October used the same simulated workload:
+one three-minute run without animation and two three-minute runs with animation
+per build. The updated build recorded **0.026% CPU without animation** and
+**0.035–0.061% with animation**, versus 0.035% and 0.035–0.078% before. Mean private
+memory stayed around **5 MiB** (4.92–4.99 MiB after; 4.74–4.87 MiB before). These
+small CPU readings vary by a few Windows accounting ticks; the samples show no
+clear CPU regression, not a proven sustained reduction in background CPU or RAM.
+
 ## Build from source
 
 Requirements: Windows, Rust's MSVC toolchain (Rust 1.88 or newer), Visual Studio
@@ -163,8 +182,8 @@ and licences. Optional API/import validation uses `tools/validate-configuration.
 with ripgrep and Visual Studio's dumpbin installed.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Latest local validation: **677 passing tests**, with
-three opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
+storage and the application. Latest local validation: **682 passing tests**, with
+four opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
 

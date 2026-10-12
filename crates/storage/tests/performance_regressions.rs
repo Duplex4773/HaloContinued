@@ -1,5 +1,7 @@
 #[path = "../../core/tests/support/allocation_counter.rs"]
 mod allocation_counter;
+#[path = "support/usage_reference.rs"]
+mod usage_reference;
 use allocation_counter::{TrackingAllocator, measure};
 use hb_core::{
     BatteryInsights, Engine, Estimator, HistoryStore, InsightsBuilder, PollingRate, Reading,
@@ -10,6 +12,110 @@ use rusqlite::{Connection, params};
 
 #[global_allocator]
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+#[test]
+fn sampled_usage_matches_previous_output_with_bounded_allocation_traffic() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let mut store = Store::open(&path).unwrap();
+    for minute in 0..1440 {
+        let mut sample = reading(minute * 60, (100 - minute % 100) as u8);
+        if minute % 53 == 0 {
+            sample.connection = hb_core::Connection::Sleeping;
+        }
+        if minute % 61 == 0 {
+            sample.charging = Some(true);
+        }
+        if minute % 83 == 0 {
+            sample.level = None;
+        }
+        store
+            .record_usage(&UsageObservation {
+                reading: sample,
+                polling_rate: PollingRate::try_from(1000).ok(),
+                session: Some((minute / 100) as u64),
+            })
+            .unwrap();
+    }
+    store.flush().unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute("UPDATE readings SET payload='{}' WHERE ts=4200", [])
+        .unwrap();
+    db.execute(
+        "UPDATE usage_metadata SET session='damaged' WHERE ts=8400",
+        [],
+    )
+    .unwrap();
+    let until = 1439 * 60;
+    for seconds in [60, 12 * 3600, 30 * 86400] {
+        for width in [2, 3, 5, 64, 513] {
+            let actual = store
+                .query_usage("invented", until, seconds, width)
+                .unwrap();
+            let expected =
+                usage_reference::query_usage(&db, "invented", until, seconds, width).unwrap();
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{expected:?}"),
+                "seconds={seconds}, width={width}"
+            );
+        }
+    }
+    let (_, sampled) = measure(|| {
+        store
+            .query_usage("invented", until, 12 * 3600, 128)
+            .unwrap()
+    });
+    let (_, previous) =
+        measure(|| usage_reference::query_usage(&db, "invented", until, 12 * 3600, 128).unwrap());
+    assert!(
+        sampled.calls * 3 < previous.calls,
+        "sampled={sampled:?}, previous={previous:?}"
+    );
+    assert!(
+        sampled.bytes < previous.bytes,
+        "sampled={sampled:?}, previous={previous:?}"
+    );
+    println!("1,440-row usage graph: sampled={sampled:?}, previous={previous:?}");
+}
+
+#[test]
+#[ignore = "explicit 30-day history allocation measurement; no hardware"]
+fn thirty_day_usage_sampling_allocations() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let mut store = Store::open(&path).unwrap();
+    for minute in 0..43_200 {
+        let mut sample = reading(minute * 60, (100 - (minute % 3000) / 30) as u8);
+        sample.name = "Synthetic mouse".into();
+        store
+            .record_usage(&UsageObservation {
+                reading: sample,
+                polling_rate: PollingRate::try_from(1000).ok(),
+                session: Some(1),
+            })
+            .unwrap();
+    }
+    store.flush().unwrap();
+    let db = Connection::open(path).unwrap();
+    db.execute_batch("PRAGMA cache_size=-512;").unwrap();
+    let until = 43_199 * 60;
+    let expected = usage_reference::query_usage(&db, "invented", until, 12 * 3600, 1000).unwrap();
+    let actual = store
+        .query_usage("invented", until, 12 * 3600, 1000)
+        .unwrap();
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    let (_, sampled) = measure(|| {
+        store
+            .query_usage("invented", until, 12 * 3600, 1000)
+            .unwrap()
+    });
+    let (_, previous) =
+        measure(|| usage_reference::query_usage(&db, "invented", until, 12 * 3600, 1000).unwrap());
+    println!("43,200-row usage graph allocations: previous={previous:?}; sampled={sampled:?}");
+    assert!(sampled.calls * 10 < previous.calls);
+    assert!(sampled.bytes * 5 < previous.bytes);
+}
 
 #[test]
 fn checkpoint_load_avoids_json_tree_and_recovers_valid_neighbours() {

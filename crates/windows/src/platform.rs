@@ -394,16 +394,22 @@ impl BatteryProvider for BluetoothProvider {
         BluetoothProvider::invalidate(self);
     }
     fn next_poll_delay(&self) -> Option<Duration> {
-        Some(
-            self.retries
-                .iter()
-                .copied()
-                .min()
-                .unwrap_or(self.next_full)
-                .min(self.next_full)
-                .saturating_sub(self.last_poll)
-                .min(Duration::from_secs(2)),
-        )
+        let discovery = self
+            .retries
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(self.next_full)
+            .min(self.next_full)
+            .saturating_sub(self.last_poll);
+        // Connection events still invalidate discovery immediately. With no
+        // open links there is no connection status to check every two seconds;
+        // retain the scheduled arrival retries and minute recovery discovery.
+        Some(if self.links.is_empty() {
+            discovery
+        } else {
+            discovery.min(Duration::from_secs(2))
+        })
     }
     fn diagnostics(&self) -> Vec<String> {
         self.diagnostics.clone()
@@ -719,7 +725,28 @@ mod scheduling_tests {
         let result = p.poll(&NoHid, &context).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].timestamp, 99);
-        assert_eq!(p.next_poll_delay(), Some(Duration::from_secs(2)));
+        assert_eq!(p.next_poll_delay(), Some(Duration::from_secs(59)));
+    }
+    #[test]
+    fn empty_bluetooth_inventory_waits_for_discovery_and_keeps_arrival_retries() {
+        let mut provider = BluetoothProvider::default();
+        provider.complete_snapshot(Ok(Vec::new()), Duration::ZERO);
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(60)));
+        provider.invalidate();
+        assert!(provider.refresh_due(Duration::from_secs(10)));
+        provider.complete_snapshot(Ok(Vec::new()), Duration::from_secs(10));
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(3)));
+        assert!(provider.refresh_due(Duration::from_secs(13)));
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(5)));
+        assert!(provider.refresh_due(Duration::from_secs(18)));
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(7)));
+        assert!(provider.refresh_due(Duration::from_secs(25)));
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(45)));
+        provider.complete_snapshot(
+            Err(ProviderError::new("synthetic discovery failure")),
+            Duration::from_secs(25),
+        );
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(15)));
     }
     #[test]
     fn failed_bluetooth_snapshot_stays_failed_until_successful_refresh() {

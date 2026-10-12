@@ -1,4 +1,8 @@
 //! Bounded, batched history storage; configuration never shares upstream's folder.
+#[cfg(test)]
+#[path = "../tests/support/usage_reference.rs"]
+mod usage_reference;
+mod usage_sampler;
 use hb_core::{
     BatteryInsights, Estimator, HistoryStore, InsightsBuilder, PollingActivity,
     PollingActivityKind, PollingRate, ProviderError, Reading, Settings, Snapshot, UsageObservation,
@@ -641,42 +645,45 @@ impl Store {
         seconds: i64,
         max_points: usize,
     ) -> Result<hb_core::HistorySeries, ProviderError> {
-        use hb_core::{HistoryAxis, HistorySample, HistorySeries};
+        use hb_core::{HistoryAxis, HistorySeries};
+        use usage_sampler::Sample;
         let limit = max_points.clamp(2, 4096);
-        let total = self.stream_usage(key, until, |_, _| {})?;
+        let total = self.stream_usage(key, until, |_, _, _| {})?;
         let since = total.saturating_sub(seconds.max(1)).max(0);
         let buckets = limit.saturating_sub(2) / 2;
-        let mut extremes: Vec<Option<(HistorySample, HistorySample)>> = vec![None; buckets];
-        let mut baseline = None;
+        let mut extremes: Vec<Option<(Sample, Sample)>> = vec![None; buckets];
+        let mut baseline: Option<Sample> = None;
         let mut first = None;
-        let mut last = None;
-        self.stream_usage(key, until, |reading, position| {
+        let mut last: Option<Sample> = None;
+        self.stream_usage(key, until, |payload, reading, position| {
             if !reading.level.is_some_and(|level| level <= 100) {
                 return;
             }
-            let sample = HistorySample { reading, position };
             if position < since {
-                baseline = Some(sample);
+                baseline
+                    .get_or_insert_with(Sample::default)
+                    .replace(payload, reading, position);
                 return;
             }
+            let sample = last.get_or_insert_with(Sample::default);
+            sample.replace(payload, reading, position);
             if first.is_none() {
                 first = Some(baseline.take().unwrap_or_else(|| sample.clone()));
             }
-            last = Some(sample.clone());
             if buckets > 0 {
                 let span = total.saturating_sub(since).max(1);
                 let bucket = ((position.saturating_sub(since) as i128 * buckets as i128)
                     / span as i128)
                     .min(buckets as i128 - 1) as usize;
                 if let Some((low, high)) = &mut extremes[bucket] {
-                    if sample.reading.level < low.reading.level {
-                        *low = sample.clone();
+                    if sample.level < low.level {
+                        low.replace(payload, reading, position);
                     }
-                    if sample.reading.level > high.reading.level {
-                        *high = sample;
+                    if sample.level > high.level {
+                        high.replace(payload, reading, position);
                     }
                 } else {
-                    extremes[bucket] = Some((sample.clone(), sample));
+                    extremes[bucket] = Some((sample.clone(), sample.clone()));
                 }
             }
         })?;
@@ -690,10 +697,13 @@ impl Store {
         if let Some(sample) = last {
             samples.push(sample);
         }
-        samples.sort_by_key(|sample| sample.reading.timestamp);
-        samples.dedup_by_key(|sample| sample.reading.timestamp);
+        samples.sort_by_key(|sample| sample.timestamp);
+        samples.dedup_by_key(|sample| sample.timestamp);
         Ok(HistorySeries {
-            samples,
+            samples: samples
+                .into_iter()
+                .map(Sample::decode)
+                .collect::<Result<_, _>>()?,
             axis: HistoryAxis::Usage,
             since,
             until: total,
@@ -703,7 +713,7 @@ impl Store {
         &self,
         key: &str,
         until: i64,
-        mut visit: impl FnMut(Reading, i64),
+        mut visit: impl FnMut(&str, &usage_sampler::TimingReading<'_>, i64),
     ) -> Result<i64, ProviderError> {
         let sql = if self.has_usage_metadata {
             "SELECT r.ts,r.payload,m.session FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts"
@@ -721,7 +731,8 @@ impl Store {
         while let Some(row) = rows.next().map_err(sql_error)? {
             let timestamp: i64 = row.get(0).map_err(sql_error)?;
             let payload = row_text(row, 1).map_err(sql_error)?;
-            let Ok(reading) = serde_json::from_str::<Reading>(payload) else {
+            let Ok(reading) = serde_json::from_str::<usage_sampler::TimingReading<'_>>(payload)
+            else {
                 previous = None;
                 continue;
             };
@@ -729,12 +740,6 @@ impl Store {
                 previous = None;
                 continue;
             }
-            let awake = |r: &Reading| {
-                r.online()
-                    && r.level.is_some_and(|level| level <= 100)
-                    && r.charging == Some(false)
-                    && !r.charging_inferred
-            };
             let session = match row.get_ref(2).map_err(sql_error)? {
                 rusqlite::types::ValueRef::Null => None,
                 value => match value
@@ -745,12 +750,12 @@ impl Store {
                     Some(session) => Some(session),
                     None => {
                         previous = None;
-                        visit(reading, total);
+                        visit(payload, &reading, total);
                         continue;
                     }
                 },
             };
-            let reading_awake = awake(&reading);
+            let reading_awake = reading.awake();
             if let Some((timestamp, true, previous_session)) = previous
                 && reading_awake
                 && previous_session == session
@@ -762,7 +767,7 @@ impl Store {
                 total = total.saturating_add(reading.timestamp - timestamp);
             }
             previous = Some((reading.timestamp, reading_awake, session));
-            visit(reading, total);
+            visit(payload, &reading, total);
         }
         Ok(total)
     }
@@ -1787,12 +1792,43 @@ mod tests {
             }
         }
         transaction.commit().unwrap();
-        let start = std::time::Instant::now();
         let series = store
             .query_usage("usage", 43199 * 60, 12 * 3600, 1000)
             .unwrap();
-        println!("43200 rows, two passes: {:?}", start.elapsed());
         assert_eq!(series.until, 43199 * 60);
         assert!(series.samples.len() <= 1000);
+        let reference =
+            usage_reference::query_usage(&store.db, "usage", 43199 * 60, 12 * 3600, 1000).unwrap();
+        assert_eq!(format!("{series:?}"), format!("{reference:?}"));
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        // Use the same SQLite connection, page cache and warmed database for
+        // both paths. Alternate query order; seeding is outside the timings.
+        for round in 0..9 {
+            for optimized in [round % 2 == 0, round % 2 != 0] {
+                let start = std::time::Instant::now();
+                let result = if optimized {
+                    store
+                        .query_usage("usage", 43199 * 60, 12 * 3600, 1000)
+                        .unwrap()
+                } else {
+                    usage_reference::query_usage(&store.db, "usage", 43199 * 60, 12 * 3600, 1000)
+                        .unwrap()
+                };
+                std::hint::black_box(result);
+                let milliseconds = start.elapsed().as_secs_f64() * 1000.;
+                if optimized {
+                    after.push(milliseconds)
+                } else {
+                    before.push(milliseconds)
+                }
+            }
+        }
+        before.sort_by(f64::total_cmp);
+        after.sort_by(f64::total_cmp);
+        println!(
+            "43,200-row usage query, shared connection: previous median {:.3} ms, sampled median {:.3} ms; before {before:?}; after {after:?}",
+            before[4], after[4]
+        );
     }
 }

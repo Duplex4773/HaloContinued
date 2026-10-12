@@ -21,6 +21,46 @@ fn percent(text: &str) -> Option<f64> {
     value.is_finite().then(|| (value / 100.0).clamp(0.0, 1.0))
 }
 
+// Share wrapping metrics with the painter. Reflow only when visible content changes.
+fn row_height(dc: HDC, text: &str, width: i32, dpi: i32) -> i32 {
+    let mut bounds = RECT {
+        right: width,
+        ..Default::default()
+    };
+    let mut text: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        DrawTextW(
+            dc,
+            &mut text,
+            &mut bounds,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
+    }
+    bounds.bottom.max(20 * dpi / 96)
+}
+pub fn panel_height(hwnd: HWND, text: &str, width: i32, mix: bool) -> i32 {
+    unsafe {
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
+        let dc = GetDC(Some(hwnd));
+        if dc.is_invalid() {
+            return 260;
+        }
+        let saved = SaveDC(dc);
+        let font = HFONT(SendMessageW(hwnd, WM_GETFONT, None, None).0 as _);
+        SelectObject(dc, font.into());
+        let gap = (if mix { 7 } else { 10 }) * dpi / 96;
+        let height = 50 * dpi / 96
+            + text
+                .lines()
+                .skip(1)
+                .filter(|row| !row.is_empty())
+                .map(|row| row_height(dc, row, (width - 32).max(1) * dpi / 96, dpi) + gap)
+                .sum::<i32>();
+        let _ = RestoreDC(dc, saved);
+        ReleaseDC(Some(hwnd), dc);
+        ((height * 96 + dpi - 1) / dpi).max(92)
+    }
+}
 pub fn draw(item: &DRAWITEMSTRUCT, palette: Palette, large_font: HFONT) {
     unsafe {
         let dc = item.hDC;
@@ -117,20 +157,7 @@ pub fn draw(item: &DRAWITEMSTRUCT, palette: Palette, large_font: HFONT) {
                         progress(row)
                     };
                     SelectObject(dc, normal.into());
-                    let mut measure = RECT {
-                        left,
-                        top: y,
-                        right,
-                        bottom: y,
-                    };
-                    let mut caption: Vec<u16> = row.encode_utf16().collect();
-                    DrawTextW(
-                        dc,
-                        &mut caption,
-                        &mut measure,
-                        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
-                    );
-                    let height = (measure.bottom - y).max(px(20));
+                    let height = row_height(dc, row, right - left, dpi);
                     text(
                         row,
                         left,

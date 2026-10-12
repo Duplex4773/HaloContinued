@@ -99,6 +99,16 @@ fn duration_label(seconds: i64, use_days: bool) -> String {
     }
 }
 
+fn battery_ticks(height: f32) -> &'static [i32] {
+    if height >= 120.0 {
+        &[0, 25, 50, 75, 100]
+    } else if height >= 64.0 {
+        &[0, 50, 100]
+    } else {
+        &[0, 100]
+    }
+}
+
 fn axis_labels(axis: HistoryAxis, span: i64) -> [String; 5] {
     std::array::from_fn(|index| match axis {
         HistoryAxis::Usage => duration_label(span.saturating_mul(index as i64) / 4, false),
@@ -261,7 +271,7 @@ impl Chart {
             self.target.Clear(Some(&Palette::d2d(palette.background)));
             let grid = &self.grid;
             let line = &self.line;
-            for level in [0, 25, 50, 75, 100] {
+            for &level in battery_ticks((bottom - top) / self.scale) {
                 let y = bottom - (bottom - top) * level as f32 / 100.;
                 self.target.DrawLine(
                     Vector2 { X: left, Y: y },
@@ -306,7 +316,7 @@ impl Chart {
                     DWRITE_TEXT_ALIGNMENT_TRAILING,
                 )?;
             }
-            for level in [0, 25, 50, 75, 100] {
+            for &level in battery_ticks((bottom - top) / self.scale) {
                 let y = bottom - (bottom - top) * level as f32 / 100.;
                 text(
                     &format!("{level}%"),
@@ -389,6 +399,17 @@ mod tests {
         history_trace(&series.samples, since, until).collect()
     }
 
+    #[test]
+    fn compact_history_keeps_percentage_labels_separated() {
+        for height in [40.0, 63.0, 64.0, 100.0, 120.0, 500.0] {
+            let levels = battery_ticks(height);
+            assert_eq!(levels.first(), Some(&0));
+            assert_eq!(levels.last(), Some(&100));
+            for pair in levels.windows(2) {
+                assert!(height * (pair[1] - pair[0]) as f32 / 100.0 >= 24.0);
+            }
+        }
+    }
     #[test]
     fn sleep_and_missing_samples_hold_the_last_level_until_wake_and_now() {
         let rows = [
@@ -551,6 +572,13 @@ mod tests {
                         )
                         .unwrap();
                 }
+                chart
+                    .paint(
+                        (840.0 * chart.scale) as u32,
+                        (385.0 * chart.scale) as u32,
+                        &HistorySeries::default(),
+                    )
+                    .unwrap();
                 chart.paint(960, 900, &HistorySeries::default()).unwrap();
                 let size = chart.target.GetPixelSize();
                 assert_eq!((size.width, size.height), (960, 900));

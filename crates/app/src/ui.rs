@@ -159,6 +159,7 @@ fn user_message(message: &str) -> &str {
         || message.starts_with("Low battery alert ")
         || message == "Settings saved"
         || message == "Device settings saved"
+        || message == "Device preferences reset"
         || message == "Automatic boost settings saved"
         || message == "Low-battery settings saved"
     {
@@ -224,6 +225,56 @@ fn polling_message(message: &str) -> &str {
         return "This device did not report its current rate.";
     }
     "Couldn't confirm the rate. Wake the device and select Refresh rate."
+}
+fn device_control_error(message: &str, changed: bool, setting: &str, readable: bool) -> String {
+    if changed {
+        return if readable {
+            format!("The {setting} may have changed. Select Read current before trying again.")
+        } else {
+            format!("The {setting} may have changed. Check the mouse before trying again.")
+        };
+    }
+    let message = message.to_ascii_lowercase();
+    let text = if message.contains("backup") || message.contains("recovery") {
+        "Couldn't save the original settings. Check that the app's data folder is writable, then try again."
+    } else if message.contains("game") || message.contains("presentation") {
+        "Close the game or presentation before changing this setting."
+    } else if message.contains("busy") {
+        "The mouse is busy. Wait a moment, then try again."
+    } else if message.contains("unsupported")
+        || message.contains("not support")
+        || message.contains("does not accept")
+    {
+        "This setting is not supported on the current connection."
+    } else if message.contains("range")
+        || message.contains("at least")
+        || message.contains("duration")
+    {
+        "Choose a value within the supported range shown above."
+    } else if message.contains("cancel")
+        || message.contains("changed")
+        || message.contains("profile")
+        || message.contains("stage")
+    {
+        if readable {
+            "The device or its settings changed. Read the current setting before trying again."
+        } else {
+            "The device or its settings changed. Reconnect the mouse before trying again."
+        }
+    } else if message.contains("read the current") || message.contains("read current") {
+        "Select Read current before applying a change."
+    } else if message.contains("permission") || message.contains("disabled") {
+        "Turn on Allow device settings changes in Settings first."
+    } else {
+        "Couldn't contact the mouse. Wake or reconnect it, then try again."
+    };
+    text.into()
+}
+fn settings_number(text: &str, minimum: u64, maximum: u64) -> Option<u64> {
+    text.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| (minimum..=maximum).contains(n))
 }
 fn polling_unavailable(device: &ConfigurationDevice) -> &'static str {
     if device.source == "corsair" {
@@ -813,7 +864,7 @@ impl InsightsUi {
         true
     }
 }
-const INSIGHTS_EMPTY: &str = "To compare rates, allow polling-rate changes in Settings, then select Refresh rate in Devices or the tray menu. Only rates confirmed by the device are included.";
+const INSIGHTS_EMPTY: &str = "To compare rates, turn on Allow device settings changes in Settings, then select Refresh rate in Devices or the tray menu. Only rates confirmed by the device are included.";
 fn insight_coverage_text(data: &BatteryInsights) -> String {
     let c = &data.coverage;
     format!(
@@ -878,8 +929,21 @@ fn rate_insight_text(rate: &RateInsight) -> String {
     } else {
         "Learning combines separate sessions. Rate changes and gaps are excluded."
     };
+    let evidence = if estimate.is_some() {
+        format!(
+            "Estimate based on · {} of battery use\nBattery used in that time · {}%",
+            insight_hours(rate.projection_seconds),
+            rate.projection_consumed_percent
+        )
+    } else {
+        format!(
+            "Learning time · {} / 30 min\nBattery used · {} / 3 percentage points",
+            rate.projection_seconds / 60,
+            rate.projection_consumed_percent
+        )
+    };
     format!(
-        "{} Hz · {}\nFull battery · {}\nAt this rate, time left · {}\nTime between drops · {} / 30 min\nBattery drop · {} / 3 percentage points\n{explanation}",
+        "{} Hz · {}\nFull battery · {}\nAt this rate, time left · {}\n{evidence}\n{explanation}",
         rate.hz,
         if estimate.is_none() {
             "Still learning"
@@ -894,8 +958,6 @@ fn rate_insight_text(rate: &RateInsight) -> String {
         remaining
             .map(|h| insight_estimate(Some(h)))
             .unwrap_or_else(|| "Waiting for a fresh reading".into()),
-        rate.projection_seconds / 60,
-        rate.projection_consumed_percent
     )
 }
 fn rate_insight_row(rate: &RateInsight) -> String {
@@ -1611,6 +1673,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(0)
             }
             WM_SIZE => {
+                if Some(hwnd) == s.dashboard {
+                    s.configuration_visibility();
+                }
                 if Some(hwnd) == s.dashboard && wp.0 as u32 != SIZE_MINIMIZED {
                     s.layout_page();
                 }
@@ -1620,6 +1685,16 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
+                LRESULT(0)
+            }
+            WM_SHOWWINDOW if Some(hwnd) == s.dashboard => {
+                // WM_SHOWWINDOW precedes the native visibility flag update.
+                // Defer reading that state until ShowWindow has completed.
+                let _ = PostMessageW(Some(s.monitor), WM_APP + 12, WPARAM(0), LPARAM(0));
+                LRESULT(0)
+            }
+            m if m == WM_APP + 12 => {
+                s.configuration_visibility();
                 LRESULT(0)
             }
             WM_MOUSEWHEEL if Some(hwnd) == s.dashboard && s.page_host.is_some() => {
@@ -2462,6 +2537,7 @@ impl State {
             if let Some(h) = self.dashboard {
                 if self.owns_dashboard(h) {
                     let _ = ShowWindow(h, SW_RESTORE);
+                    self.configuration_visibility();
                     let _ = SetForegroundWindow(h);
                     return;
                 }
@@ -2509,13 +2585,17 @@ impl State {
                             );
                         }
                     }
-                    self.configuration_visibility();
+                    // Prepare the requested Devices page and its initial read
+                    // before showing the fully built window (avoids a flash).
+                    self.runtime
+                        .send(Command::ConfigurationVisible(self.page == 1));
                     self.refresh_theme();
                     self.polling.abandon();
                     self.build();
+                    let _ = ShowWindow(h, SW_SHOW);
+                    self.configuration_visibility();
                     self.read_polling();
                     self.query_insights();
-                    let _ = ShowWindow(h, SW_SHOW);
                     let _ = SetForegroundWindow(h);
                 }
                 Err(e) => self.error = e.to_string(),
@@ -2720,7 +2800,7 @@ impl State {
                             .collect::<Vec<_>>();
                         self.combo(14, &labels, chosen, 150, 294, 215);
                         self.button(15, "&Save changes", 20, 374, 160);
-                        self.button(16, "Reset device settings", 192, 374, 190);
+                        self.button(16, "Reset preferences", 192, 374, 190);
                     } else {
                         self.heading(
                             88,
@@ -3108,7 +3188,7 @@ impl State {
             self.set_control_text(78, &self.insights.status);
         }
     }
-    fn render_insights(&self) {
+    fn render_insights(&mut self) {
         if self.dashboard.is_none() || self.page != 6 {
             return;
         }
@@ -3119,6 +3199,7 @@ impl State {
             .and_then(|d| self.settings.device(&d.reading.key))
             .and_then(|p| p.fullscreen_boost_rate)
             .filter(|_| self.settings.polling_controls);
+        let _redraw = DashboardRedraw::new(self.dashboard.unwrap());
         self.render_insight_cards(boost);
         let prior_choices = [self.text(70), self.text(71)];
         for id in [70, 71] {
@@ -3182,10 +3263,11 @@ impl State {
         self.insights_details();
         self.set_control_text(78, &self.insights.status);
     }
-    fn insights_details(&self) {
+    fn insights_details(&mut self) {
         if self.dashboard.is_none() || self.page != 6 {
             return;
         }
+        let _redraw = DashboardRedraw::new(self.dashboard.unwrap());
         let selected = |id| {
             self.controls.get(&id).map_or(0, |h| unsafe {
                 send(*h, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0.max(0) as usize
@@ -3229,9 +3311,99 @@ impl State {
                     .into()
             });
         self.set_control_text(76, &text);
+        self.layout_insight_content();
+    }
+    fn insight_polling_supported(&self) -> bool {
+        self.snapshot.devices.get(self.selected).is_some_and(|d| {
+            self.has_polling_controls(&ConfigurationDevice::from_reading(&d.reading))
+        })
+    }
+    fn layout_insight_content(&mut self) {
+        if self.page != 6 || self.page_host.is_none() {
+            return;
+        }
+        let polling = self.insight_polling_supported();
+        let position = |state: &Self, id, x, y, width, height| {
+            state.position_control(id, x, y - PAGE_TOP - state.page_scroll, width, height);
+        };
+        let height = |id, width, minimum| {
+            self.controls.get(&id).map_or(minimum, |h| {
+                crate::dashboard_widgets::panel_height(*h, &self.text(id), width, id == 410)
+                    .max(minimum)
+            })
+        };
+        for id in [73, 410, 411, 80, 70, 74] {
+            if let Some(control) = self.controls.get(&id) {
+                unsafe {
+                    let _ = ShowWindow(*control, if polling { SW_SHOW } else { SW_HIDE });
+                }
+            }
+        }
+        let session_y = if polling {
+            let habits_height = height(410, 370, 172).max(height(411, 374, 172));
+            position(self, 410, 20, 388, 370, habits_height);
+            position(self, 411, 406, 388, 374, habits_height);
+            let rate_y = 388 + habits_height + 26;
+            position(self, 80, 20, rate_y, 760, 28);
+            position(self, 70, 20, rate_y + 42, 760, 280);
+            let rate_height = height(74, 760, 160);
+            position(self, 74, 20, rate_y + 86, 760, rate_height);
+            rate_y + 86 + rate_height + 24
+        } else {
+            348
+        };
+        position(self, 75, 20, session_y, 760, 28);
+        position(self, 71, 20, session_y + 42, 760, 280);
+        let session_height = height(76, 760, 170);
+        position(self, 76, 20, session_y + 86, 760, session_height);
+        let note_y = session_y + 86 + session_height + 16;
+        position(self, 77, 20, note_y, 760, 48);
+        self.page_height = note_y + 64 - PAGE_TOP;
+        self.layout_page();
     }
     fn render_insight_cards(&self, boost: Option<PollingRate>) {
         let data = self.insights.data.as_ref();
+        if !self.insight_polling_supported() {
+            let device = self.snapshot.devices.get(self.selected);
+            let remaining = device
+                .filter(|d| d.reading.online() && d.reading.charging != Some(true))
+                .and_then(|d| d.seconds_left);
+            let estimate = remaining
+                .map(|s| insight_estimate(Some(s as f64 / 3600.0)))
+                .unwrap_or_else(|| {
+                    if device.is_some() {
+                        "Not available".into()
+                    } else {
+                        "—".into()
+                    }
+                });
+            self.set_control_text(
+                400,
+                &format!("Time left\n{estimate}\nBased on recorded battery use"),
+            );
+            self.set_control_text(
+                401,
+                &format!(
+                    "Recorded use\n{}\nOver the last 30 days",
+                    data.map(|d| insight_hours(d.coverage.awake_seconds))
+                        .unwrap_or_else(|| "—".into())
+                ),
+            );
+            self.set_control_text(
+                402,
+                &format!(
+                    "Battery level\n{}\nLatest available reading",
+                    device
+                        .and_then(|d| d.reading.level)
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "—".into())
+                ),
+            );
+            self.set_control_text(79, if device.is_some() {
+                "Polling-rate comparisons are unavailable for this device. Its recorded battery use and sessions appear below."
+            } else { "Connect or wake a battery-powered device, then select Refresh to get started." });
+            return;
+        }
         let prediction = data
             .map(|d| d.adaptive_prediction(boost, None))
             .unwrap_or_default();
@@ -3376,7 +3548,7 @@ impl State {
                     .collect();
                 let value = serde_json::json!({"data_folder":self.dir,"snapshot":self.snapshot,"providers":self.diagnostics,"settings":self.settings,"application_error":self.error,
                     "polling_messages":self.polling.status,"tray_polling_messages":self.tray_polling.status,
-                    "polling_readings":readings,"insights_debug":format!("{:?}",self.insights.data)});
+                    "polling_readings":readings,"dpi_debug":format!("{:?}",self.dpi.outcome),"sleep_debug":format!("{:?}",self.sleep.outcome),"insights_debug":format!("{:?}",self.insights.data)});
                 self.error = match hb_storage::atomic_write(
                     &path,
                     &serde_json::to_vec_pretty(&value).unwrap(),
@@ -3453,6 +3625,15 @@ impl State {
                     self.set_control_text(95, user_message(&self.error));
                 }
             }
+            53 => {
+                self.command(3, 0);
+                if let Some(control) = self.controls.get(&112) {
+                    unsafe {
+                        let _ = SetFocus(Some(*control));
+                    }
+                    self.keep_focus_visible();
+                }
+            }
             40 => self.apply_polling(false),
             41 => self.read_polling(),
             42 => self.apply_polling(true),
@@ -3488,8 +3669,7 @@ impl State {
                     let low = match device_threshold(&self.text(13)) {
                         Ok(low) => low,
                         Err(e) => {
-                            self.error = e.into();
-                            self.set_control_text(95, user_message(&self.error));
+                            self.invalid_field(13, e);
                             return;
                         }
                     };
@@ -3539,14 +3719,24 @@ impl State {
             }
             16 => {
                 if let Some((device, battery)) = self.current_device() {
+                    let mut draft = self.capture_form(true);
+                    draft.text.retain(|(id, _)| !matches!(id, 11 | 13));
+                    draft.checks.retain(|(id, _)| *id != 12);
+                    draft.choices.retain(|(id, _)| *id != 14);
                     if battery.is_some() {
-                        self.settings.reset_device(&device.key);
+                        let preferences = self.settings.device_mut(&device.key);
+                        preferences.name = None;
+                        preferences.hidden = false;
+                        preferences.icon = None;
+                        preferences.low = None;
                     } else {
                         self.settings.device_mut(&device.key).name = None;
                     }
                     self.save();
                     self.device_form_key = None;
+                    self.error = "Device preferences reset".into();
                     self.build();
+                    self.restore_form(draft);
                 }
             }
             210 => {
@@ -3554,24 +3744,29 @@ impl State {
                 for (i, (key, _)) in CHECKS.iter().enumerate() {
                     value[*key] = self.checked(setting_check_id(i)).into()
                 }
-                let interval = self
-                    .text(201)
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|n| (5..=3600).contains(n));
-                let low = self.text(203).parse::<u8>().ok().filter(|n| *n <= 100);
-                let warning = self.text(215).parse::<u8>().ok().filter(|n| *n <= 100);
-                if interval.is_none() || low.is_none() || warning.is_none() {
-                    self.error =
-                        "Enter 5–3600 seconds and battery percentages from 0 to 100.".into();
-                    self.set_control_text(95, user_message(&self.error));
+                let Some(interval) = settings_number(&self.text(201), 5, 3600) else {
+                    self.invalid_field(
+                        201,
+                        "Enter a battery check interval from 5 to 3600 seconds.",
+                    );
                     return;
-                }
+                };
+                let Some(low) = settings_number(&self.text(203), 0, 100) else {
+                    self.invalid_field(
+                        203,
+                        "Enter a default low-battery alert from 0 to 100% (0 turns it off).",
+                    );
+                    return;
+                };
+                let Some(warning) = settings_number(&self.text(215), 0, 100) else {
+                    self.invalid_field(215, "Enter an orange warning level from 0 to 100%.");
+                    return;
+                };
                 value["polling_controls"] = self.checked(112).into();
                 value["restore_polling_on_startup"] = self.checked(113).into();
-                value["interval"] = interval.unwrap().into();
-                value["low"] = low.unwrap().into();
-                value["warning_level"] = warning.unwrap().into();
+                value["interval"] = interval.into();
+                value["low"] = low.into();
+                value["warning_level"] = warning.into();
                 value["icon_theme"] =
                     ["auto", "white", "black", "windows", "topbar"][self.choice(205).min(4)].into();
                 let repo = self.text(209);
@@ -3716,8 +3911,13 @@ impl State {
     }
     fn configuration_visibility(&self) {
         self.runtime.send(Command::ConfigurationVisible(
-            self.dashboard.is_some() && self.page == 1,
+            self.dashboard_visible() && self.page == 1,
         ));
+    }
+    fn dashboard_visible(&self) -> bool {
+        self.dashboard.is_some_and(|hwnd| unsafe {
+            IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool()
+        })
     }
     fn device_rows(&self) -> Vec<(ConfigurationDevice, Option<DeviceView>)> {
         merged_device_rows(&self.snapshot.devices, &self.configuration_devices)
@@ -3735,10 +3935,35 @@ impl State {
             .and_then(|p| p.name.clone())
             .unwrap_or_else(|| device.name.clone())
     }
+    fn has_polling_controls(&self, device: &ConfigurationDevice) -> bool {
+        // A supported model with an unavailable connection still needs its recovery message.
+        // This is a visibility hint only; the original capability guards every request.
+        let mut model = device.clone();
+        model.capability = PollingCapability::ReadWrite;
+        hb_providers::controls::polling_menu_candidate(&model)
+            || (device.kind == "keyboard" && self.configuration_devices.iter().any(|d| d == device))
+    }
     fn visible_polling_device(&self) -> Option<ConfigurationDevice> {
         (self.dashboard.is_some() && self.page == 1 && self.settings.polling_controls)
             .then(|| self.current_device().map(|(d, _)| d))
             .flatten()
+            .filter(|device| self.has_polling_controls(device))
+    }
+    fn invalid_field(&mut self, id: u16, message: &str) {
+        self.error = message.into();
+        self.set_control_text(95, message);
+        if let Some(control) = self.controls.get(&id) {
+            unsafe {
+                let _ = SetFocus(Some(*control));
+                send(
+                    *control,
+                    windows::Win32::UI::Controls::EM_SETSEL,
+                    WPARAM(0),
+                    LPARAM(-1),
+                );
+            }
+            self.keep_focus_visible();
+        }
     }
     fn enable_control(&self, id: u16, enabled: bool) {
         if let Some(h) = self.controls.get(&id) {
@@ -3767,7 +3992,7 @@ impl State {
             .0
         });
         self.page_height = if self.current_device().is_some() {
-            708
+            426
         } else {
             220
         } - PAGE_TOP;
@@ -3810,9 +4035,13 @@ impl State {
                 }
             }
         }
-        if self.current_device().is_none() {
+        if !self
+            .current_device()
+            .is_some_and(|(d, _)| self.has_polling_controls(&d))
+        {
             return;
         }
+        self.page_height = 708 - PAGE_TOP;
         self.heading(98, "Polling rate", 20, 434, 750);
         self.control(
             99,
@@ -3837,14 +4066,22 @@ impl State {
                         _ => None,
                     })
                     .unwrap_or_else(|| {
-                        "Allow device settings changes in Settings to use this option.".into()
+                        "Turn on Allow device settings changes in Settings to use these controls."
+                            .into()
                     }),
                 WINDOW_STYLE::default(),
                 20,
                 510,
                 750,
-                80,
+                48,
             );
+            if self
+                .current_device()
+                .is_some_and(|(d, _)| matches!(d.capability, PollingCapability::ReadWrite))
+            {
+                self.button(53, "Open Settings", 20, 572, 175);
+            }
+            self.page_height = 626 - PAGE_TOP;
             return;
         }
         let Some(reading) = self.visible_polling_device() else {
@@ -4030,6 +4267,9 @@ impl State {
             .or_else(|| hb_providers::dpi::model_limits(&device))
     }
     fn queue_dpi(&mut self, value: Option<DpiValue>) {
+        if !self.runtime.configuration_visible() {
+            return;
+        }
         let Some((device, _)) = self.current_device() else {
             return;
         };
@@ -4152,14 +4392,7 @@ impl State {
             "Allow device settings changes in Settings first.".into()
         } else if let Some(o) = &observed {
             if let Some(e) = &o.failure {
-                format!(
-                    "{e}{}",
-                    if o.may_have_changed {
-                        " The DPI may have changed; read it again."
-                    } else {
-                        ""
-                    }
-                )
+                device_control_error(e, o.may_have_changed, "DPI", true)
             } else if o.may_have_changed {
                 "DPI updated and checked. The original was saved in the app's dpi-backups folder."
                     .into()
@@ -4200,6 +4433,7 @@ impl State {
         self.page_height = y + 214 - PAGE_TOP;
         self.heading(430, "Sleep when idle", 20, y, 750);
         let Some(model) = hb_providers::sleep_controls::model(&device) else {
+            self.page_height = y + 120 - PAGE_TOP;
             self.control(
                 434,
                 w!("STATIC"),
@@ -4266,14 +4500,7 @@ impl State {
             "Allow device settings changes in Settings first.".into()
         } else if let Some(o) = observed {
             if let Some(error) = &o.failure {
-                format!(
-                    "{error}{}",
-                    if o.may_have_changed {
-                        " The setting may have changed."
-                    } else {
-                        ""
-                    }
-                )
+                device_control_error(error, o.may_have_changed, "sleep time", model.readable())
             } else if let Some(seconds) = o.seconds {
                 if seconds == 0 {
                     "Current sleep time: Never.".into()
@@ -4511,7 +4738,8 @@ impl State {
         self.polling_controls();
     }
     fn read_polling(&mut self) {
-        if let Some(reading) = self.visible_polling_device()
+        if self.dashboard_visible()
+            && let Some(reading) = self.visible_polling_device()
             && reading.online()
             && matches!(reading.capability, PollingCapability::ReadWrite)
         {
@@ -5002,7 +5230,8 @@ impl State {
         }
     }
     fn refresh_device_details(&self) {
-        if self.page == 1
+        if self.dashboard_visible()
+            && self.page == 1
             && self.controls.contains_key(&91)
             && let Some((_, Some(d))) = self.current_device()
         {
@@ -5739,6 +5968,31 @@ mod behaviour_tests {
         );
     }
     #[test]
+    fn device_feedback_hides_protocol_errors_and_preserves_write_uncertainty() {
+        for raw in [
+            "HID error: 0x1f invalid report",
+            "Unknown DPI feature 2202",
+            "profile CRC mismatch",
+        ] {
+            let message = device_control_error(raw, false, "DPI", true);
+            assert!(
+                !message.contains("HID") && !message.contains("CRC") && !message.contains("2202")
+            );
+        }
+        let message = device_control_error("Unsupported report", true, "DPI", true);
+        assert!(message.contains("may have changed") && message.contains("Read current"));
+        let message = device_control_error("HID timeout", true, "sleep time", false);
+        assert!(message.contains("may have changed") && !message.contains("Read current"));
+        assert!(
+            device_control_error("backup failed", false, "DPI", true).contains("original settings")
+        );
+        assert!(device_control_error("Mouse busy", false, "DPI", true).contains("Wait a moment"));
+        assert_eq!(settings_number(" 60 ", 5, 3600), Some(60));
+        for invalid in ["4", "3601", "-1", "1.5", ""] {
+            assert_eq!(settings_number(invalid, 5, 3600), None);
+        }
+    }
+    #[test]
     fn unavailable_controls_explain_the_actual_constraint() {
         let mut device =
             ConfigurationDevice::from_reading(&Reading::new("test", "Keyboard", "razer", 0));
@@ -6148,7 +6402,7 @@ fn tray_polling_choices(
     if !settings.polling_controls {
         return vec![choice(
             512,
-            "Allow polling-rate changes in &Settings…".into(),
+            "Enable device controls in &Settings…".into(),
             true,
             TrayPollingAction::Settings,
         )];
@@ -7559,7 +7813,8 @@ mod insights_tests {
         for expected in [
             "1000 Hz",
             "Early estimate",
-            "Time between drops · 120 / 30 min",
+            "Estimate based on · 2.0 hours of battery use",
+            "Battery used in that time · 20%",
             "Full battery · about 10 hours",
             "At this rate, time left · Waiting for a fresh reading",
             "Rate changes and gaps are excluded.",
@@ -7577,6 +7832,14 @@ mod insights_tests {
         assert!(INSIGHTS_EMPTY.contains("tray menu"));
         assert!(INSIGHTS_EMPTY.contains("Only rates confirmed by the device are included"));
         assert!(!text.contains("samples") && !text.contains("confidence"));
+        assert!(!text.contains("/ 30 min"));
+        let mut learning = rate;
+        learning.projected_full_charge_hours = None;
+        learning.projection_seconds = 600;
+        learning.projection_consumed_percent = 1;
+        let text = rate_insight_text(&learning);
+        assert!(text.contains("Learning time · 10 / 30 min"));
+        assert!(text.contains("Battery used · 1 / 3 percentage points"));
     }
     #[test]
     fn insight_coverage_explains_empty_rate_evidence_and_corruption() {
@@ -7669,8 +7932,8 @@ mod insights_tests {
             ..RateInsight::default()
         };
         let text = rate_insight_text(&rate);
-        assert!(text.contains("Time between drops · 120 / 30 min"));
-        assert!(text.contains("Battery drop · 0 / 3 percentage points"));
+        assert!(text.contains("Estimate based on · 2.0 hours of battery use"));
+        assert!(text.contains("Battery used in that time · 0%"));
         assert!(rate_insight_row(&rate).contains("less than 1 hour"));
         rate.projected_full_charge_hours = Some(f64::NAN);
         assert!(rate_insight_row(&rate).contains("Still learning"));
@@ -7800,7 +8063,7 @@ mod dashboard_lifecycle_tests {
                 &mut message,
                 Some(monitor),
                 WM_APP + 8,
-                WM_APP + 11,
+                WM_APP + 12,
                 PM_REMOVE,
             )
             .as_bool()
@@ -8208,10 +8471,15 @@ mod dashboard_lifecycle_tests {
             }
             for mode in [SW_MINIMIZE, SW_HIDE] {
                 let _ = ShowWindow(first, mode);
+                dispatch_monitor(monitor);
+                assert!(!context.state.borrow().dashboard_visible());
+                assert!(!context.state.borrow().runtime.configuration_visible());
                 send(monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
                 assert_eq!(context.state.borrow().dashboard, Some(first));
                 assert!(IsWindowVisible(first).as_bool());
                 assert!(!IsIconic(first).as_bool());
+                assert!(context.state.borrow().dashboard_visible());
+                assert!(context.state.borrow().runtime.configuration_visible());
             }
             {
                 let mut state = context.state.borrow_mut();
@@ -8235,7 +8503,7 @@ mod dashboard_lifecycle_tests {
                 let mut reading = Reading::new(
                     "synthetic-mouse",
                     "Test mouse",
-                    "razer",
+                    "simulation",
                     SystemClock::default().unix(),
                 );
                 reading.level = Some(50);
@@ -8335,12 +8603,54 @@ mod dashboard_lifecycle_tests {
                 state.insights.data = Some(insights);
                 state.insights.key = Some("synthetic-mouse".into());
             }
+            {
+                let mut state = context.state.borrow_mut();
+                let saved = state.snapshot.devices[0].clone();
+                let saved_data = state.insights.data.clone();
+                state.snapshot.devices[0].reading.source = "bluetooth".into();
+                state.snapshot.devices[0].reading.kind = "headset".into();
+                state.snapshot.devices[0].seconds_left = Some(7200);
+                state.page = 1;
+                state.build();
+                assert!(
+                    !state.controls.contains_key(&98),
+                    "battery-only devices must not offer polling controls"
+                );
+                assert!(state.visible_polling_device().is_none());
+                state.page = 6;
+                state.build();
+                assert!(state.text(400).contains("about 2 hours"));
+                assert!(state.text(401).contains("Recorded use"));
+                assert!(state.text(402).contains("50%"));
+                assert!(!IsWindowVisible(state.controls[&410]).as_bool());
+                assert!(!IsWindowVisible(state.controls[&70]).as_bool());
+                assert!(IsWindowVisible(state.controls[&71]).as_bool());
+                state.snapshot.devices[0] = saved;
+                state.insights.data = saved_data;
+                state.page = 1;
+                state.build();
+                let permission = state.settings.polling_controls;
+                state.settings.polling_controls = false;
+                state.build();
+                assert!(state.controls.contains_key(&53));
+                state.command(53, 0);
+                assert_eq!(state.page, 3);
+                assert_eq!(GetFocus(), state.controls[&112]);
+                assert!(
+                    !state.settings.polling_controls,
+                    "navigation must not grant hardware permission"
+                );
+                state.settings.polling_controls = permission;
+                state.page = 1;
+                state.build();
+            }
             // DPI UI uses invented state only; this never opens physical hardware.
             {
                 let mut state = context.state.borrow_mut();
                 let saved = state.snapshot.devices[0].reading.clone();
                 let key = "razer:00bf:SYNTHETIC-DPI".to_string();
                 state.snapshot.devices[0].reading.key = key.clone();
+                state.snapshot.devices[0].reading.source = "razer".into();
                 state.snapshot.devices[0].reading.via = "usb".into();
                 state.selected_device = Some(key.clone());
                 let generation = state.polling.generation;
@@ -8467,10 +8777,44 @@ mod dashboard_lifecycle_tests {
                             send(state.controls[&70], CB_SETCURSEL, WPARAM(1), LPARAM(0));
                             state.command(70, CBN_SELCHANGE as u16);
                             assert!(state.text(74).starts_with("2000 Hz"));
+                            assert!(state.text(74).contains("Estimate based on"));
+                            assert!(!state.text(74).contains("/ 30 min"));
                             state.render_insights();
                             assert_eq!(state.choice(70), 1);
                             assert!(state.text(402).contains("100%"));
                             assert!(state.text(410).contains("1000 Hz · 75%"));
+                            let original_mix = state.text(410);
+                            let original_details = state.text(74);
+                            let many_rows = INSIGHT_RATES
+                                .iter()
+                                .map(|r| format!("{r} Hz · 14%"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            state.set_control_text(
+                                410,
+                                &format!("Polling-rate mix · last 7 days\n{many_rows}"),
+                            );
+                            state.set_control_text(74, &format!("Long result\n{}", "An explanation that needs more than one line at the current size. ".repeat(30)));
+                            state.layout_insight_content();
+                            let mut rate_bounds = RECT::default();
+                            let mut next_bounds = RECT::default();
+                            GetWindowRect(state.controls[&74], &mut rate_bounds).unwrap();
+                            GetWindowRect(state.controls[&75], &mut next_bounds).unwrap();
+                            let needed = crate::dashboard_widgets::panel_height(
+                                state.controls[&74],
+                                &state.text(74),
+                                760,
+                                false,
+                            );
+                            let scale = GetDpiForWindow(reopened).max(96) as i32;
+                            assert!(rate_bounds.bottom - rate_bounds.top >= needed * scale / 96);
+                            assert!(
+                                next_bounds.top >= rate_bounds.bottom,
+                                "wrapped results must not overlap the next section"
+                            );
+                            state.set_control_text(410, &original_mix);
+                            state.set_control_text(74, &original_details);
+                            state.layout_insight_content();
                             let saved = state.insights.data.take();
                             state.render_insights();
                             assert!(state.text(410).contains("No history loaded"));
@@ -8491,7 +8835,8 @@ mod dashboard_lifecycle_tests {
                         }
                         if page == 1 {
                             assert!(state.controls.contains_key(&49));
-                            state.scroll_page(i32::MAX);
+                            // Other supported settings can follow boost; reveal this section itself.
+                            state.scroll_page(708 - PAGE_TOP);
                             let mut pane = RECT::default();
                             GetWindowRect(state.page_host.unwrap(), &mut pane).unwrap();
                             for id in [49, 50, 51, 52] {
@@ -8828,7 +9173,19 @@ mod dashboard_lifecycle_tests {
                 state.command(210, 0);
                 assert_eq!(state.controls[&201], interval);
                 assert_eq!(state.text(201), "invalid");
-                assert!(state.text(95).starts_with("Enter "));
+                assert!(state.text(95).contains("battery check interval"));
+                assert_eq!(GetFocus(), state.controls[&201]);
+                state.set_control_text(201, " 60 ");
+                state.set_control_text(203, "101");
+                state.command(210, 0);
+                assert!(state.text(95).contains("default low-battery alert"));
+                assert_eq!(GetFocus(), state.controls[&203]);
+                state.set_control_text(203, "20");
+                state.set_control_text(215, "-1");
+                state.command(210, 0);
+                assert!(state.text(95).contains("orange warning level"));
+                assert_eq!(GetFocus(), state.controls[&215]);
+                state.set_control_text(215, "30");
                 state.set_control_text(201, "60");
                 let dpi = GetDpiForWindow(reopened).max(96) as i32;
                 SetWindowPos(
@@ -8907,7 +9264,20 @@ mod dashboard_lifecycle_tests {
                 state.build();
                 assert_eq!(state.text(11), "Unsaved mouse name");
                 assert_eq!(state.text(13), "invalid");
+                let preserved = state.settings.device_mut("synthetic-mouse");
+                preserved.fullscreen_boost_rate = Some(PollingRate::try_from(4000).unwrap());
+                preserved.low_battery_mode = Some(hb_core::settings::LowBatteryMode {
+                    threshold: 20,
+                    polling_rate: Some(PollingRate::try_from(500).unwrap()),
+                    sleep_seconds: None,
+                });
+                let startup = preserved.requested_polling_rate;
                 state.command(16, 0);
+                let preserved = state.settings.device("synthetic-mouse").unwrap();
+                assert_eq!(preserved.requested_polling_rate, startup);
+                assert_eq!(preserved.fullscreen_boost_rate.unwrap().hz(), 4000);
+                assert!(preserved.low_battery_mode.is_some());
+                assert_eq!(state.text(95), "Device preferences reset");
                 assert_ne!(state.text(11), "Unsaved mouse name");
                 assert!(state.text(13).is_empty());
                 state.set_control_text(11, "Another unsaved name");

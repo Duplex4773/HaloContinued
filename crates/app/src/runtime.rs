@@ -517,10 +517,12 @@ struct ConfigurationWatch {
     epoch: AtomicU64,
 }
 impl ConfigurationWatch {
-    fn set_visible(&self, visible: bool) {
-        if self.visible.swap(visible, Ordering::AcqRel) != visible {
+    fn set_visible(&self, visible: bool) -> bool {
+        let changed = self.visible.swap(visible, Ordering::AcqRel) != visible;
+        if changed {
             self.epoch.fetch_add(1, Ordering::AcqRel);
         }
+        changed
     }
     fn active(&self, epoch: u64) -> bool {
         self.visible.load(Ordering::Acquire) && self.epoch.load(Ordering::Acquire) == epoch
@@ -593,7 +595,9 @@ impl Runtime {
     pub fn send(&self, command: Command) {
         let command = match command {
             Command::ConfigurationVisible(visible) => {
-                self.configuration.set_visible(visible);
+                if !self.configuration.set_visible(visible) {
+                    return;
+                }
                 Command::ConfigurationVisible(visible)
             }
             Command::Settings(settings) => {
@@ -626,6 +630,9 @@ impl Runtime {
         if self.commands.try_send(command).is_err() {
             let _ = self.sink.try_send(Event::Error("Command queue is busy; retry the action. Device configuration remains revoked until settings or resume is acknowledged.".into()));
         }
+    }
+    pub fn configuration_visible(&self) -> bool {
+        self.configuration.visible.load(Ordering::Acquire)
     }
     pub fn request_insights(
         &self,
@@ -3473,6 +3480,14 @@ mod tests {
                 window: Arc::new(AtomicUsize::new(0)),
                 configuration,
             };
+            // Native resize/show notifications can repeat the same visibility.
+            // They must not fill the command queue or wake the engine each time.
+            for _ in 0..1000 {
+                runtime.send(Command::ConfigurationVisible(true));
+            }
+            assert!(rx.is_empty());
+            assert!(runtime.events.is_empty());
+            assert_eq!(runtime.configuration.epoch.load(Ordering::Acquire), 1);
             runtime
                 .submit_control(ControlRequest {
                     request: 1,
