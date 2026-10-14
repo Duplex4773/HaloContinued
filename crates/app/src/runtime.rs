@@ -1148,30 +1148,57 @@ fn manual_polling_change(request: &ControlRequest) -> bool {
     request.request & background == 0 && request.action.rate().is_some()
 }
 
-/// One initial read per supported battery mouse, sharing the startup discovery
-/// window and existing workers. Never turn saved requests into readback evidence.
+/// Bounded startup readback recovery using existing discovery and workers.
+/// Saved requests never count as readback evidence; retries only issue GETs.
+struct InitialReadAttempt {
+    request: u64,
+    attempts: u8,
+    retry_at: Option<Instant>,
+}
 struct InitialPollingReads {
     until: Instant,
     enabled: bool,
     attempted: BTreeSet<String>,
+    pending: BTreeMap<String, InitialReadAttempt>,
     next_request: u64,
 }
 impl InitialPollingReads {
     fn new(settings: &Settings, now: Instant) -> Self {
         Self {
-            until: now + Duration::from_secs(60),
+            until: now + Duration::from_secs(300),
             enabled: settings.polling_controls,
             attempted: BTreeSet::new(),
+            pending: BTreeMap::new(),
             next_request: STARTUP_POLLING_REQUEST_BIT | STARTUP_POLLING_READ_BIT,
         }
     }
     fn cancel(&mut self) {
         self.enabled = false;
         self.attempted.clear();
+        self.pending.clear();
     }
     fn observe_request(&mut self, key: &str) {
+        self.pending.remove(key);
         if self.enabled && self.attempted.len() < 512 {
             self.attempted.insert(key.into());
+        }
+    }
+    fn complete(&mut self, outcome: &ControlOutcome, now: Instant) {
+        if !self.enabled || now >= self.until {
+            return;
+        }
+        let Some(pending) = self.pending.get_mut(&outcome.key) else {
+            return;
+        };
+        if pending.request != outcome.request || pending.retry_at.is_some() {
+            return;
+        }
+        let confirmed = outcome.failure.is_none()
+            && outcome.observation.as_ref().and_then(|o| o.rate).is_some();
+        if confirmed || pending.attempts >= 3 {
+            self.pending.remove(&outcome.key);
+        } else {
+            pending.retry_at = Some(now + Duration::from_secs(15));
         }
     }
     fn next(
@@ -1184,15 +1211,28 @@ impl InitialPollingReads {
         if now >= self.until {
             self.cancel();
         }
-        if !self.enabled || self.attempted.len() >= 512 {
+        if !self.enabled {
             return None;
         }
         let device = devices.find(|device| {
             device.online()
                 && hb_providers::controls::polling_menu_candidate(device)
-                && !self.attempted.contains(&device.key)
+                && ((!self.attempted.contains(&device.key) && self.attempted.len() < 512)
+                    || self
+                        .pending
+                        .get(&device.key)
+                        .is_some_and(|attempt| attempt.retry_at.is_some_and(|due| now >= due)))
         })?;
-        self.observe_request(&device.key);
+        self.attempted.insert(device.key.clone());
+        let attempts = self.pending.get(&device.key).map_or(1, |p| p.attempts + 1);
+        self.pending.insert(
+            device.key.clone(),
+            InitialReadAttempt {
+                request: self.next_request,
+                attempts,
+                retry_at: None,
+            },
+        );
         let request = ControlRequest {
             request: self.next_request,
             target: ControlTarget { device, generation },
@@ -1216,6 +1256,10 @@ impl StartupPolling {
     }
     fn active(&self) -> bool {
         self.reads.enabled || !self.restore.pending.is_empty()
+    }
+    fn blocks_automation(&self, now: Instant) -> bool {
+        // A slow receiver must not extend the original automation startup wait.
+        self.active() && now < self.restore.until
     }
     fn cancel(&mut self) {
         self.restore.cancel();
@@ -1241,9 +1285,19 @@ impl StartupPolling {
                     .next(now, epoch, generation, devices.clone(), keyboard_epoch)
         {
             if let Command::Polling(request, _, _) = &command {
-                // Restore already performs a verified read; do not duplicate it
-                // even if its guarded transaction fails or has an uncertain SET.
+                // Successful restoration already confirms the rate. Failed or
+                // uncertain restoration may be followed by GETs, never another SET.
                 self.reads.observe_request(&request.target.device.key);
+                if self.reads.enabled && self.reads.attempted.contains(&request.target.device.key) {
+                    self.reads.pending.insert(
+                        request.target.device.key.clone(),
+                        InitialReadAttempt {
+                            request: request.request,
+                            attempts: 0,
+                            retry_at: None,
+                        },
+                    );
+                }
             }
             return Some(command);
         }
@@ -2265,7 +2319,7 @@ fn run(
             && !suspended
             && !stop
             && inflight == 0
-            && !startup_polling.active()
+            && !startup_polling.blocks_automation(Instant::now())
             && !jobs.is_full()
             && commands.is_empty()
         {
@@ -2282,7 +2336,7 @@ fn run(
             && !suspended
             && !stop
             && inflight == 0
-            && !startup_polling.active()
+            && !startup_polling.blocks_automation(Instant::now())
             && !jobs.is_full()
             && commands.is_empty()
             && engine.settings.polling_controls
@@ -2691,9 +2745,11 @@ fn run(
                 let boost_guard = boost.guard(request.request);
                 usage_tracker
                     .begin_control(&request, boost_guard.as_ref().map(|guard| guard.fullscreen));
-                startup_polling
-                    .reads
-                    .observe_request(&request.target.device.key);
+                if request.request & STARTUP_POLLING_REQUEST_BIT == 0 {
+                    startup_polling
+                        .reads
+                        .observe_request(&request.target.device.key);
+                }
                 let allowed = (!automatic || boost_guard.is_some())
                     && (!saver_request || saver_cancel.is_some())
                     && epoch == permission.epoch.load(Ordering::Acquire)
@@ -2723,6 +2779,7 @@ fn run(
                     boost.complete(&outcome);
                     saver.polling_complete(&outcome);
                     saver_dirty = true;
+                    startup_polling.reads.complete(&outcome, Instant::now());
                     let _ = events.send(Event::Polling(Box::new(outcome)));
                 } else if simulate {
                     let outcome = simulate_control(
@@ -2749,6 +2806,7 @@ fn run(
                     boost.complete(&outcome);
                     saver.polling_complete(&outcome);
                     saver_dirty = true;
+                    startup_polling.reads.complete(&outcome, Instant::now());
                     let _ = events.send(Event::Polling(Box::new(outcome)));
                 } else {
                     match jobs.try_send(WorkerJob::Polling(
@@ -2768,6 +2826,7 @@ fn run(
                             boost.complete(&outcome);
                             saver.polling_complete(&outcome);
                             saver_dirty = true;
+                            startup_polling.reads.complete(&outcome, Instant::now());
                             let _ = events.send(Event::Polling(Box::new(outcome)));
                         }
                     }
@@ -2816,6 +2875,7 @@ fn run(
                 boost.complete(&outcome);
                 saver.polling_complete(&outcome);
                 saver_dirty = true;
+                startup_polling.reads.complete(&outcome, Instant::now());
                 let _ = events.send(Event::Polling(outcome));
             }
             Work::Command(Ok(
@@ -4140,11 +4200,125 @@ mod tests {
         let mut expired = InitialPollingReads::new(&startup_settings(), now);
         assert!(
             expired
-                .next(now + Duration::from_secs(60), 0, 1, std::iter::once(device))
+                .next(
+                    now + Duration::from_secs(300),
+                    0,
+                    1,
+                    std::iter::once(device)
+                )
                 .is_none()
         );
         assert!(!expired.enabled);
         assert!(expired.attempted.is_empty());
+    }
+    #[test]
+    fn initial_polling_reads_allow_late_discovery_and_bound_read_only_retries() {
+        let start = Instant::now();
+        let mut now = start + Duration::from_secs(120);
+        let device = ConfigurationDevice::from_reading(&control_reading());
+        let mut reads = InitialPollingReads::new(&startup_settings(), start);
+        for generation in 1..=3 {
+            let Command::Polling(request, _, _) = reads
+                .next(now, 0, generation, std::iter::once(device.clone()))
+                .expect("late receiver must get a bounded startup read")
+            else {
+                panic!()
+            };
+            assert_eq!(request.action, ControlAction::Read);
+            assert_eq!(request.target.generation, generation);
+            assert!(
+                reads
+                    .next(now, 0, generation, std::iter::once(device.clone()))
+                    .is_none()
+            );
+            reads.complete(&ControlOutcome::failed(&request, "receiver not ready"), now);
+            assert!(
+                reads
+                    .next(
+                        now + Duration::from_secs(14),
+                        0,
+                        generation,
+                        std::iter::once(device.clone())
+                    )
+                    .is_none()
+            );
+            now += Duration::from_secs(15);
+        }
+        assert!(reads.next(now, 0, 4, std::iter::once(device)).is_none());
+        assert!(reads.pending.is_empty());
+    }
+    #[test]
+    fn startup_uncertain_restore_only_rechecks_and_confirmation_stops_recovery() {
+        let now = Instant::now();
+        let device = ConfigurationDevice::from_reading(&control_reading());
+        let mut startup = StartupPolling::new(&startup_settings(), now);
+        let Command::Polling(restore, _, _) = startup
+            .next(now, 0, 1, std::iter::once(device.clone()), None, true)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(matches!(restore.action, ControlAction::Apply(_)));
+        let mut uncertain = ControlOutcome::failed(&restore, "acknowledgment missing");
+        uncertain.may_have_changed = true;
+        startup.reads.complete(&uncertain, now);
+        let later = now + Duration::from_secs(15);
+        let Command::Polling(read, _, _) = startup
+            .next(later, 0, 2, std::iter::once(device.clone()), None, true)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(read.action, ControlAction::Read);
+        let mut rate = PollingRate::try_from(2000).unwrap();
+        let outcome = simulate_control(&read, &mut rate, 2, 100);
+        startup.reads.complete(&outcome, later);
+        assert!(
+            startup
+                .next(
+                    later + Duration::from_secs(30),
+                    0,
+                    2,
+                    std::iter::once(device),
+                    None,
+                    true
+                )
+                .is_none()
+        );
+        assert!(!startup.blocks_automation(now + Duration::from_secs(60)));
+        assert!(startup.restore.pending.is_empty());
+        assert!(startup.reads.pending.is_empty());
+    }
+    #[test]
+    fn startup_read_recovery_yields_to_manual_requests_and_cancellation() {
+        let now = Instant::now();
+        let device = ConfigurationDevice::from_reading(&control_reading());
+        for cancel in [false, true] {
+            let mut reads = InitialPollingReads::new(&startup_settings(), now);
+            let Command::Polling(request, _, _) = reads
+                .next(now, 0, 1, std::iter::once(device.clone()))
+                .unwrap()
+            else {
+                panic!()
+            };
+            if cancel {
+                reads.cancel();
+            } else {
+                reads.observe_request(&device.key);
+            }
+            reads.complete(&ControlOutcome::failed(&request, "late completion"), now);
+            assert!(
+                reads
+                    .next(
+                        now + Duration::from_secs(20),
+                        0,
+                        2,
+                        std::iter::once(device.clone())
+                    )
+                    .is_none()
+            );
+            assert!(reads.pending.is_empty());
+        }
     }
     #[test]
     fn device_watcher_initial_inventory_does_not_invalidate_startup_readback() {

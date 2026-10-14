@@ -79,6 +79,13 @@ every five seconds when needed; boosting requires ten seconds of stable
 fullscreen gaming, and restoration waits fifteen seconds on the desktop. Some
 borderless games are missed. Keep the app running for restoration.
 
+With device settings enabled, launch also checks supported mice's current polling
+rates in the background. Receivers have up to five minutes to become available;
+failed reads get up to three attempts, at least fifteen seconds apart. A confirmed
+read stops the checks. Saved-rate restoration remains one-shot: if it fails, the
+app can read the current rate without repeating the change. No continuous polling
+rate checks or additional background timer are used.
+
 Low-battery mode is also opt-in. It only lowers a faster polling rate or shortens
 a longer sleep timer. Boost takes priority over its polling rate. Prior settings
 return when charging or when battery recovers five percentage points above the
@@ -182,7 +189,7 @@ and licences. Optional API/import validation uses `tools/validate-configuration.
 with ripgrep and Visual Studio's dumpbin installed.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Latest local validation: **682 passing tests**, with
+storage and the application. Latest local validation: **685 passing tests**, with
 four opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
