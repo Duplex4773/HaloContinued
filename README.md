@@ -2,6 +2,11 @@
 
 **Battery monitoring, device controls and battery-life insights for Windows.**
 
+**Performance goal:** keep CPU and RAM use as low as practical while adding
+device controls, history and battery insights. The aim is no noticeable
+performance compromise during work or gaming. The app still consumes resources;
+usage varies with connected devices, settings and dashboard activity.
+
 Current release: **1.0.0** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
