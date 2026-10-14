@@ -2,6 +2,12 @@
 
 **Battery monitoring and device controls, without a heavyweight background suite.**
 
+Current release: **1.0.0** for Windows 11 x64, available as an unsigned per-user
+installer and a portable ZIP.
+
+**Personal project:** I build Halo Continued for my own use. It is shared
+publicly, but whether others use it is not a priority.
+
 Halo Continued is an independent Rust/Win32 application for Windows 11 x64,
 inspired by [HaloBattery](https://github.com/HeyOkay/HaloBattery). It began as a
 Rust port and carries forward upstream device protocols, provider behaviour,
@@ -34,7 +40,7 @@ history or battery-life estimates.
 
 ## Get started
 
-1. Extract a portable package, or build from source below.
+1. Run the installer, extract a portable package, or build from source below.
 2. Run **HaloContinued.exe**. Monitoring starts and the dashboard opens.
 3. Open **Settings** to choose appearance, notifications and startup preferences.
 4. To configure hardware, enable **Allow device settings changes**, then select
@@ -49,6 +55,15 @@ settings, create `portable.txt` beside the executable; data goes in the adjacent
 `HaloBatteryNext-data` folder. An unwritable portable folder falls back to the
 normal location. These folder names preserve compatibility with earlier Rust
 builds; upstream HaloBattery settings are separate and are not imported.
+
+The optional installer installs for your account in
+`%LOCALAPPDATA%\Programs\HaloContinued`, without administrator privileges. It
+adds a Start menu shortcut, with optional desktop shortcut and startup at sign-in.
+Run a newer installer to upgrade; settings and history are preserved. Uninstall
+from Windows **Settings > Apps > Installed apps**. Uninstalling keeps your data
+and removes startup registration only if it still points to that installation.
+The installer and portable executable are unsigned, so Windows may show an
+unrecognised-app warning. Download releases from this project's GitHub repository.
 
 Exit an older build before upgrading. Keep portable data beside the replacement
 executable. If its location changes, save **Start with Windows** again to update
@@ -213,15 +228,34 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 0.1.0
+.\tools\package-rust.ps1 -Version 1.0.0
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-0.1.0-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.0.0-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
 with ripgrep and Visual Studio's dumpbin installed.
+
+To also build the unsigned installer, install [Inno Setup](https://jrsoftware.org/isinfo.php)
+6.3 or newer, then run:
+
+```powershell
+.\tools\package-installer.ps1 -Version 1.0.0
+# For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
+```
+
+This produces the portable ZIP, `dist/HaloContinued-1.0.0-windows-x64-setup.exe`
+and `dist/HaloContinued-1.0.0-SHA256SUMS.txt`. The installer uses the same app and
+dependency notices as the ZIP; it adds no service, updater or background process.
+Exit Halo Continued from its tray menu before installing or uninstalling.
+Installer regression checks can be run with
+`.\tools\test-installer.ps1 -Iscc 'path\to\ISCC.exe'`. They use isolated test
+identities, leave the running app alone and never launch the packaged app.
+Add `-PreviousPackageZip 'dist/HaloContinued-0.1.0-windows-x64.zip'` to test an
+upgrade from that version, including executable replacement, the Installed apps
+version and preservation of settings and history.
 
 The five workspace crates separate device models, protocols, Windows integration,
 storage and the application. Latest local validation: **709 passing tests**, with
