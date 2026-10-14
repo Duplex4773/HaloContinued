@@ -1,9 +1,19 @@
 # Halo Continued
 
-**Battery monitoring and device controls, without a heavyweight background suite.**
+**Battery monitoring, device controls and battery-life insights for Windows.**
 
 Current release: **1.0.0** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
+
+| Download | Use it for |
+| --- | --- |
+| [**V1.0.0 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.0/HaloContinued-1.0.0-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.0.0 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.0/HaloContinued-1.0.0-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. |
+
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.0/HaloContinued-1.0.0-SHA256SUMS.txt)
+· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.0)
+
+Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -15,9 +25,9 @@ tests and community hardware reports, while adding practical device controls
 and richer battery insights. It is maintained by
 [Duplex4773](https://github.com/Duplex4773), independently of HaloBattery.
 
-Native Windows controls keep it small and responsive. There is no Python, .NET,
-browser or webview runtime to install, and no vendor suite is required for the
-supported controls.
+The dashboard uses native Windows controls. The portable executable includes its
+runtime dependencies, and supported device controls work without installing a
+vendor suite. Hardware changes are optional and disabled by default.
 
 ## What you can do
 
@@ -37,6 +47,36 @@ supported controls.
 
 Batteryless keyboards appear on Devices without battery tray icons, alerts,
 history or battery-life estimates.
+
+## Screenshots
+
+The actual V1.0.0 interface, captured with simulated devices and example history.
+Images follow your preferred light or dark theme; no personal device data is shown.
+
+<table>
+  <tr><th>Devices and polling controls</th><th>Battery history</th></tr>
+  <tr>
+    <td><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/devices-dark.png">
+      <img src="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/devices-light.png" alt="Devices page showing a simulated mouse, battery level, alert preferences and polling-rate controls" width="480">
+    </picture></td>
+    <td><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/history-dark.png">
+      <img src="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/history-light.png" alt="Battery history page showing an example battery-level graph against estimated time used" width="480">
+    </picture></td>
+  </tr>
+  <tr><th>Battery-life insights</th><th>Settings</th></tr>
+  <tr>
+    <td><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/insights-dark.png">
+      <img src="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/insights-light.png" alt="Insights page showing example remaining battery life, polling-rate mix and automatic boost history" width="480">
+    </picture></td>
+    <td><picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/settings-dark.png">
+      <img src="https://raw.githubusercontent.com/Duplex4773/HaloContinued/main/assets/screenshots/settings-light.png" alt="Settings page with battery alerts, appearance, battery checks and optional device controls" width="480">
+    </picture></td>
+  </tr>
+</table>
 
 ## Get started
 
@@ -62,13 +102,37 @@ adds a Start menu shortcut, with optional desktop shortcut and startup at sign-i
 Run a newer installer to upgrade; settings and history are preserved. Uninstall
 from Windows **Settings > Apps > Installed apps**. Uninstalling keeps your data
 and removes startup registration only if it still points to that installation.
-The installer and portable executable are unsigned, so Windows may show an
-unrecognised-app warning. Download releases from this project's GitHub repository.
+Download releases from this project's GitHub repository.
 
 Exit an older build before upgrading. Keep portable data beside the replacement
 executable. If its location changes, save **Start with Windows** again to update
 the startup path. Update checking remains disabled unless a release repository
 is configured.
+
+## Relationship to HaloBattery
+
+HaloBattery provides the battery-monitoring foundation, including device
+protocols and community hardware reports. Halo Continued builds on that work
+with optional hardware settings and a dashboard for history and battery analysis.
+
+This comparison refers to the reviewed [HaloBattery 1.15.0 revision](https://github.com/HeyOkay/HaloBattery/tree/2251f0534a8e886c9692ead42056059b4f69d8c0)
+and Halo Continued 1.0.0:
+
+| Area | HaloBattery | Halo Continued |
+| --- | --- | --- |
+| Everyday interface | Per-device tray icons and menus. | Per-device tray icons and menus, plus Devices, History, Insights and Settings pages. |
+| Hardware settings | Focuses on battery monitoring and its preferences. | Adds polling-rate, sensitivity and hardware sleep controls for specifically supported devices. |
+| Automatic device settings | Fullscreen detection adjusts battery checks and notifications. | Also offers opt-in fullscreen polling boosts and low-battery polling/sleep changes. |
+| Battery analysis | Saves readings to estimate remaining use. | Adds 30-day charts, battery sessions and estimates that account for a mix of polling rates. |
+| Packaging | Python application distributed with a bundled runtime folder. | Self-contained Rust executable, portable ZIP and optional per-user installer. |
+| Windows support | Windows 10 and 11. | Windows 11 x64. |
+| Release updates | In-app automatic updates. | Manual downloads and installer upgrades. |
+
+The additional controls are useful when your hardware supports them; the
+dashboard brings their settings and battery records together. Hardware coverage,
+Windows version and your preferred workflow are practical reasons to choose
+between the projects. Shared features such as notifications, portable settings
+and working without vendor suites originate in HaloBattery too.
 
 ## Device support and limitations
 
@@ -152,7 +216,7 @@ transitions where appropriate. “Time used” estimates device availability; it
 does not record keystrokes, mouse movements or gaming time. Estimates remain in learning
 until sufficient evidence is available.
 
-## Performance: Rust versus upstream
+## Resource use
 
 A native executable avoids the bundled Python runtime. Bounded workers, cached
 HID discovery and tray graphics, event-driven waits and batched SQLite writes
@@ -171,8 +235,9 @@ refer to **one logical core**; RAM means **private committed memory**.
 | Halo Continued, standard Rust | 0.017% | 0.035% | 4.75 MiB | 4.55 MiB |
 | Halo Continued, AVX512 Rust | Below counter resolution | 0.043% | 4.81 MiB | 4.71 MiB |
 
-Rust used about **85–87% less private memory** in these samples and recorded less
-CPU time. All versions had very small absolute CPU costs. AVX512 showed **no
+The Halo Continued harness used about **85–87% less private memory** in these
+samples and recorded less CPU time. These results apply to the implementations
+and test conditions described here. All versions had very small absolute CPU costs. AVX512 showed **no
 consistent background-monitoring advantage**; the standard build is the default.
 Below counter resolution means Windows recorded no CPU-time increment during
 that sample, not that the application performed no work.
