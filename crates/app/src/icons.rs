@@ -264,6 +264,13 @@ mod tests {
             before,
             "rendered HICON and DIB resources must be released"
         );
+        device.reading.level = None;
+        assert_eq!(
+            frames(&device, &settings, true, 32).unwrap().len(),
+            30,
+            "Unknown battery must still animate while charging"
+        );
+        device.reading.level = Some(73);
         settings.animation = false;
         assert_eq!(frames(&device, &settings, false, 32).unwrap().len(), 1);
         settings.animation = true;

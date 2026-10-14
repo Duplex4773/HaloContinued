@@ -333,122 +333,7 @@ fn steel_aerox_all_wireless_editions_exact_d2_packet_and_all_steps() {
     assert!(poll("steelseries", &h).is_empty());
     h.done();
 }
-fn nxp(index: u8, numbered: bool) -> Vec<u8> {
-    let mut r = vec![0; 64];
-    r[0] = 0x0e;
-    r[1] = 0x50;
-    r[4] = index;
-    r[5] = 2;
-    if numbered {
-        r.insert(0, 0)
-    }
-    r
-}
-fn nxp_dev(path: &str, page: u16, usage: u16, iface: i32) -> HidInfo {
-    device("corsair", 0x1b7f, page, usage, iface, path)
-}
-#[test]
-fn corsair_nxp_all_steps_report_id_compatibility_and_coarse_gauge() {
-    for (numbered, index, level) in [false, true].into_iter().flat_map(|n| {
-        [0, 15, 30, 50, 100]
-            .into_iter()
-            .enumerate()
-            .map(move |(i, l)| (n, i as u8, l))
-    }) {
-        let h = FakeHid::new(
-            vec![nxp_dev("nxp", 0xff42, 1, 1)],
-            vec![
-                Step::Write(padded(&[0, 0x0e, 0x50], 65)),
-                rd(&nxp(index, numbered)),
-            ],
-        );
-        let r = poll("corsair", &h);
-        assert_eq!(
-            (&*r[0].key, r[0].level, r[0].charging, &*r[0].kind),
-            (
-                "corsair:1b7f:FIXTURE-CORSAIR-1B7F",
-                Some(level),
-                Some(false),
-                "mouse"
-            )
-        );
-        assert_eq!(r[0].precision, Precision::Coarse);
-        assert_eq!(r[0].approx, Some(format!("about {level}%")));
-        h.done();
-    }
-}
-#[test]
-fn corsair_nxp_priority_retry_and_dedup_are_independent_of_enumeration_order() {
-    for inputs in [
-        vec![
-            nxp_dev("usage2", 0xff42, 2, 1),
-            nxp_dev("usage1", 0xff42, 1, 1),
-        ],
-        vec![
-            nxp_dev("iface2", 0xff42, 2, 2),
-            nxp_dev("usage1", 0xff42, 1, 1),
-        ],
-    ] {
-        let h = FakeHid::new(
-            inputs,
-            vec![Step::Write(padded(&[0, 0x0e, 0x50], 65)), rd(&nxp(4, true))],
-        );
-        assert_eq!(poll("corsair", &h)[0].level, Some(100));
-        assert_eq!(*h.opened.lock().unwrap(), vec!["usage1"]);
-        h.done();
-    }
-    let h = FakeHid::new(
-        vec![
-            nxp_dev("first", 0xff42, 1, 1),
-            nxp_dev("second", 0xff42, 2, 2),
-        ],
-        vec![
-            Step::Write(padded(&[0, 0x0e, 0x50], 65)),
-            rd(&[]),
-            Step::Write(padded(&[0, 0x0e, 0x50], 65)),
-            rd(&nxp(4, true)),
-        ],
-    );
-    assert_eq!(poll("corsair", &h)[0].level, Some(100));
-    assert_eq!(*h.opened.lock().unwrap(), vec!["first", "second"]);
-    h.done();
-}
-#[test]
-fn corsair_nxp_no_keyboard_fallback_when_vendor_exists_but_missing_vendor_can_fallback() {
-    let h = FakeHid::new(
-        vec![
-            nxp_dev("keyboard", 1, 2, 0),
-            nxp_dev("vendor", 0xff42, 1, 1),
-        ],
-        vec![Step::Write(padded(&[0, 0x0e, 0x50], 65)), rd(&[])],
-    );
-    assert!(poll("corsair", &h).is_empty());
-    assert_eq!(*h.opened.lock().unwrap(), vec!["vendor"]);
-    h.done();
-    let h = FakeHid::new(
-        vec![nxp_dev("fallback", 1, 2, 0)],
-        vec![Step::Write(padded(&[0, 0x0e, 0x50], 65)), rd(&nxp(1, true))],
-    );
-    assert_eq!(poll("corsair", &h)[0].level, Some(15));
-    h.done();
-}
-#[test]
-fn corsair_nxp_rejects_out_of_table_short_and_empty_replies() {
-    for reply in [
-        nxp(5, true),
-        nxp(255, false),
-        vec![0, 0x0e, 0x50, 0, 3],
-        vec![0],
-        vec![],
-    ] {
-        let h = FakeHid::new(
-            vec![nxp_dev("nxp", 0xff42, 1, 1)],
-            vec![Step::Write(padded(&[0, 0x0e, 0x50], 65)), rd(&reply)],
-        );
-        assert!(poll("corsair", &h).is_empty());
-        h.done();
-    }
-}
+// Dark Core now uses the measured Bragi exchange; see upstream115_io.rs.
 fn feature_reply(charging: u8, level: u8) -> Vec<u8> {
     vec![0, 0xa1, 0, 2, 2, 0, 0x83, charging, level]
 }
@@ -1134,10 +1019,10 @@ fn independent_family_identities_do_not_share_charging_or_sleeping_readings() {
 }
 
 #[test]
-fn corsair_headset_catalog_remains_separate_from_nxp_mouse() {
+fn corsair_original_headset_catalog_remains_separate_from_bragi_devices() {
     let got: std::collections::BTreeMap<_, _> = DEVICES
         .iter()
-        .filter(|d| d.provider == "corsair" && d.variant != "nxp")
+        .filter(|d| d.provider == "corsair" && d.variant.is_empty())
         .map(|d| (d.pid, d.name))
         .collect();
     assert_eq!(

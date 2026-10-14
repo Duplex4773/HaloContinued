@@ -426,7 +426,7 @@ fn corsair_requires_heartbeat_and_drains_between_handshake_and_battery() {
     use hb_providers::protocols::padded;
     let device = hb_providers::catalog::DEVICES
         .iter()
-        .find(|d| d.provider == "corsair" && d.variant != "nxp")
+        .find(|d| d.provider == "corsair" && d.variant.is_empty())
         .unwrap();
     let mut selected = info(device.vid, device.pid, 0);
     selected.interface = 4;

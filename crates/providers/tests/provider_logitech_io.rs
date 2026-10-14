@@ -7,6 +7,68 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn hidpp10_reads_charge_register_without_querying_feature_table() {
+    let mut ex = Exchange {
+        short: true,
+        ..Default::default()
+    };
+    ex.error(1, 0, 1, &[], 1);
+    ex.steps
+        .push(Step::Write(vec![0x10, 1, 0x81, 0x0d, 0, 0, 0]));
+    ex.read(vec![0x10, 1, 0x81, 0x0d, 73, 0, 0x50]);
+    ex.empty_slots();
+    let hid = FakeHid::new(receiver(0xc52b, "7&register", true), ex.steps);
+    let rows = poll(
+        &mut HidProvider::new("logitech"),
+        &hid,
+        &FakeClock::default(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].level, rows[0].charging), (Some(73), Some(true)));
+    hid.done();
+}
+#[test]
+fn hidpp10_charge_error_falls_back_to_coarse_status_and_both_error_forms_are_immediate() {
+    for error in [0x8f, 0xff] {
+        let mut ex = Exchange {
+            short: true,
+            ..Default::default()
+        };
+        ex.error(1, 0, 1, &[], 1);
+        ex.steps
+            .push(Step::Write(vec![0x10, 1, 0x81, 0x0d, 0, 0, 0]));
+        ex.read(vec![0x10, 1, error, 0x81, 0x0d, 2]);
+        ex.steps.push(Step::Write(vec![0x10, 1, 0x81, 7, 0, 0, 0]));
+        ex.read(vec![0x10, 1, 0x81, 7, 3, 0x21, 0]);
+        ex.empty_slots();
+        let clock = FakeClock::default();
+        let hid = FakeHid::new(receiver(0xc52b, "7&register", true), ex.steps);
+        let rows = poll(&mut HidProvider::new("logitech"), &hid, &clock);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, Some(20));
+        assert_eq!(rows[0].precision, Precision::Coarse);
+        assert!(clock.monotonic() < Duration::from_millis(100));
+        hid.done();
+    }
+}
+#[test]
+fn hidpp10_without_short_collection_never_sends_register_command_on_long_collection() {
+    let mut ex = Exchange::default();
+    ex.error(1, 0, 1, &[], 1);
+    ex.empty_slots();
+    let hid = FakeHid::new(receiver(0xc52b, "7&register", false), ex.steps);
+    assert!(
+        poll(
+            &mut HidProvider::new("logitech"),
+            &hid,
+            &FakeClock::default()
+        )
+        .is_empty()
+    );
+    hid.done();
+}
+
 #[derive(Default)]
 struct Exchange {
     steps: Vec<Step>,

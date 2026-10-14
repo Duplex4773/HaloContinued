@@ -314,6 +314,46 @@
   [
     "corsair",
     6940,
+    2621,
+    "Corsair Virtuoso RGB Wireless SE",
+    "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2622,
+    "Corsair Virtuoso RGB Wireless SE",
+    "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2624,
+    "Corsair Virtuoso RGB Wireless SE",
+    "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2658,
+    "Corsair Virtuoso RGB Wireless XT",
+    "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2660,
+    "Corsair Virtuoso RGB Wireless XT",
+    "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
     2711,
     "Corsair HS80 Max Wireless",
     "",
@@ -324,7 +364,7 @@
     6940,
     7039,
     "Corsair Dark Core RGB Pro SE",
-    "nxp",
+    "bragi",
     0
   ],
   [
@@ -914,6 +954,22 @@
   [
     "hyperx_cloud3",
     1008,
+    1941,
+    "HyperX Cloud II Core Wireless",
+    "",
+    0
+  ],
+  [
+    "hyperx_cloud3",
+    1008,
+    2453,
+    "HyperX Cloud II Core Wireless",
+    "",
+    0
+  ],
+  [
+    "hyperx_cloud3",
+    1008,
     3229,
     "HyperX Cloud III Wireless",
     "",
@@ -1289,6 +1345,30 @@
   ],
   [
     "mchose",
+    8227,
+    61459,
+    "MCHOSE A5 Pro Max (1K receiver)",
+    "",
+    0
+  ],
+  [
+    "mchose",
+    8227,
+    61461,
+    "MCHOSE A5 Pro Max (4K receiver)",
+    "",
+    0
+  ],
+  [
+    "mchose",
+    8227,
+    61465,
+    "MCHOSE A5 Pro Max (wired)",
+    "",
+    0
+  ],
+  [
+    "mchose",
     14391,
     4107,
     "MCHOSE A7 V2 Ultra",
@@ -1332,6 +1412,22 @@
     1406,
     8201,
     "Nintendo Switch Pro Controller",
+    "",
+    0
+  ],
+  [
+    "nzxt",
+    7793,
+    8449,
+    "NZXT Lift Elite Wireless",
+    "",
+    0
+  ],
+  [
+    "nzxt",
+    7793,
+    8489,
+    "NZXT Lift Elite Wireless",
     "",
     0
   ],
@@ -1420,6 +1516,22 @@
     13652,
     62863,
     "ATK VXE R1 SE+ (wired)",
+    "",
+    0
+  ],
+  [
+    "pulsar",
+    14096,
+    13332,
+    "Pulsar X2 CrazyLight Mini (wired)",
+    "",
+    0
+  ],
+  [
+    "pulsar",
+    14096,
+    21510,
+    "Pulsar X2 CrazyLight Mini (2.4 GHz)",
     "",
     0
   ],
@@ -2088,6 +2200,22 @@
     63
   ],
   [
+    "steam",
+    10462,
+    4868,
+    "Steam Controller (2025)",
+    "",
+    0
+  ],
+  [
+    "steam",
+    10462,
+    4869,
+    "Steam Controller (2025)",
+    "",
+    0
+  ],
+  [
     "steelseries",
     4152,
     4690,
@@ -2436,6 +2564,14 @@
     4152,
     8970,
     "Arctis GameBuds",
+    "parse_gamebuds",
+    0
+  ],
+  [
+    "steelseries",
+    4152,
+    8983,
+    "Arctis GameBuds X",
     "parse_gamebuds",
     0
   ],

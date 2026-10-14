@@ -309,6 +309,7 @@ const CHECKS: &[(&str, &str)] = &[
         "low_sound",
         "Play a sound when battery is low (every 5 minutes)",
     ),
+    ("keep_disconnected", "Keep disconnected icons until exit"),
 ];
 fn setting_check_id(index: usize) -> u16 {
     // 112 and 113 belong to the separate polling permission controls.
@@ -1995,8 +1996,8 @@ impl State {
             100,
         );
         self.page_height = match self.page {
-            3 if self.more_options => 1230,
-            3 => 690,
+            3 if self.more_options => 1264,
+            3 => 724,
             6 => 1430,
             _ => 708,
         } - PAGE_TOP;
@@ -2037,7 +2038,7 @@ impl State {
                 }
             }
         }
-        self.page_height = if self.more_options { 1230 } else { 690 } - PAGE_TOP;
+        self.page_height = if self.more_options { 1264 } else { 724 } - PAGE_TOP;
         self.set_control_text(
             212,
             if self.more_options {
@@ -2892,11 +2893,13 @@ impl State {
                 self.query();
             }
             3 => {
+                // Leave a dedicated Appearance row for disconnected icons.
+                let lower = |y| y + 34;
                 let value = serde_json::to_value(&self.settings).unwrap_or_default();
                 self.heading(90, "Alerts and battery", 20, 70, 740);
                 self.heading(91, "Appearance", 20, 252, 740);
-                self.heading(92, "Battery checks", 20, 412, 740);
-                self.heading(93, "Device controls", 20, 492, 740);
+                self.heading(92, "Battery checks", 20, lower(412), 740);
+                self.heading(93, "Device controls", 20, lower(492), 740);
                 for (i, x, y, width) in [
                     (0, 20, 104, 360),
                     (1, 400, 104, 380),
@@ -2906,11 +2909,12 @@ impl State {
                     (3, 20, 288, 360),
                     (4, 400, 288, 380),
                     (7, 20, 322, 370),
+                    (13, 20, 392, 760),
                     (5, 400, 322, 380),
-                    (2, 400, 448, 380),
-                    (9, 20, 938, 760),
-                    (10, 20, 972, 760),
-                    (11, 20, 1048, 760),
+                    (2, 400, lower(448), 380),
+                    (9, 20, lower(938), 760),
+                    (10, 20, lower(972), 760),
+                    (11, 20, lower(1048), 760),
                 ] {
                     let (key, label) = CHECKS[i];
                     self.check(
@@ -2946,14 +2950,20 @@ impl State {
                     358,
                     380,
                 );
-                self.label(200, "Battery check interval (seconds)", 20, 452, 240);
-                self.edit(201, &self.settings.interval.to_string(), 270, 448, 100);
+                self.label(200, "Battery check interval (seconds)", 20, lower(452), 240);
+                self.edit(
+                    201,
+                    &self.settings.interval.to_string(),
+                    270,
+                    lower(448),
+                    100,
+                );
                 self.check(
                     112,
                     "Allow device settings changes",
                     self.settings.polling_controls,
                     20,
-                    528,
+                    lower(528),
                     360,
                 );
                 self.check(
@@ -2961,20 +2971,20 @@ impl State {
                     "Restore saved rates when the app starts",
                     self.settings.restore_polling_on_startup,
                     400,
-                    528,
+                    lower(528),
                     380,
                 );
                 self.control(216, w!("STATIC"),
                     "Enable this to change supported devices' polling rate, sensitivity (DPI) and sleep time on Devices.",
-                    WINDOW_STYLE::default(), 20, 566, 760, 46);
-                self.heading(207, "Device brands to monitor", 20, 674, 740);
+                    WINDOW_STYLE::default(), 20, lower(566), 760, 46);
+                self.heading(207, "Device brands to monitor", 20, lower(674), 740);
                 for (i, p) in providers().iter().enumerate() {
                     self.check(
                         300 + i as u16,
                         provider_label(p),
                         self.settings.enabled(p),
                         20 + (i as i32 % 4) * 190,
-                        708 + (i as i32 / 4) * 28,
+                        lower(708) + (i as i32 / 4) * 28,
                         180,
                     );
                 }
@@ -2986,7 +2996,7 @@ impl State {
                         "Advanced options"
                     },
                     20,
-                    622,
+                    lower(622),
                     200,
                 );
                 self.control(
@@ -2995,19 +3005,19 @@ impl State {
                     "Extra PlayStation checks are optional and may affect other controller apps.",
                     WINDOW_STYLE::default(),
                     20,
-                    1004,
+                    lower(1004),
                     760,
                     40,
                 );
-                self.heading(208, "About Halo Continued", 20, 1070, 740);
+                self.heading(208, "About Halo Continued", 20, lower(1070), 740);
                 self.label(
                     218,
                     concat!("Version ", env!("CARGO_PKG_VERSION"), " · Windows 11"),
                     20,
-                    1105,
+                    lower(1105),
                     440,
                 );
-                self.button(217, "Open data folder", 570, 1100, 210);
+                self.button(217, "Open data folder", 570, lower(1100), 210);
                 self.edit(
                     209,
                     self.settings
@@ -3016,14 +3026,14 @@ impl State {
                         .as_deref()
                         .unwrap_or(""),
                     20,
-                    1122,
+                    lower(1122),
                     740,
                 );
                 self.label(
                     219,
                     "Closing this window keeps battery monitoring running. Use the tray menu to exit.",
                     20,
-                    1156,
+                    lower(1156),
                     760,
                 );
                 self.button(210, "&Save settings", 20, 682, 160);
@@ -5657,11 +5667,13 @@ fn device_detail(d: &DeviceView) -> String {
 fn provider_label(id: &str) -> &str {
     match id {
         "razer" => "Razer",
+        "nzxt" => "NZXT Lift Elite",
+        "steam" => "Steam Controller",
         "audeze" => "Audeze Maxwell",
         "wlmouse" => "WLmouse",
         "mchose" => "MCHOSE",
         "hyperx_alpha2" => "HyperX Alpha 2",
-        "hyperx_cloud3" => "HyperX Cloud III",
+        "hyperx_cloud3" => "HyperX III / II Core",
         "hyperx_cloud3s" => "HyperX Cloud III S",
         "hyperx" => "HyperX Cloud II",
         "keychron" => "Keychron",
@@ -5877,7 +5889,7 @@ mod behaviour_tests {
     #[test]
     fn every_provider_has_a_unique_readable_settings_label() {
         let ids = providers();
-        assert_eq!(ids.len(), 28);
+        assert_eq!(ids.len(), 30);
         let labels = ids
             .iter()
             .map(|id| provider_label(id))
@@ -8770,6 +8782,56 @@ mod dashboard_lifecycle_tests {
                         state.apply_theme(DashboardTheme::new(dark, false));
                         expected = state.theme.as_ref().unwrap().palette.background;
                         state.build();
+                        if page == 3 {
+                            let mut boxes = Vec::new();
+                            for id in (0..CHECKS.len())
+                                .map(setting_check_id)
+                                .chain([112, 113, 206, 205])
+                            {
+                                let hwnd = state.controls[&id];
+                                if IsWindowVisible(hwnd).as_bool() {
+                                    let mut rect = RECT::default();
+                                    GetWindowRect(hwnd, &mut rect).unwrap();
+                                    boxes.push((id, rect));
+                                }
+                            }
+                            for (index, (id, a)) in boxes.iter().enumerate() {
+                                for (other, b) in &boxes[index + 1..] {
+                                    assert!(
+                                        a.right <= b.left
+                                            || b.right <= a.left
+                                            || a.bottom <= b.top
+                                            || b.bottom <= a.top,
+                                        "Settings controls {id} and {other} overlap"
+                                    );
+                                }
+                            }
+                            let retained_id = setting_check_id(
+                                CHECKS
+                                    .iter()
+                                    .position(|(key, _)| *key == "keep_disconnected")
+                                    .unwrap(),
+                            );
+                            for id in [206, retained_id] {
+                                let text = state.text(id);
+                                let checked = state.checked(id);
+                                send(state.controls[&id], WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
+                                send(state.controls[&id], WM_PAINT, WPARAM(0), LPARAM(0));
+                                send(
+                                    state.controls[&id],
+                                    windows::Win32::UI::Controls::WM_MOUSELEAVE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                                assert_eq!(state.text(id), text);
+                                assert_eq!(state.checked(id), checked);
+                            }
+                            assert_eq!(state.text(206), "Start at sign-in");
+                            assert_eq!(
+                                state.text(retained_id),
+                                "Keep disconnected icons until exit"
+                            );
+                        }
                         if advanced {
                             state.scroll_page(i32::MAX);
                         }

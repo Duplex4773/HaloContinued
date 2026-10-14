@@ -889,3 +889,13 @@ mod tests {
         ));
     }
 }
+
+/// Timestamp only: no input contents, hooks, interception or synthetic input.
+pub fn last_input_tick() -> Option<u32> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetLastInputInfo(&mut info).as_bool().then_some(info.dwTime) }
+}

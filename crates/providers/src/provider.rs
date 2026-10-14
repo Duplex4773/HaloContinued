@@ -11,6 +11,8 @@ use std::{
 
 pub const FAMILIES: &[(&str, &str)] = &[
     ("razer", "Razer mice, keyboards and headsets"),
+    ("nzxt", "NZXT Lift Elite Wireless"),
+    ("steam", "Steam Controller (2025)"),
     ("audeze", "Audeze Maxwell"),
     ("wlmouse", "WLmouse"),
     ("mchose", "MCHOSE"),
@@ -75,6 +77,9 @@ pub struct HidProvider {
     razer_status: u16,
     razer_cache: BTreeMap<String, (String, u8)>,
     centurion_features: BTreeMap<String, (u8, Option<u8>)>,
+    blackshark_reading: Option<(Option<u8>, Option<bool>)>,
+    corsair_budget: BTreeMap<String, Duration>,
+    wl_backoff: (u32, u8, u128),
 }
 impl HidProvider {
     pub fn new(id: &'static str) -> Self {
@@ -115,6 +120,9 @@ impl HidProvider {
             razer_status: 0,
             razer_cache: BTreeMap::new(),
             centurion_features: BTreeMap::new(),
+            blackshark_reading: None,
+            corsair_budget: BTreeMap::new(),
+            wl_backoff: (0, 0, 0),
         }
     }
     /// Enable the bounded first-listen window only for a one-shot diagnostic probe.
@@ -252,7 +260,9 @@ impl HidProvider {
                 .get(key)
                 .is_some_and(|at| now.saturating_sub(*at) < Duration::from_secs(300));
             live.contains(key)
-                && (recent || self.id == "jbl" || self.id == "razer" && reading.kind == "mouse")
+                && (recent
+                    || ["jbl", "pulsar"].contains(&self.id)
+                    || self.id == "razer" && reading.kind == "mouse")
                 || self.id == "mchose" && recent
         });
         self.last_observed
@@ -533,6 +543,7 @@ impl HidProvider {
     ) -> Result<Option<Battery>, ProviderError> {
         match self.id {
             "razer" if [0x555, 0x556].contains(&d.pid) => self.read_pa(s, c, false),
+            "razer" if d.pid == 0x0528 => self.query_blackshark2020(s, c),
             "razer" => self.read_razer(d, info, s, c),
             "barracuda" => self.read_pa(s, c, true),
             "wlmouse" if info.usage_page != 0xffff => {
@@ -669,6 +680,7 @@ impl HidProvider {
                 self.log("no power reply (events, short frames and invalid checksums are ignored)");
                 Ok(None)
             }
+            "mchose" if d.vid == 0x2023 => self.query_mchose_a5(s, c),
             "mchose" if d.vid == 0xa8a5 => {
                 s.write(&p::padded(&[0, 0x55, 0x30, 0xa5, 0x0b, 0x2e, 1, 1, 1], 65))?;
                 for _ in 0..25 {
@@ -834,6 +846,7 @@ impl HidProvider {
                 self.log("no charge in the status report (mouse off or asleep, or the 2.4G link is not up)");
                 Ok(None)
             }
+            "corsair" if d.variant == "bragi" => self.query_bragi(s, c, info),
             "corsair" if d.variant == "nxp" => {
                 s.write(&p::padded(&[0, 0x0e, 0x50], 65))?;
                 let reply = s.read(65, Duration::from_millis(500))?;
@@ -955,7 +968,11 @@ impl HidProvider {
             }
             "eightbitdo" => {
                 let mut seen_reports = BTreeMap::new();
-                let rid = if is_bluetooth(&info.path) { 1 } else { 4 };
+                let rid = if d.pid == 0x6009 || !is_bluetooth(&info.path) {
+                    4
+                } else {
+                    1
+                };
                 let deadline = (c.clock.monotonic() + Duration::from_millis(400)).min(c.deadline);
                 let mut reports = 0;
                 while c.active() && c.clock.monotonic() < deadline && reports < 16 {
@@ -979,7 +996,11 @@ impl HidProvider {
                     }
                 }
                 if seen_reports.is_empty() {
-                    self.log("nothing received: ordinary mode (not switched by Steam or a game)");
+                    self.log(if d.pid == 0x6009 {
+                        "Pro 3: no report received; controller may be asleep or held by another app"
+                    } else {
+                        "nothing received: ordinary mode (not switched by Steam or a game)"
+                    });
                 }
                 for (id, reply) in seen_reports {
                     self.log(format!(
@@ -1500,6 +1521,13 @@ impl HidProvider {
                     };
                     let ping = self.logitech_request(&mut *long, &mut short, c, slot, 0, 1, &[])?;
                     self.logitech_timeout = 600;
+                    if ping.is_none() && self.logitech_error == Some(1) {
+                        self.log(format!("slot {slot}: HID++ 1.0; reading battery registers"));
+                        if let Some(b) = self.logitech_registers(&mut *long, &mut short, c, slot)? {
+                            self.keep_logitech_register(b, long_info, group, slot, c, &mut found);
+                        }
+                        continue;
+                    }
                     if ping.is_none() {
                         if let Some(error) = self.logitech_error {
                             self.log(match error {
@@ -1546,6 +1574,7 @@ impl HidProvider {
                     } else {
                         name
                     };
+                    let mut battery_found = false;
                     for feature in [0x1004u16, 0x1000, 0x1001, 0x1f20] {
                         let index = self
                             .logitech_request(
@@ -1597,7 +1626,13 @@ impl HidProvider {
                         if !found.contains_key(&key) || reading.charging == Some(true) {
                             found.insert(key, reading);
                         }
+                        battery_found = true;
                         break;
+                    }
+                    if !battery_found
+                        && let Some(b) = self.logitech_registers(&mut *long, &mut short, c, slot)?
+                    {
+                        self.keep_logitech_register(b, long_info, group, slot, c, &mut found);
                     }
                 }
                 Ok(())
@@ -1645,6 +1680,7 @@ impl HidProvider {
             "am_infinity",
             "nintendo",
             "jbl",
+            "pulsar",
             "logitech",
         ]
         .contains(&self.id)
@@ -1656,7 +1692,7 @@ impl HidProvider {
         {
             return None;
         }
-        let expired = self.id != "jbl"
+        let expired = !["jbl", "pulsar"].contains(&self.id)
             && self
                 .last_observed
                 .get(key)
@@ -1690,6 +1726,7 @@ impl HidProvider {
     }
 }
 include!("upstream114.rs");
+include!("upstream115.rs");
 fn set_battery(r: &mut Reading, b: Battery) {
     r.level = Some(b.level);
     r.charging = b.charging.or(Some(false));
@@ -1711,6 +1748,13 @@ fn reading_key(id: &str, d: &Device, i: &HidInfo) -> String {
         )
     } else if ["wlmouse", "gwolves", "lamzu", "am_infinity", "lofree"].contains(&id) {
         format!("{}:{identity}", id)
+    } else if id == "corsair" && d.variant == "bragi" {
+        let family = match d.pid {
+            0x0a40 | 0x0a3d | 0x0a3e => 0x0a40,
+            0x0a62 | 0x0a64 => 0x0a64,
+            pid => pid,
+        };
+        format!("corsair:{family:04x}:{identity}")
     } else if id == "mchose" {
         format!("mchose:{:04x}:{identity}", d.vid)
     } else if id == "asus" {
@@ -1731,7 +1775,18 @@ fn reading_key(id: &str, d: &Device, i: &HidInfo) -> String {
     } else if id == "nintendo" {
         format!("switch:{:04x}:{identity}", d.pid)
     } else if ["hyperx_cloud3", "hyperx_alpha2"].contains(&id) {
-        format!("hyperx:{:04x}:{identity}", d.pid)
+        format!(
+            "hyperx:{:04x}:{identity}",
+            if id == "hyperx_cloud3" {
+                match d.pid {
+                    0x0c9d => 0x05b7,
+                    0x0795 => 0x0995,
+                    pid => pid,
+                }
+            } else {
+                d.pid
+            }
+        )
     } else {
         format!("{}:{:04x}:{identity}", id, d.pid)
     }
@@ -1778,6 +1833,7 @@ fn valid_identity_value(value: &str) -> Option<String> {
 fn candidate(id: &str, d: &Device, i: &HidInfo) -> bool {
     let usage = (i.usage_page, i.usage);
     match id {
+        "razer" if d.pid == 0x0528 => usage == (0xff00, 1),
         "razer" => d.pid != 0x053a,
         "barracuda" => i.usage_page == 0xff00,
         "audeze" => usage == (0xff13, 1),
@@ -1791,7 +1847,9 @@ fn candidate(id: &str, d: &Device, i: &HidInfo) -> bool {
         "am_infinity" => usage == (0xffff, 2),
         "asus" => i.interface == 0 && i.usage_page >= 0xff00,
         "mchose" => {
-            if d.vid == 0xa8a5 {
+            if d.vid == 0x2023 {
+                i.usage_page == 0xffff
+            } else if d.vid == 0xa8a5 {
                 i.usage_page == 0xff01
             } else {
                 i.usage_page >= 0xff00
@@ -1800,8 +1858,8 @@ fn candidate(id: &str, d: &Device, i: &HidInfo) -> bool {
         "keychron" => i.interface == 4,
         "pulsar" => usage == (0xff02, 2) || (i.interface == 1 && i.usage_page >= 0xff00),
         "corsair" => {
-            if d.variant == "nxp" {
-                i.usage_page == 0xff42
+            if ["nxp", "bragi"].contains(&d.variant) {
+                i.usage_page == 0xff42 && (d.variant != "bragi" || i.usage == 1)
             } else {
                 i.interface == 4 && i.usage_page >= 0xff00
             }
@@ -1844,9 +1902,9 @@ fn candidate_group(id: &str, d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool
                 .or_else(|| mine.first());
             picked.is_some_and(|picked| picked.path == i.path)
         }
-        "corsair" if d.variant == "nxp" => {
+        "corsair" if ["nxp", "bragi"].contains(&d.variant) => {
             if mine.iter().any(|other| other.usage_page == 0xff42) {
-                i.usage_page == 0xff42
+                i.usage_page == 0xff42 && (d.variant != "bragi" || i.usage == 1)
             } else {
                 true
             }
@@ -1917,6 +1975,7 @@ impl BatteryProvider for HidProvider {
             return Ok(Vec::new());
         }
         self.diagnostics.clear();
+        self.corsair_budget.clear();
         self.audeze_pending = false;
         self.playstation_pending = false;
         self.playstation_budget.clear();
@@ -1924,11 +1983,26 @@ impl BatteryProvider for HidProvider {
         for &vendor in &self.vendors {
             infos.extend(hid.enumerate(vendor)?);
         }
+        if ["nzxt", "steam"].contains(&self.id) {
+            return self.poll_added115(&infos, hid, c);
+        }
         if self.id != "logitech" {
             self.prune_enumerated(&infos, c.clock.monotonic());
         }
         if self.id == "jbl" {
             return self.poll_jbl(&infos, hid, c);
+        }
+        if self.id == "wlmouse" {
+            let signature = infos.iter().fold(0u128, |h, i| h ^ stable_guid(&i.path));
+            if signature != self.wl_backoff.2 {
+                self.wl_backoff = (0, 0, signature);
+            }
+            if self.last.is_empty() && self.wl_backoff.0 >= 3 && self.wl_backoff.1 < 4 {
+                self.wl_backoff.1 += 1;
+                self.log("WLmouse silent receiver: skipping expensive collection walk");
+                return Ok(Vec::new());
+            }
+            self.wl_backoff.1 = 0;
         }
         if self.id == "pulsar" {
             for info in &infos {
@@ -2041,6 +2115,7 @@ impl BatteryProvider for HidProvider {
         let mut output = Vec::new();
         let mut seen = BTreeSet::new();
         let mut errors = Vec::new();
+        let mut answered_bragi = BTreeSet::new();
         if self.id == "audeze" {
             for info in &infos {
                 if !DEVICES.iter().any(|d| {
@@ -2092,6 +2167,12 @@ impl BatteryProvider for HidProvider {
                 continue;
             }
             let key = reading_key(self.id, &d, i);
+            if self.id == "corsair"
+                && d.variant == "bragi"
+                && answered_bragi.contains(&(key.clone(), d.pid))
+            {
+                continue;
+            }
             if ["wlmouse", "gwolves", "lamzu"].contains(&self.id)
                 && output.iter().any(|r: &Reading| {
                     r.key == key
@@ -2108,6 +2189,8 @@ impl BatteryProvider for HidProvider {
                 "lamzu",
                 "asus",
                 "playstation",
+                "hyperx_cloud3",
+                "corsair",
             ]
             .contains(&self.id)
                 && seen.contains(&key)
@@ -2130,7 +2213,7 @@ impl BatteryProvider for HidProvider {
                 Ok(s) => s,
                 Err(e) => {
                     self.log(e.to_string());
-                    if self.id == "razer" && ![0x555, 0x556].contains(&d.pid) {
+                    if self.id == "razer" && ![0x528, 0x555, 0x556].contains(&d.pid) {
                         self.razer_dead.insert(
                             i.path.clone(),
                             c.clock.monotonic() + Duration::from_secs(300),
@@ -2139,9 +2222,11 @@ impl BatteryProvider for HidProvider {
                     if ["playstation", "eightbitdo"].contains(&self.id) {
                         let mut reading = Reading::new(&key, d.name, self.id, c.clock.unix());
                         if self.id == "eightbitdo" {
-                            reading.approx = Some(
-                                "level shown only while Steam or a game uses the controller".into(),
-                            );
+                            reading.approx = Some(if d.pid == 0x6009 {
+                                "Connected; waiting for a battery report".into()
+                            } else {
+                                "level shown only while Steam or a game uses the controller".into()
+                            });
                         }
                         if self.id == "playstation" {
                             let since = *self
@@ -2187,7 +2272,7 @@ impl BatteryProvider for HidProvider {
                 seen.insert(key.clone());
             }
             if self.id == "razer"
-                && ![0x555, 0x556].contains(&d.pid)
+                && ![0x528, 0x555, 0x556].contains(&d.pid)
                 && d.name.to_lowercase().contains("blackshark")
                 && result.as_ref().is_ok_and(|r| r.is_none())
             {
@@ -2235,7 +2320,7 @@ impl BatteryProvider for HidProvider {
                     seen.insert(key.clone());
                 }
             }
-            if self.id == "razer" && ![0x555, 0x556].contains(&d.pid) && result.is_err() {
+            if self.id == "razer" && ![0x528, 0x555, 0x556].contains(&d.pid) && result.is_err() {
                 self.razer_dead.insert(
                     i.path.clone(),
                     c.clock.monotonic() + Duration::from_secs(300),
@@ -2243,6 +2328,9 @@ impl BatteryProvider for HidProvider {
             }
             match result {
                 Ok(Some(b)) => {
+                    if self.id == "corsair" && d.variant == "bragi" {
+                        answered_bragi.insert((key.clone(), d.pid));
+                    }
                     let mut r = Reading::new(&key, d.name, self.id, c.clock.unix());
                     if self.id == "lofree"
                         && let Some(product) = i
@@ -2279,7 +2367,7 @@ impl BatteryProvider for HidProvider {
                         "steelseries",
                     ]
                     .contains(&self.id)
-                        && !(d.variant == "nxp"
+                        && !(["nxp", "bragi"].contains(&d.variant) && d.pid == 0x1b7f
                             || d.variant.contains("rival")
                             || d.variant.contains("aerox"))
                     {
@@ -2295,6 +2383,14 @@ impl BatteryProvider for HidProvider {
                     }
                     .into();
                     set_battery(&mut r, b);
+                    if self.id == "razer"
+                        && d.pid == 0x0528
+                        && let Some((level, charging)) = self.blackshark_reading
+                    {
+                        r.level = level;
+                        r.charging = charging;
+                        r.kind = "headset".into();
+                    }
                     if self.id == "audeze" {
                         self.stuck.remove(&key);
                         r.charging = Some([0x4b1a, 0x4b1e].contains(&d.pid));
@@ -2322,6 +2418,8 @@ impl BatteryProvider for HidProvider {
                         "lamzu",
                         "asus",
                         "playstation",
+                        "hyperx_cloud3",
+                        "corsair",
                     ]
                     .contains(&self.id)
                     {
@@ -2335,7 +2433,9 @@ impl BatteryProvider for HidProvider {
                             } else {
                                 d.name.into()
                             };
-                        } else if !["asus", "playstation"].contains(&self.id) {
+                        } else if !["asus", "playstation", "hyperx_cloud3", "corsair"]
+                            .contains(&self.id)
+                        {
                             let generic = d.name.to_lowercase().contains("receiver")
                                 || ["WLmouse", "G-Wolves mouse", "LAMZU Maya X"].contains(&d.name)
                                     && self.family_names.contains_key(&key);
@@ -2373,9 +2473,11 @@ impl BatteryProvider for HidProvider {
                         }
                         let mut r = Reading::new(&key, d.name, self.id, c.clock.unix());
                         if self.id == "eightbitdo" {
-                            r.approx = Some(
-                                "level shown only while Steam or a game uses the controller".into(),
-                            );
+                            r.approx = Some(if d.pid == 0x6009 {
+                                "Connected; waiting for a battery report".into()
+                            } else {
+                                "level shown only while Steam or a game uses the controller".into()
+                            });
                         }
                         if self.id == "playstation" && self.playstation_basic {
                             self.playstation_since.remove(&key);
@@ -2501,6 +2603,15 @@ impl BatteryProvider for HidProvider {
                     output.push(r)
                 }
             }
+        }
+        if self.id == "wlmouse" {
+            self.wl_backoff.0 = if output.iter().any(Reading::online) {
+                0
+            } else if errors.is_empty() {
+                self.wl_backoff.0.saturating_add(1)
+            } else {
+                self.wl_backoff.0
+            };
         }
         if output.is_empty() && !errors.is_empty() {
             Err(errors.remove(0))

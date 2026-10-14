@@ -258,14 +258,15 @@ impl Engine {
                 self.estimator.pause(&r.key);
                 let misses = self.misses.entry(r.key.clone()).or_default();
                 *misses = misses.saturating_add(1);
-                let limit = if ["xinput", "playstation"].contains(&provider) {
+                let limit = if ["xinput", "playstation", "steam"].contains(&provider) {
                     1
                 } else {
                     2
                 };
-                if *misses < limit {
+                if *misses < limit || self.settings.keep_disconnected && fresh.len() < 512 {
                     let mut cached = r.clone();
                     cached.connection = Connection::Stale;
+                    cached.charging = Some(false);
                     fresh.push(cached);
                 }
             }

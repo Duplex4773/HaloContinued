@@ -61,6 +61,8 @@ pub struct Settings {
     pub time_left: bool,
     pub percent_in_icon: bool,
     pub quiet_fullscreen: bool,
+    /// Retain unavailable devices until the process exits; off by default.
+    pub keep_disconnected: bool,
     pub status_file: bool,
     pub playstation_full_mode: bool,
     pub polling_controls: bool,
@@ -89,6 +91,7 @@ impl Default for Settings {
             time_left: true,
             percent_in_icon: false,
             quiet_fullscreen: true,
+            keep_disconnected: false,
             status_file: false,
             playstation_full_mode: false,
             polling_controls: false,

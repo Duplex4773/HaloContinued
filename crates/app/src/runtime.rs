@@ -171,6 +171,93 @@ fn provider_delay(interval: u64, quiet: bool, pending: Option<Duration>) -> Dura
             .max(Duration::from_secs(1))
     }
 }
+fn startup_discovery_delay(
+    delay: Duration,
+    empty: bool,
+    elapsed: Duration,
+    quiet: bool,
+) -> Duration {
+    if empty && !quiet && elapsed < Duration::from_secs(90) {
+        delay.min(Duration::from_secs(10))
+    } else {
+        delay
+    }
+}
+
+#[cfg(test)]
+mod upstream115_scheduling_tests {
+    use super::*;
+    #[test]
+    fn fast_startup_retry_is_bounded_and_does_not_override_gaming_or_known_devices() {
+        for (empty, elapsed, quiet, want) in [
+            (true, 0, false, 10),
+            (true, 89, false, 10),
+            (true, 90, false, 60),
+            (false, 0, false, 60),
+            (true, 0, true, 60),
+        ] {
+            assert_eq!(
+                startup_discovery_delay(
+                    Duration::from_secs(60),
+                    empty,
+                    Duration::from_secs(elapsed),
+                    quiet
+                ),
+                Duration::from_secs(want)
+            );
+        }
+        assert_eq!(
+            startup_discovery_delay(Duration::from_secs(3), true, Duration::ZERO, false),
+            Duration::from_secs(3)
+        );
+    }
+    #[test]
+    fn input_wake_only_checks_eligible_sleeping_devices_and_preserves_five_second_bound() {
+        let now = Instant::now();
+        let mut wake = InputWake::new(now);
+        assert!(!wake.due(now, false));
+        assert!(wake.due(now, true));
+        assert!(!wake.observe(Some(10)));
+        assert!(!wake.due(now + Duration::from_secs(4), true));
+        assert!(wake.due(now + Duration::from_secs(5), true));
+        assert!(wake.observe(Some(11)));
+        assert!(wake.due(now + Duration::from_secs(10), true));
+        assert!(!wake.observe(Some(11)));
+        assert!(!wake.due(now + Duration::from_secs(20), false));
+        assert!(wake.due(now + Duration::from_secs(20), true));
+        assert!(!wake.observe(Some(50)));
+        assert!(wake.due(now + Duration::from_secs(25), true));
+        assert!(!wake.observe(None));
+    }
+}
+struct InputWake {
+    next: Instant,
+    previous: Option<u32>,
+}
+impl InputWake {
+    fn new(now: Instant) -> Self {
+        Self {
+            next: now,
+            previous: None,
+        }
+    }
+    fn due(&mut self, now: Instant, wakeable: bool) -> bool {
+        if !wakeable {
+            self.previous = None;
+            return false;
+        }
+        if now < self.next {
+            return false;
+        }
+        self.next = now + Duration::from_secs(5);
+        true
+    }
+    fn observe(&mut self, tick: Option<u32>) -> bool {
+        let changed = self.previous.zip(tick).is_some_and(|(old, new)| old != new);
+        self.previous = tick;
+        changed
+    }
+}
 fn battery_provider_delay(
     id: &str,
     interval: u64,
@@ -1947,7 +2034,9 @@ fn run(
     commands: Receiver<Command>,
     events: Events,
 ) {
-    let mut startup_polling = StartupPolling::new(&settings, Instant::now());
+    let monitoring_started = Instant::now();
+    let mut input_wake = InputWake::new(monitoring_started);
+    let mut startup_polling = StartupPolling::new(&settings, monitoring_started);
     let mut boost = crate::boost::Boost::new(Instant::now());
     let mut saver = crate::battery_saver::BatterySaver::default();
     let mut saver_dirty = true;
@@ -2155,6 +2244,21 @@ fn run(
             Instant::now(),
         );
         was_quiet = quiet;
+        let now = Instant::now();
+        let wakeable = !simulate
+            && !suspended
+            && !stop
+            && !quiet
+            && engine
+                .provider_readings("pulsar")
+                .iter()
+                .any(|r| r.connection == Connection::Sleeping);
+        if input_wake.due(now, wakeable)
+            && input_wake.observe(hb_windows::system::last_input_tick())
+        {
+            due.insert("pulsar", now);
+        }
+
         let visible = configuration.visible.load(Ordering::Acquire) && !suspended && !stop;
         if visible && !configuration_visible {
             configuration_due = Instant::now();
@@ -2547,6 +2651,12 @@ fn run(
                     engine.settings.interval,
                     quiet,
                     r.provider.next_poll_delay(),
+                );
+                let delay = startup_discovery_delay(
+                    delay,
+                    engine.readings().is_empty(),
+                    monitoring_started.elapsed(),
+                    quiet,
                 );
                 schedule_completed_provider(&mut due, id, Instant::now(), delay);
                 providers.insert(id, r.provider);

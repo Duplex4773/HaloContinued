@@ -130,7 +130,15 @@ impl EnumerationCache {
             let immediate_or_due = c.short
                 && c.short_retry_at
                     .is_none_or(|at| now.saturating_sub(at) >= SHORT_RETRY);
-            if now.saturating_sub(c.at) < CACHE_TTL && !immediate_or_due {
+            // Fast Startup may expose no collections before receivers settle.
+            // Only empty boot inventories get a shorter TTL; later operation and
+            // successful sibling vendors keep the ordinary cache and epoch.
+            let ttl = if c.devices.is_empty() && now < Duration::from_secs(90) {
+                Duration::from_secs(10)
+            } else {
+                CACHE_TTL
+            };
+            if now.saturating_sub(c.at) < ttl && !immediate_or_due {
                 return Ok(c.devices.clone());
             }
         }
@@ -461,6 +469,51 @@ impl HidSession for Session {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    #[test]
+    fn empty_boot_inventory_refreshes_at_ten_seconds_without_revoking_siblings() {
+        let mut cache = EnumerationCache::default();
+        assert!(
+            cache
+                .enumerate(0x1e71, 0, Duration::ZERO, || Ok((vec![], 0)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            cache
+                .enumerate(0x1e71, 0, Duration::from_secs(9), || panic!(
+                    "cached empty inventory"
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cache
+                .enumerate(0x1e71, 0, Duration::from_secs(10), || Ok((infos(1), 1)))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            cache
+                .enumerate(0x1e71, 0, Duration::from_secs(20), || panic!(
+                    "working inventory keeps normal TTL"
+                ))
+                .unwrap()
+                .len(),
+            1
+        );
+        cache
+            .enumerate(0x28de, 0, Duration::from_secs(100), || Ok((vec![], 0)))
+            .unwrap();
+        assert!(
+            cache
+                .enumerate(0x28de, 0, Duration::from_secs(110), || panic!(
+                    "post-boot empty inventory keeps normal TTL"
+                ))
+                .unwrap()
+                .is_empty()
+        );
+    }
     #[test]
     fn census_shares_vendor_bursts_but_refreshes_on_expiry_and_connection_changes() {
         let mut cache = CensusCache::default();

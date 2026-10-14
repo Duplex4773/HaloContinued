@@ -18,6 +18,7 @@ supported controls.
 | Feature | What it offers |
 | --- | --- |
 | Battery monitoring | A tray icon for each battery-powered device, charging animation, warning colours, low-battery and full-charge notifications, and optional alert sounds. |
+| Disconnected devices | Optionally keep disconnected device icons greyed with their last battery level until the app exits. |
 | Polling rates | Read and change supported mouse and keyboard rates. Supported mice show the last confirmed rate on hover and offer rate selection in the tray menu. |
 | Automatic fullscreen boost | Opt in to a higher mouse polling rate during Windows-reported fullscreen gaming, then restore the previous rate on the desktop. |
 | Mouse sensitivity (DPI) | Read, change and restore sensitivity on selected Razer and Logitech mice. The app shows supported ranges and saves original settings before changes. |
@@ -56,7 +57,7 @@ is configured.
 
 ## Device support and limitations
 
-Battery monitoring covers **28 provider families** across supported mice,
+Battery monitoring covers **30 provider families and 326 hardware IDs** across supported mice,
 keyboards, headsets and controllers. Configuration support is narrower than
 battery support, and depends on the exact model, firmware and connection.
 
@@ -73,6 +74,34 @@ fullscreen boost/restoration and hardware sleep at the tested timeout. This does
 not verify every connection, sleep value or power-cycle behaviour. Battery
 reports inherited from HaloBattery retain their **User-verified in parent app**
 distinction. Simulated tests do not establish hardware verification.
+
+Battery support reviewed against HaloBattery **1.15.0 and subsequent fixes**
+through [`2251f05`](https://github.com/HeyOkay/HaloBattery/commit/2251f05):
+
+| Device or family | Added or corrected support | Hardware evidence |
+| --- | --- | --- |
+| Razer BlackShark V2 Pro (2020) | Receiver `1532:0528`; coarse readings, unknown power states and charging with unreliable percentages hidden. Its charging cable is not probed. | User-verified in parent app |
+| Steam Controller (2025) | Pucks `28DE:1304` and `1305`, independent controller slots; passive battery reads, charging and sleep retention. | User-verified in parent app |
+| NZXT Lift Elite Wireless | `1E71:2101` receiver and `2129` cable; battery and charging. | User-verified in parent app |
+| MCHOSE A5 Pro Max | `2023:F013` 1K receiver, `F015` 4K receiver and `F019` cable; battery and charging on the model's vendor collection. | 1K receiver user-verified in parent app; other connections retain protocol-based support |
+| Logitech HID++ 1.0 | Older devices read through battery registers, with coarse readings labelled where appropriate. | Register support user-verified in parent app |
+| HyperX Cloud II Core Wireless | `03F0:0995` and `0795`; battery and charging. | User-verified in parent app |
+| Pulsar X2 CrazyLight Mini | `3710:5406` receiver and `3414` cable. Pulsar/ATK/VXE sleeping readings remain while their receiver is present and refresh after activity. | Both connections user-verified in parent app |
+| SteelSeries Arctis GameBuds X | `1038:2317`; existing GameBuds battery exchange. | User-verified in parent app |
+| Corsair Dark Core RGB Pro SE | `1B1C:1B7F`; corrected routed battery reads with confirmation and bounded waits. | User-verified in parent app |
+| Corsair Virtuoso SE / XT | SE `1B1C:0A40`, `0A3E`, `0A3D`; XT `0A64`, `0A62`; model-specific framing, battery and charging. | `0A40` user-verified in parent app; remaining IDs unverified in parent app |
+| 8BitDo Pro 3 | Correct battery report over Bluetooth without changing controller mode. | Bluetooth user-verified in parent app |
+
+Receiver/cable readings share an icon when trusted hardware identity proves they
+belong together. Devices with ambiguous identities remain separate. These are
+battery-support additions; they do not expand polling, DPI or sleep write allowlists.
+
+After a slow Windows boot, an empty inventory is retried every ten seconds for
+up to ninety seconds. Sleeping Pulsar-family mice use Windows' last-input timestamp
+to request a targeted battery refresh, at most once every five seconds and outside
+quiet gaming. Input contents are never read or saved. Silent WLmouse receivers
+back off to every fifth scheduled poll after their initial attempts, with immediate
+recovery when their collection inventory changes.
 
 Fullscreen boost is off by default and enabled per mouse. Windows is checked
 every five seconds when needed; boosting requires ten seconds of stable
@@ -105,7 +134,7 @@ approval by every anti-cheat service.
 Insights learns from reliable battery drops and the time spent at confirmed
 polling rates. It excludes sleeping, charging, missing readings and uncertain
 transitions where appropriate. “Time used” estimates device availability; it
-does not monitor input or measure gaming time. Estimates remain in learning
+does not record keystrokes, mouse movements or gaming time. Estimates remain in learning
 until sufficient evidence is available.
 
 ## Performance: Rust versus upstream
@@ -115,7 +144,7 @@ HID discovery and tray graphics, event-driven waits and batched SQLite writes
 limit background work. Charging frames are pre-rendered; the animation timer
 stops when no icons need it. Dashboard graphics are released when it closes,
 and hovering an icon does not query hardware. The standard executable is about
-**3.24 MiB**, including HIDAPI, SQLite and the MSVC runtime.
+**3.30 MiB**, including HIDAPI, SQLite and the MSVC runtime.
 
 **Controlled comparison, 10 October 2026:** one simulated mouse, three-minute
 samples after warm-up, fresh data and dashboard never opened. CPU percentages
@@ -168,6 +197,12 @@ memory stayed around **5 MiB** (4.92–4.99 MiB after; 4.74–4.87 MiB before). 
 small CPU readings vary by a few Windows accounting ticks; the samples show no
 clear CPU regression, not a proven sustained reduction in background CPU or RAM.
 
+After the 1.15 support additions, a **14 October three-minute regression sample**
+with one simulated charging mouse and the dashboard closed recorded **0.035% of
+one logical core** and **4.59 MiB mean private memory** (4.71 MiB peak). It used the
+same release test harness and warm-up method. This checks the simulated background
+workload; newly supported hardware has not been resource-benchmarked locally.
+
 ## Build from source
 
 Requirements: Windows, Rust's MSVC toolchain (Rust 1.88 or newer), Visual Studio
@@ -189,7 +224,7 @@ and licences. Optional API/import validation uses `tools/validate-configuration.
 with ripgrep and Visual Studio's dumpbin installed.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Latest local validation: **685 passing tests**, with
+storage and the application. Latest local validation: **709 passing tests**, with
 four opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
@@ -203,7 +238,7 @@ hardware reports are the foundation of this project. “Inspired by” describes
 independent direction; it does not remove the port's upstream origins or credits.
 
 The port started from HaloBattery **1.13.0** (`a566a046`), with reviewed changes
-through **1.14.0** (`0e383bb`). Halo Continued is not an official HaloBattery release.
+through **1.15.0 and subsequent fixes** (`2251f05`). Halo Continued is not an official HaloBattery release.
 The upstream copyright notice is preserved alongside the continuation's notice
 in the [MIT licence](LICENSE).
 
@@ -221,6 +256,9 @@ Thanks also to the protocol researchers and contributors behind
 [Linux-Arctis-Manager](https://github.com/elegos/Linux-Arctis-Manager),
 [Arctis-Sound-Manager](https://github.com/loteran/Arctis-Sound-Manager) and
 [hitscan-battery](https://github.com/sopparus/hitscan-battery), along with the
-[original protocol contributors](https://github.com/HeyOkay/HaloBattery/tree/0e383bb560c04f9d9ac4b163b04941c6ade4cb85).
+[SDL controller researchers](https://github.com/libsdl-org/SDL),
+[sc2-research](https://github.com/CouchTurtle/sc2-research),
+[steambattery](https://github.com/eva-val/steambattery) and the
+[original protocol contributors](https://github.com/HeyOkay/HaloBattery/tree/2251f05).
 External protocol references are not runtime dependencies. Portable packages
 retain notices for the libraries they distribute.

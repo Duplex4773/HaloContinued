@@ -456,11 +456,13 @@ fn pulsar_capability_rejections_and_voltage_have_actionable_diagnostics() {
     let mut s = pulsar_steps(&bad);
     s.push(rd(&[]));
     let h = FakeHid::new(vec![d("pulsar", 0xf58a, 0xff02, 2, 1, "control")], s);
-    assert!(
-        p.poll(&h, &context(&FakeClock::default(), &AtomicBool::new(false)))
-            .unwrap()
-            .is_empty()
-    );
+    let retained = p
+        .poll(&h, &context(&FakeClock::default(), &AtomicBool::new(false)))
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].level, Some(78));
+    assert_eq!(retained[0].connection, Connection::Sleeping);
+    assert_eq!(retained[0].timestamp, r[0].timestamp);
     assert!(p.diagnostics().iter().any(|s| s.contains("no power reply")));
     h.done();
 }
