@@ -38,6 +38,7 @@ fn only_verified_change_resets_learning() {
         target: ControlTarget {
             device: ConfigurationDevice::from_reading(&Reading::new("a", "Mouse", "razer", 10)),
             generation: 2,
+            connection_stamp: None,
         },
         action: ControlAction::Read,
     };

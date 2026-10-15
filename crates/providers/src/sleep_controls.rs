@@ -193,7 +193,14 @@ pub fn execute(
                 "Connection changed or request cancelled",
             ));
         }
-        let mut session = GuardedSession::new(hid.open(i)?, hid, context, generation);
+        let stamp = crate::controls::connection_stamp(&request.target, hid, i)?;
+        let mut session = GuardedSession::new(
+            crate::controls::open_connected(hid, i, stamp)?,
+            hid,
+            context,
+            generation,
+        );
+        out.connection_stamp = stamp;
         match m.wire {
             Wire::Asus => asus_sleep(
                 &mut session,

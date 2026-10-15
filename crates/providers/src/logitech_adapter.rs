@@ -77,6 +77,7 @@ pub(crate) fn execute(
         capability: Capabilities,
         long: GuardedSession<'a>,
         short: Option<GuardedSession<'a>>,
+        connection_stamp: Option<ConnectionStamp>,
     }
     let mut routes = Vec::new();
     let mut uncertainty = None;
@@ -109,7 +110,8 @@ pub(crate) fn execute(
                 "device connection changed or configuration cancelled before opening",
             );
         }
-        let long = match hid.open(info) {
+        let stamp = hid.connection_stamp(info);
+        let long = match crate::controls::open_connected(hid, info, stamp) {
             Ok(s) => s,
             Err(e) => {
                 uncertainty = Some(e.message);
@@ -169,6 +171,7 @@ pub(crate) fn execute(
                 capability,
                 long,
                 short,
+                connection_stamp: stamp,
             });
         }
     }
@@ -185,6 +188,11 @@ pub(crate) fn execute(
         );
     }
     let mut route = routes.pop().unwrap();
+    if request.target.connection_stamp.is_some()
+        && request.target.connection_stamp != route.connection_stamp
+    {
+        return ControlOutcome::failed(request, "Mouse reconnected; automatic change cancelled");
+    }
     if let Some(error) = uncertainty {
         return ControlOutcome::failed(
             request,
@@ -230,7 +238,7 @@ pub(crate) fn execute(
         ))
     };
     let observation = result.observed_hz.map(|hz| PollingObservation {
-        target: ControlTarget { device: reading.clone(), generation },
+        target: ControlTarget { device: reading.clone(), generation, connection_stamp: route.connection_stamp },
         supported: route.capability.supported_hz.iter().filter_map(|h| PollingRate::try_from(*h).ok()).collect(),
         rate: if mode_verified {rate(Some(hz))} else {None},
         timestamp: context.clock.unix(),

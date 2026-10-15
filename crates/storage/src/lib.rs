@@ -529,13 +529,24 @@ impl Store {
                 .query(params![key, until.saturating_sub(7 * 86400), until])
                 .map_err(sql_error)?;
             while let Some(row) = rows.next().map_err(sql_error)? {
-                match row_text(row, 0).map_err(sql_error)? {
+                // One malformed event must not prevent the rest of the user's
+                // valid battery history from loading, or inflate activity counts.
+                let Ok(kind) = row_text(row, 0) else {
+                    continue;
+                };
+                let Ok(rate) = row.get::<_, u32>(1) else {
+                    continue;
+                };
+                if PollingRate::try_from(rate).is_err() {
+                    continue;
+                }
+                let Ok(previous) = row.get::<_, Option<u32>>(2) else {
+                    continue;
+                };
+                match kind {
                     "boost" => {
                         result.recent.boost_sessions += 1;
-                        let rate: u32 = row.get(1).map_err(sql_error)?;
-                        result.recent.normal_rate = row
-                            .get::<_, Option<u32>>(2)
-                            .map_err(sql_error)?
+                        result.recent.normal_rate = previous
                             .filter(|previous| *previous < rate)
                             .and_then(|hz| PollingRate::try_from(hz).ok());
                     }

@@ -341,6 +341,7 @@ fn request(t: &Transport) -> DpiRequest {
                 connection: Connection::Online,
                 capability: PollingCapability::Unavailable("Polling unrelated".into()),
             },
+            connection_stamp: None,
         },
         value: None,
         expected: None,

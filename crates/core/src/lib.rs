@@ -140,6 +140,11 @@ pub trait HidTransport: Send + Sync {
     fn generation(&self) -> u64 {
         0
     }
+    /// Read-only proof of this collection's current connection incarnation.
+    /// Called for configuration transactions, never for routine battery polling.
+    fn connection_stamp(&self, _info: &HidInfo) -> Option<ConnectionStamp> {
+        None
+    }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError>;
     fn open(&self, info: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError>;
 }

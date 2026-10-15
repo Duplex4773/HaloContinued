@@ -27,6 +27,7 @@ fn request() -> ControlRequest {
         target: ControlTarget {
             device: ConfigurationDevice::from_reading(&reading),
             generation: 0,
+            connection_stamp: None,
         },
         action: ControlAction::Apply(PollingRate::try_from(8000).unwrap()),
     }
@@ -77,6 +78,33 @@ fn exact_mchose_receiver_route_rejects_ambiguous_or_changed_identity() {
     }
 }
 
+#[test]
+fn mchose_recovery_requires_its_observed_connection_proof() {
+    struct Stamped<'a>(&'a FakeHid, Option<ConnectionStamp>);
+    impl HidTransport for Stamped<'_> {
+        fn enumerate(&self, v: u16) -> Result<Vec<HidInfo>, ProviderError> {
+            self.0.enumerate(v)
+        }
+        fn open(&self, i: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
+            self.0.open(i)
+        }
+        fn connection_stamp(&self, _: &HidInfo) -> Option<ConnectionStamp> {
+            self.1
+        }
+    }
+    for stamp in [ConnectionStamp::new(78), None] {
+        let h = FakeHid::new(vec![receiver()], vec![]);
+        let mut q = request();
+        q.target.connection_stamp = ConnectionStamp::new(77);
+        let clock = FakeClock::default();
+        let cancel = AtomicBool::new(false);
+        let out = HidDeviceController.execute(&q, &Stamped(&h, stamp), &context(&clock, &cancel));
+        assert!(out.failure.is_some());
+        assert!(!out.may_have_changed);
+        assert!(h.opened.lock().unwrap().is_empty());
+        h.done();
+    }
+}
 #[test]
 fn mchose_session_requires_online_mouse_current_epoch_and_permission() {
     let base = request();

@@ -143,6 +143,19 @@ pub struct ControlTarget {
     pub device: ConfigurationDevice,
     /// Enumeration epoch of the last successful configuration read.
     pub generation: u64,
+    /// Native connection incarnation, independent of enumeration cache refreshes.
+    /// Missing evidence keeps the conservative generation-only safety boundary.
+    pub connection_stamp: Option<ConnectionStamp>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionStamp(std::num::NonZeroU64);
+impl ConnectionStamp {
+    pub const fn new(value: u64) -> Option<Self> {
+        match std::num::NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlAction {

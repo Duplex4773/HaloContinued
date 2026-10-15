@@ -9,6 +9,28 @@ fn engine() -> Engine {
     Engine::new(Settings::default(), Estimator::default())
 }
 #[test]
+fn inventory_presence_matches_resolved_readings_and_enabled_providers() {
+    let mut e = engine();
+    assert!(!e.has_readings());
+    let mut hid = reading(80, false, 0);
+    hid.serial = Some("SYNTHETIC-UNIT".into());
+    let mut bluetooth = hid.clone();
+    bluetooth.key = "bluetooth:one".into();
+    bluetooth.source = "bluetooth".into();
+    e.apply("razer", Ok(vec![hid]), 0.0, false);
+    e.apply("bluetooth", Ok(vec![bluetooth]), 0.0, false);
+    assert!(e.has_readings());
+    assert_eq!(e.readings().len(), 1);
+    let mut settings = e.settings.clone();
+    settings.disabled_providers.insert("razer".into());
+    e.update_settings(settings.clone());
+    assert!(e.has_readings());
+    settings.bluetooth = false;
+    e.update_settings(settings);
+    assert!(!e.has_readings());
+    assert!(e.readings().is_empty());
+}
+#[test]
 fn low_alert_has_hysteresis_and_rearms_on_charge() {
     let mut e = engine();
     for (level, charge, expected) in [

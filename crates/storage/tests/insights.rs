@@ -18,6 +18,43 @@ fn observation(ts: i64, level: u8, hz: Option<u32>, session: Option<u64>) -> Usa
 }
 
 #[test]
+fn malformed_polling_events_do_not_hide_valid_history_or_inflate_activity_counts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let mut store = Store::open(&path).unwrap();
+    for ts in [0, 60, 120] {
+        store
+            .record_usage(&observation(ts, 90, Some(1000), Some(1)))
+            .unwrap();
+    }
+    store.flush().unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "INSERT INTO polling_events VALUES
+        ('synthetic-a','1',1,'manual',1000,NULL),
+        ('synthetic-a','2',2,'boost',2000,1000),
+        ('synthetic-a','3',3,'restore',1000,2000),
+        ('synthetic-a','4',4,'boost',-1,1000),
+        ('synthetic-a','5',5,'boost','damaged',1000),
+        ('synthetic-a','6',6,'boost',1234,1000),
+        ('synthetic-a','7',7,'boost',4000,'damaged'),
+        ('synthetic-a','8',8,X'FF',4000,1000),
+        ('synthetic-a','9',9,'restore',-1,2000),
+        ('synthetic-a','10',10,'manual',1234,NULL);",
+    )
+    .unwrap();
+    let insights = store.query_insights("synthetic-a", 120).unwrap();
+    assert_eq!(insights.recent.total_seconds, 120);
+    assert_eq!(insights.recent.manual_changes, 1);
+    assert_eq!(insights.recent.boost_sessions, 1);
+    assert_eq!(insights.recent.restores, 1);
+    assert_eq!(
+        insights.recent.normal_rate,
+        PollingRate::try_from(1000).ok()
+    );
+}
+
+#[test]
 fn pending_metadata_survives_drop_restart_and_rate_session_boundaries() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("history.db");

@@ -152,6 +152,7 @@ fn entry() -> Result<(), ProviderError> {
                 target: ControlTarget {
                     device,
                     generation: hid.generation(),
+                    connection_stamp: None,
                 },
                 action,
             };

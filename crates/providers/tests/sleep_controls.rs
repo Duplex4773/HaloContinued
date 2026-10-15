@@ -28,6 +28,8 @@ struct State {
     replies: VecDeque<Vec<u8>>,
     fail_send: bool,
     reconnect_on_set: bool,
+    arrival: u64,
+    reconnect_on_open: bool,
 }
 struct Transport {
     infos: Vec<HidInfo>,
@@ -39,6 +41,9 @@ struct Session {
     generation: Arc<AtomicU64>,
 }
 impl HidTransport for Transport {
+    fn connection_stamp(&self, _: &HidInfo) -> Option<ConnectionStamp> {
+        ConnectionStamp::new(self.state.lock().unwrap().arrival)
+    }
     fn enumerate(&self, v: u16) -> Result<Vec<HidInfo>, ProviderError> {
         Ok(self
             .infos
@@ -48,6 +53,10 @@ impl HidTransport for Transport {
             .collect())
     }
     fn open(&self, _: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
+        let mut state = self.state.lock().unwrap();
+        if state.reconnect_on_open {
+            state.arrival += 1;
+        }
         Ok(Box::new(Session {
             state: self.state.clone(),
             generation: self.generation.clone(),
@@ -112,7 +121,10 @@ fn fixture(pid: u16) -> Transport {
             serial: "TEST-DEVICE".into(),
             ..Default::default()
         }],
-        state: Arc::new(Mutex::new(State::default())),
+        state: Arc::new(Mutex::new(State {
+            arrival: 77,
+            ..Default::default()
+        })),
         generation: Arc::new(AtomicU64::new(1)),
     }
 }
@@ -130,10 +142,55 @@ fn request(t: &Transport, c: &PollContext<'_>, seconds: Option<u16>) -> SleepReq
         target: ControlTarget {
             device: discover(t, c).unwrap().remove(0),
             generation: 1,
+            connection_stamp: None,
         },
         seconds,
         expected: None,
     }
+}
+#[test]
+fn sleep_restore_uses_connection_proof_independently_of_refresh_generation() {
+    for arrival in [77, 78, 0] {
+        let t = fixture(0x00bf);
+        let clock = ClockFake::default();
+        let cancel = AtomicBool::new(false);
+        let c = context(&clock, &cancel);
+        t.state.lock().unwrap().replies.push_back(reply(300, false));
+        let mut r = request(&t, &c, None);
+        let baseline = execute(&r, &t, &c);
+        assert!(baseline.failure.is_none());
+        assert_eq!(baseline.connection_stamp, ConnectionStamp::new(77));
+        t.generation.store(2, Ordering::Relaxed);
+        {
+            let mut state = t.state.lock().unwrap();
+            state.arrival = arrival;
+            state.sent.clear();
+            state.replies = vec![reply(60, false), reply(300, true), reply(300, false)].into();
+        }
+        r.target.generation = 2;
+        r.target.connection_stamp = baseline.connection_stamp;
+        r.seconds = Some(300);
+        r.expected = Some(60);
+        let out = execute(&r, &t, &c);
+        assert_eq!(out.failure.is_none(), arrival == 77);
+        assert_eq!(out.may_have_changed, arrival == 77);
+        if arrival != 77 {
+            assert!(t.state.lock().unwrap().sent.is_empty());
+        }
+    }
+}
+#[test]
+fn sleep_reconnect_during_open_sends_no_reports() {
+    let t = fixture(0x00bf);
+    let clock = ClockFake::default();
+    let cancel = AtomicBool::new(false);
+    let c = context(&clock, &cancel);
+    t.state.lock().unwrap().reconnect_on_open = true;
+    let r = request(&t, &c, Some(60));
+    let out = execute(&r, &t, &c);
+    assert!(out.failure.is_some());
+    assert!(!out.may_have_changed);
+    assert!(t.state.lock().unwrap().sent.is_empty());
 }
 #[test]
 fn every_razer_model_uses_reviewed_transaction_id_and_every_minute_roundtrips() {

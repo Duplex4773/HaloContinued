@@ -425,6 +425,13 @@ impl Engine {
         }
         ready
     }
+    /// Identity precedence always retains at least one reading from a nonempty
+    /// enabled inventory. Checking presence needs no cloned, resolved snapshot.
+    pub fn has_readings(&self) -> bool {
+        self.by_provider
+            .iter()
+            .any(|(provider, readings)| self.settings.enabled(provider) && !readings.is_empty())
+    }
     pub fn readings(&self) -> Vec<Reading> {
         let all = self
             .by_provider

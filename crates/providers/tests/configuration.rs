@@ -112,6 +112,7 @@ fn corsair_every_approved_pid_is_visible_but_never_sends_configuration() {
                 target: ControlTarget {
                     device: d[0].clone(),
                     generation: 0,
+                    connection_stamp: None,
                 },
                 action,
             };
@@ -173,6 +174,7 @@ fn missing_negative_duplicate_and_conflicting_identity_collections_are_unavailab
                 target: ControlTarget {
                     device: device.clone(),
                     generation: 0,
+                    connection_stamp: None,
                 },
                 action,
             };

@@ -26,6 +26,8 @@ struct State {
     change_on_set: AtomicBool,
     change_on_read: AtomicBool,
     open_failure: AtomicBool,
+    arrival: AtomicU64,
+    change_arrival_on_open: AtomicBool,
 }
 struct Transport {
     devices: Vec<HidInfo>,
@@ -35,6 +37,9 @@ impl HidTransport for Transport {
     fn generation(&self) -> u64 {
         self.state.epoch.load(Ordering::Relaxed)
     }
+    fn connection_stamp(&self, _: &HidInfo) -> Option<ConnectionStamp> {
+        ConnectionStamp::new(self.state.arrival.load(Ordering::Relaxed))
+    }
     fn enumerate(&self, v: u16) -> Result<Vec<HidInfo>, ProviderError> {
         assert_eq!(v, 0x1532);
         Ok(self.devices.clone())
@@ -43,6 +48,9 @@ impl HidTransport for Transport {
         self.state.opens.fetch_add(1, Ordering::Relaxed);
         if self.state.open_failure.load(Ordering::Relaxed) {
             return Err(ProviderError::new("open refused"));
+        }
+        if self.state.change_arrival_on_open.load(Ordering::Relaxed) {
+            self.state.arrival.fetch_add(1, Ordering::Relaxed);
         }
         Ok(Box::new(Session(self.state.clone())))
     }
@@ -103,6 +111,7 @@ fn request(action: ControlAction) -> ControlRequest {
         target: ControlTarget {
             device: ConfigurationDevice::from_reading(&reading),
             generation: 3,
+            connection_stamp: None,
         },
         action,
     }
@@ -110,6 +119,7 @@ fn request(action: ControlAction) -> ControlRequest {
 fn transport() -> Transport {
     let state = Arc::new(State::default());
     state.epoch.store(3, Ordering::Relaxed);
+    state.arrival.store(77, Ordering::Relaxed);
     Transport {
         devices: vec![device()],
         state,
@@ -128,6 +138,48 @@ fn run(request: &ControlRequest, hid: &Transport, cancelled: bool) -> ControlOut
 }
 fn apply() -> ControlAction {
     ControlAction::Apply(PollingRate::try_from(8000).unwrap())
+}
+#[test]
+fn connection_proof_survives_cache_refresh_but_not_reconnect_or_missing_evidence() {
+    for arrival in [77, 78, 0] {
+        let hid = transport();
+        let baseline = run(&request(ControlAction::Read), &hid, false)
+            .observation
+            .unwrap();
+        assert_eq!(baseline.target.connection_stamp, ConnectionStamp::new(77));
+        hid.state.sent.lock().unwrap().clear();
+        hid.state.opens.store(0, Ordering::Relaxed);
+        // All three cases reuse the same path, serial, container and model.
+        hid.state.epoch.store(4, Ordering::Relaxed);
+        hid.state.arrival.store(arrival, Ordering::Relaxed);
+        let mut target = baseline.target;
+        target.generation = 4;
+        let outcome = run(
+            &ControlRequest {
+                target,
+                ..request(apply())
+            },
+            &hid,
+            false,
+        );
+        assert_eq!(outcome.failure.is_none(), arrival == 77);
+        assert_eq!(outcome.may_have_changed, arrival == 77);
+        if arrival != 77 {
+            assert_eq!(hid.state.opens.load(Ordering::Relaxed), 0);
+            assert!(hid.state.sent.lock().unwrap().is_empty());
+        }
+    }
+}
+#[test]
+fn reconnect_between_proof_and_open_sends_no_packets_even_without_event() {
+    let hid = transport();
+    hid.state
+        .change_arrival_on_open
+        .store(true, Ordering::Relaxed);
+    let outcome = run(&request(apply()), &hid, false);
+    assert!(outcome.failure.is_some());
+    assert!(!outcome.may_have_changed);
+    assert!(hid.state.sent.lock().unwrap().is_empty());
 }
 #[test]
 fn reads_fresh_epoch_and_ignores_display_name() {

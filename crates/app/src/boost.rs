@@ -66,12 +66,34 @@ impl Boost {
         now >= self.next_sample
     }
     pub fn observe_generation(&mut self, generation: u64) {
-        self.entries
-            .retain(|_, entry| entry.target.generation == generation);
+        self.entries.retain(|_, entry| {
+            if entry.target.generation != generation {
+                if entry.target.connection_stamp.is_none() {
+                    return false;
+                }
+                // Only rebind the cache epoch. The controller must still match
+                // the saved native connection stamp before opening/writing.
+                entry.target.generation = generation;
+            }
+            true
+        });
         if let Some(pending) = &self.pending
             && pending.request.target.generation != generation
         {
             pending.guard.cancel.store(true, Ordering::Release);
+        }
+    }
+    pub fn observe_provider(&mut self, provider: &str, readings: &[Reading]) {
+        self.entries.retain(|_, e| {
+            e.target.device.source != provider
+                || readings.iter().any(|r| {
+                    e.target.device.matches_reading(r) && r.connection != Connection::Stale
+                })
+        });
+        if let Some(p) = &self.pending
+            && !self.entries.contains_key(&p.request.target.device.key)
+        {
+            p.guard.cancel.store(true, Ordering::Release);
         }
     }
     /// Avoid resolving and cloning the device inventory on idle wakes. Once
@@ -223,6 +245,7 @@ impl Boost {
                     target: ControlTarget {
                         device: ConfigurationDevice::from_reading(r),
                         generation,
+                        connection_stamp: None,
                     },
                     boost,
                     baseline: None,
@@ -280,12 +303,22 @@ impl Boost {
         let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
+        if entry.target.generation != p.request.target.generation
+            && entry.target.connection_stamp.is_some()
+            && !outcome.may_have_changed
+        {
+            // Refresh cancelled before any SET: retain the verified original,
+            // then let the next transaction revalidate this connection.
+            return;
+        }
         let observation = outcome.observation.as_ref();
         if outcome.failure.is_some()
             || observation.is_none()
             || observation.is_some_and(|o| {
                 o.target.generation != entry.target.generation
                     || o.target.device != entry.target.device
+                    || (entry.target.connection_stamp.is_some()
+                        && o.target.connection_stamp != entry.target.connection_stamp)
             })
         {
             // Never retry an uncertain automatic SET, including restore.
@@ -301,6 +334,7 @@ impl Boost {
                     && o.supported.contains(&rate)
                 {
                     entry.baseline = Some(rate);
+                    entry.target.connection_stamp = o.target.connection_stamp;
                 } else {
                     self.entries.remove(key);
                 }
@@ -429,7 +463,10 @@ mod tests {
             request: request.request,
             key: request.target.device.key.clone(),
             observation: Some(PollingObservation {
-                target: request.target.clone(),
+                target: ControlTarget {
+                    connection_stamp: ConnectionStamp::new(1),
+                    ..request.target.clone()
+                },
                 supported: vec![rate(1000), rate(2000), rate(4000)],
                 rate: Some(rate(hz)),
                 timestamp: 0,
@@ -512,6 +549,9 @@ mod tests {
                     r[0].serial = Some("different-device".into());
                 }
                 if scenario == 3 {
+                    r[0].connection = Connection::Stale;
+                    b.observe_provider("simulation", &r);
+                    r[0].connection = Connection::Online;
                     assert!(b.next(&s, 2, &r).is_none());
                 }
             }
@@ -519,6 +559,147 @@ mod tests {
             settle(&mut b, now + Duration::from_secs(30), false);
             assert!(b.next(&s, 1, &r).is_none());
         }
+    }
+    #[test]
+    fn refresh_and_unrelated_changes_preserve_verified_restoration() {
+        let now = Instant::now();
+        let (settings, readings) = fixture();
+        let mut b = Boost::new(now);
+        settle(&mut b, now, true);
+        let read = b.next(&settings, 1, &readings).unwrap();
+        complete(&mut b, &read, 1000);
+        let apply = b.next(&settings, 1, &readings).unwrap();
+        complete(&mut b, &apply, 2000);
+        let mut other = readings[0].clone();
+        other.key.push_str(":other-unit");
+        // Changes to another mouse from the same provider are unrelated too.
+        b.observe_provider("simulation", &[readings[0].clone(), other]);
+        b.observe_provider("simulation", &readings);
+        for generation in 2..=20 {
+            b.observe_provider("logitech", &[]);
+            b.observe_generation(generation);
+            assert!(b.owns(&readings[0].key));
+            assert!(!b.needs_inventory(&settings));
+        }
+        settle(&mut b, now + Duration::from_secs(30), false);
+        let restore = b.next(&settings, 20, &readings).unwrap();
+        assert_eq!(restore.target.generation, 20);
+        assert_eq!(restore.target.connection_stamp, ConnectionStamp::new(1));
+        assert_eq!(
+            restore.action,
+            ControlAction::ApplyIf {
+                rate: rate(1000),
+                expected: rate(2000)
+            }
+        );
+        complete(&mut b, &restore, 1000);
+        assert!(!b.owns(&readings[0].key));
+    }
+    #[test]
+    fn refresh_before_set_preserves_ownership_but_uncertain_write_does_not() {
+        for changed in [false, true] {
+            let now = Instant::now();
+            let (settings, readings) = fixture();
+            let mut b = Boost::new(now);
+            settle(&mut b, now, true);
+            let read = b.next(&settings, 1, &readings).unwrap();
+            complete(&mut b, &read, 1000);
+            let apply = b.next(&settings, 1, &readings).unwrap();
+            complete(&mut b, &apply, 2000);
+            settle(&mut b, now + Duration::from_secs(30), false);
+            let restore = b.next(&settings, 1, &readings).unwrap();
+            let guard = b.guard(restore.request).unwrap();
+            b.observe_generation(2);
+            assert!(guard.cancel.load(Ordering::Acquire));
+            let mut failure =
+                ControlOutcome::failed(&restore, "refresh invalidated queued transaction");
+            failure.may_have_changed = changed;
+            b.complete(&failure);
+            let retry = b.next(&settings, 2, &readings);
+            assert_eq!(retry.is_some(), !changed);
+            if let Some(retry) = retry {
+                // A real reconnect is detected by the controller's fresh stamp.
+                b.complete(&ControlOutcome::failed(&retry, "connection stamp changed"));
+                assert!(b.next(&settings, 2, &readings).is_none());
+            }
+        }
+    }
+    #[test]
+    fn missing_proof_disconnect_and_changed_identity_revoke_recovery() {
+        for case in 0..4 {
+            let now = Instant::now();
+            let (settings, mut readings) = fixture();
+            let mut b = Boost::new(now);
+            settle(&mut b, now, true);
+            let read = b.next(&settings, 1, &readings).unwrap();
+            complete(&mut b, &read, 1000);
+            let apply = b.next(&settings, 1, &readings).unwrap();
+            complete(&mut b, &apply, 2000);
+            match case {
+                0 => {
+                    b.entries
+                        .get_mut(&readings[0].key)
+                        .unwrap()
+                        .target
+                        .connection_stamp = None;
+                    b.observe_generation(2);
+                }
+                1 => b.observe_provider("simulation", &[]),
+                2 => {
+                    readings[0].connection = Connection::Stale;
+                    b.observe_provider("simulation", &readings);
+                    readings[0].connection = Connection::Online;
+                }
+                _ => {
+                    readings[0].container = Some("new receiver".into());
+                    b.observe_provider("simulation", &readings);
+                }
+            }
+            settle(&mut b, now + Duration::from_secs(30), false);
+            assert!(b.next(&settings, 2, &readings).is_none());
+        }
+    }
+    #[test]
+    fn communication_failure_pauses_restore_without_discarding_original() {
+        let now = Instant::now();
+        let (settings, mut readings) = fixture();
+        let mut b = Boost::new(now);
+        settle(&mut b, now, true);
+        let read = b.next(&settings, 1, &readings).unwrap();
+        complete(&mut b, &read, 1000);
+        let apply = b.next(&settings, 1, &readings).unwrap();
+        complete(&mut b, &apply, 2000);
+        // Runtime does not report a failed provider poll as confirmed discovery.
+        readings[0].connection = Connection::Stale;
+        settle(&mut b, now + Duration::from_secs(30), false);
+        assert!(b.next(&settings, 2, &readings).is_none());
+        assert!(b.owns(&readings[0].key));
+        readings[0].connection = Connection::Online;
+        assert_eq!(
+            b.next(&settings, 2, &readings).unwrap().action.rate(),
+            Some(rate(1000))
+        );
+    }
+    #[test]
+    fn sleeping_device_keeps_original_until_it_wakes() {
+        let now = Instant::now();
+        let (settings, mut readings) = fixture();
+        let mut b = Boost::new(now);
+        settle(&mut b, now, true);
+        let read = b.next(&settings, 1, &readings).unwrap();
+        complete(&mut b, &read, 1000);
+        let apply = b.next(&settings, 1, &readings).unwrap();
+        complete(&mut b, &apply, 2000);
+        readings[0].connection = Connection::Sleeping;
+        b.observe_provider("simulation", &readings);
+        settle(&mut b, now + Duration::from_secs(30), false);
+        assert!(b.next(&settings, 2, &readings).is_none());
+        assert!(b.owns(&readings[0].key));
+        readings[0].connection = Connection::Online;
+        assert_eq!(
+            b.next(&settings, 2, &readings).unwrap().action.rate(),
+            Some(rate(1000))
+        );
     }
     #[test]
     fn unknown_state_cancels_queued_work_and_clear_revokes_guard() {

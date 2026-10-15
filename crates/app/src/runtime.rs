@@ -20,6 +20,9 @@ use windows::{
 };
 pub enum Command {
     Refresh,
+    DeviceChanged {
+        arrival_or_removal: bool,
+    },
     ConfigurationVisible(bool),
     ConfigurationRefresh,
     Suspend,
@@ -155,7 +158,6 @@ enum WorkerCompleted {
 }
 enum Work {
     Command(Result<Command, crossbeam_channel::RecvError>),
-    ConnectionEvent,
     Completed(Result<WorkerCompleted, crossbeam_channel::RecvError>),
     Idle,
 }
@@ -826,9 +828,9 @@ struct DeviceEventGate {
     enumeration_completed: AtomicBool,
 }
 impl DeviceEventGate {
-    fn forward(&self, commands: &Sender<Command>, id: &str) {
+    fn forward(&self, commands: &Sender<Command>, id: &str, arrival_or_removal: bool) {
         if self.enumeration_completed.load(Ordering::Acquire) && relevant_device_event(id) {
-            let _ = commands.try_send(Command::Refresh);
+            let _ = commands.try_send(Command::DeviceChanged { arrival_or_removal });
         }
     }
 }
@@ -860,7 +862,7 @@ impl DeviceEvents {
             .Added(&TypedEventHandler::<_, DeviceInformation>::new(
                 move |_, args| {
                     if let Some(id) = args.as_ref().and_then(|a| a.Id().ok()) {
-                        added_gate.forward(&tx, &id.to_string());
+                        added_gate.forward(&tx, &id.to_string(), true);
                     }
                     Ok(())
                 },
@@ -872,7 +874,7 @@ impl DeviceEvents {
             .Updated(&TypedEventHandler::<_, DeviceInformationUpdate>::new(
                 move |_, args| {
                     if let Some(id) = args.as_ref().and_then(|a| a.Id().ok()) {
-                        updated_gate.forward(&tx, &id.to_string());
+                        updated_gate.forward(&tx, &id.to_string(), false);
                     }
                     Ok(())
                 },
@@ -883,7 +885,7 @@ impl DeviceEvents {
             .Removed(&TypedEventHandler::<_, DeviceInformationUpdate>::new(
                 move |_, args| {
                     if let Some(id) = args.as_ref().and_then(|a| a.Id().ok()) {
-                        gate.forward(&tx, &id.to_string());
+                        gate.forward(&tx, &id.to_string(), true);
                     }
                     Ok(())
                 },
@@ -939,7 +941,9 @@ fn worker(
             let controller_token = if winrt {
                 let tx = commands.clone();
                 RawGameController::RawGameControllerAdded(&EventHandler::new(move |_, _| {
-                    let _ = tx.try_send(Command::Refresh);
+                    let _ = tx.try_send(Command::DeviceChanged {
+                        arrival_or_removal: true,
+                    });
                     Ok(())
                 }))
                 .ok()
@@ -948,7 +952,9 @@ fn worker(
             };
             let removed_token = if winrt {
                 RawGameController::RawGameControllerRemoved(&EventHandler::new(move |_, _| {
-                    let _ = commands.try_send(Command::Refresh);
+                    let _ = commands.try_send(Command::DeviceChanged {
+                        arrival_or_removal: true,
+                    });
                     Ok(())
                 }))
                 .ok()
@@ -1322,7 +1328,11 @@ impl InitialPollingReads {
         );
         let request = ControlRequest {
             request: self.next_request,
-            target: ControlTarget { device, generation },
+            target: ControlTarget {
+                device,
+                generation,
+                connection_stamp: None,
+            },
             action: ControlAction::Read,
         };
         self.next_request += 1;
@@ -1468,7 +1478,11 @@ impl StartupPollingRestore {
                 .flatten();
             let request = ControlRequest {
                 request: self.next_request,
-                target: ControlTarget { device, generation },
+                target: ControlTarget {
+                    device,
+                    generation,
+                    connection_stamp: None,
+                },
                 action: ControlAction::Apply(rate),
             };
             self.next_request += 1;
@@ -1615,6 +1629,9 @@ impl HidSession for ControlSession {
 impl HidTransport for ControlTransport<'_> {
     fn generation(&self) -> u64 {
         self.hid.generation()
+    }
+    fn connection_stamp(&self, info: &HidInfo) -> Option<ConnectionStamp> {
+        self.hid.connection_stamp(info)
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
         if self.boost.as_ref().is_some_and(|g| !g.active()) {
@@ -1787,6 +1804,7 @@ fn simulate_control(
     }
     let mut target = request.target.clone();
     target.generation = generation;
+    target.connection_stamp = ConnectionStamp::new(1);
     ControlOutcome {
         request: request.request,
         key: target.device.key.clone(),
@@ -2222,6 +2240,9 @@ fn run(
         );
         usage_tracker.synchronize_clock(clock.unix());
         boost.observe_generation(hid.generation());
+        if saver_generation != hid.generation() {
+            saver.observe_generation(hid.generation());
+        }
         if suspended || stop || !engine.settings.polling_controls {
             boost.clear();
             saver.pause();
@@ -2484,7 +2505,7 @@ fn run(
         let work = if let Some(command) = startup_command.or(boost_command).or(saver_command) {
             Work::Command(Ok(command))
         } else {
-            select! {recv(commands)->m=>Work::Command(m),recv(event_rx)->_=>Work::ConnectionEvent,recv(result_rx)->r=>Work::Completed(r),default(wait)=>Work::Idle}
+            select! {recv(commands)->m=>Work::Command(m),recv(event_rx)->m=>Work::Command(m),recv(result_rx)->r=>Work::Completed(r),default(wait)=>Work::Idle}
         };
         match work {
             Work::Command(Ok(Command::Quit)) | Work::Command(Err(_)) => {
@@ -2596,7 +2617,11 @@ fn run(
             })) => {
                 let _ = storage.send(Storage::Insights(key, until, request));
             }
-            Work::ConnectionEvent => {
+            Work::Command(Ok(Command::DeviceChanged { arrival_or_removal })) => {
+                // Plug/unplug remains responsive while gaming. Routine property
+                // updates respect quiet cadence. Both paths coalesce event bursts
+                // through the existing due map instead of immediately polling.
+                let quiet_refresh = quiet && !arrival_or_removal;
                 hid.invalidate();
                 usage_tracker.invalidate(
                     hid.generation(),
@@ -2612,7 +2637,7 @@ fn run(
                         .chain(["bluetooth", "xinput"]),
                     Instant::now(),
                     &engine.settings,
-                    quiet,
+                    quiet_refresh,
                 );
             }
             Work::Completed(Ok(WorkerCompleted::Battery(mut r))) => {
@@ -2635,8 +2660,17 @@ fn run(
                     current,
                 );
                 if current {
+                    let inventory_confirmed = r.result.is_ok();
                     for n in engine.apply(id, r.result, clock.monotonic().as_secs_f64(), quiet) {
                         let _ = events.send(Event::Alert(n));
+                    }
+                    // Inspect the existing provider slice: no inventory clone,
+                    // timer, or extra discovery is needed for disconnect safety.
+                    // A communication failure only pauses writes. Successful
+                    // discovery of a missing/changed unit revokes its originals.
+                    if inventory_confirmed {
+                        boost.observe_provider(id, engine.provider_readings(id));
+                        saver.observe_provider(id, engine.provider_readings(id));
                     }
                     if let Some(level) = engine.take_low_battery_sound() {
                         let _ = hb_windows::system::play_low_battery_sound(level);
@@ -2654,7 +2688,7 @@ fn run(
                 );
                 let delay = startup_discovery_delay(
                     delay,
-                    engine.readings().is_empty(),
+                    !engine.has_readings(),
                     monitoring_started.elapsed(),
                     quiet,
                 );
@@ -3605,6 +3639,7 @@ mod tests {
                 target: ControlTarget {
                     device: simulated_keyboards().remove(0),
                     generation: 0,
+                    connection_stamp: None,
                 },
                 action,
             };
@@ -3664,6 +3699,7 @@ mod tests {
                     target: ControlTarget {
                         device: simulated_keyboards().remove(0),
                         generation: 0,
+                        connection_stamp: None,
                     },
                     action,
                 })
@@ -3689,6 +3725,7 @@ mod tests {
             target: ControlTarget {
                 device: keyboard.clone(),
                 generation: 0,
+                connection_stamp: None,
             },
             action: ControlAction::Apply(PollingRate::try_from(250).unwrap()),
         };
@@ -3720,6 +3757,7 @@ mod tests {
             target: ControlTarget {
                 device: unavailable,
                 generation: 0,
+                connection_stamp: None,
             },
             ..request
         };
@@ -4124,6 +4162,7 @@ mod tests {
             target: ControlTarget {
                 device: ConfigurationDevice::from_reading(&reading),
                 generation,
+                connection_stamp: None,
             },
             action,
         }
@@ -4439,22 +4478,24 @@ mod tests {
             "BTH-initial-controller",
             "Bluetooth-initial-keyboard",
         ] {
-            gate.forward(&commands, id);
+            gate.forward(&commands, id, true);
         }
         assert!(received.try_recv().is_err());
         // Added, Updated and Removed callbacks share this same gate. Once the
         // initial enumeration finishes, real HID/Bluetooth transitions retain
         // their existing refresh/invalidation behavior.
         gate.enumeration_completed.store(true, Ordering::Release);
-        for id in [
-            "HID#new-mouse",
-            "BTH-changed-controller",
-            "Bluetooth-removed-keyboard",
+        for (id, arrival_or_removal) in [
+            ("HID#new-mouse", true),
+            ("BTH-changed-controller", false),
+            ("Bluetooth-removed-keyboard", true),
         ] {
-            gate.forward(&commands, id);
-            assert!(matches!(received.try_recv(), Ok(Command::Refresh)));
+            gate.forward(&commands, id, arrival_or_removal);
+            assert!(
+                matches!(received.try_recv(), Ok(Command::DeviceChanged {arrival_or_removal: actual}) if actual == arrival_or_removal)
+            );
         }
-        gate.forward(&commands, "USB-unrelated-storage");
+        gate.forward(&commands, "USB-unrelated-storage", true);
         assert!(received.try_recv().is_err());
     }
     #[test]

@@ -18,6 +18,19 @@ fn reading(key: &str, timestamp: i64, level: u8) -> Reading {
 }
 
 #[test]
+fn repeated_inventory_presence_checks_allocate_nothing() {
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    engine.apply("test", Ok(vec![reading("invented", 0, 80)]), 0.0, false);
+    let (_, allocations) = measure(|| {
+        for _ in 0..1000 {
+            assert!(std::hint::black_box(&engine).has_readings());
+        }
+    });
+    assert_eq!(allocations.calls, 0);
+    assert_eq!(allocations.bytes, 0);
+}
+
+#[test]
 fn thirty_day_insights_consume_owned_rows_without_per_row_clones() {
     // Input ownership is established before measuring builder work.
     let observations: Vec<_> = (0..43_200)

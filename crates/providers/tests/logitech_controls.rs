@@ -491,6 +491,7 @@ fn control_request(action: ControlAction) -> ControlRequest {
         target: ControlTarget {
             device: ConfigurationDevice::from_reading(&reading),
             generation: 0,
+            connection_stamp: None,
         },
         action,
     }
@@ -512,6 +513,42 @@ fn route_scan(target_slot: u8, mode: Option<u8>) -> Vec<Step> {
 fn adapter(request: &ControlRequest, h: &dyn HidTransport, c: &FakeClock) -> ControlOutcome {
     use hb_providers::controls::HidDeviceController;
     HidDeviceController.execute(request, h, &context(c, &AtomicBool::new(false)))
+}
+#[test]
+fn adapter_connection_proof_survives_refresh_but_rejects_same_unit_reconnect() {
+    struct Stamped<'a>(&'a FakeHid, Option<ConnectionStamp>);
+    impl HidTransport for Stamped<'_> {
+        fn enumerate(&self, v: u16) -> Result<Vec<HidInfo>, ProviderError> {
+            self.0.enumerate(v)
+        }
+        fn open(&self, i: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
+            self.0.open(i)
+        }
+        fn connection_stamp(&self, _: &HidInfo) -> Option<ConnectionStamp> {
+            self.1
+        }
+    }
+    let h = FakeHid::new(vec![device(0xc54d)], route_scan(2, Some(2)));
+    let read = adapter(
+        &control_request(ControlAction::Read),
+        &Stamped(&h, ConnectionStamp::new(77)),
+        &FakeClock::default(),
+    );
+    let target = read.observation.unwrap().target;
+    assert_eq!(target.connection_stamp, ConnectionStamp::new(77));
+    h.done();
+    for stamp in [ConnectionStamp::new(78), None] {
+        // Same paired unit, container, model and receiver path; only connection changed.
+        let h = FakeHid::new(vec![device(0xc54d)], route_scan(2, Some(2)));
+        let q = ControlRequest {
+            target: target.clone(),
+            ..control_request(ControlAction::Apply(PollingRate::try_from(4000).unwrap()))
+        };
+        let out = adapter(&q, &Stamped(&h, stamp), &FakeClock::default());
+        assert!(out.failure.unwrap().contains("reconnected"));
+        assert!(!out.may_have_changed);
+        h.done(); // Only the identity/rate discovery reads were sent; no SET.
+    }
 }
 #[test]
 fn adapter_resolves_nonfirst_paired_slot_by_unit_and_revalidates_before_setting() {

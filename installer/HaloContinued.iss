@@ -3,10 +3,10 @@
   #error PackageDir must point to a freshly extracted portable package.
 #endif
 #ifndef ReleaseVersion
-  #define ReleaseVersion "1.0.0"
+  #define ReleaseVersion "1.0.1"
 #endif
 #ifndef NumericVersion
-  #define NumericVersion "1.0.0"
+  #define NumericVersion "1.0.1"
 #endif
 #ifndef DestinationDir
   #define DestinationDir "..\dist"

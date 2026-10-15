@@ -24,6 +24,8 @@ struct Entry {
     low: bool,
     rate: Setting,
     sleep: Setting,
+    rate_stamp: Option<ConnectionStamp>,
+    sleep_stamp: Option<ConnectionStamp>,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -41,6 +43,12 @@ impl Action {
         match self {
             Self::Polling(r) => &r.target.device.key,
             Self::Sleep(r) => &r.target.device.key,
+        }
+    }
+    fn target(&self) -> &ControlTarget {
+        match self {
+            Self::Polling(r) => &r.target,
+            Self::Sleep(r) => &r.target,
         }
     }
 }
@@ -112,6 +120,23 @@ impl BatterySaver {
             e.sleep = Setting::Done;
         }
     }
+    pub fn observe_provider(&mut self, provider: &str, readings: &[Reading]) {
+        for entry in self.entries.values_mut() {
+            if entry.target.device.source == provider
+                && !readings.iter().any(|r| {
+                    entry.target.device.matches_reading(r) && r.connection != Connection::Stale
+                })
+            {
+                entry.rate = Setting::Done;
+                entry.sleep = Setting::Done;
+                if let Some(p) = &self.pending
+                    && p.action.key() == entry.target.device.key
+                {
+                    p.cancel.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
     pub fn observe(
         &mut self,
         settings: &Settings,
@@ -122,12 +147,7 @@ impl BatterySaver {
         if !settings.polling_controls {
             return;
         }
-        for entry in self.entries.values_mut() {
-            if entry.target.generation != generation {
-                entry.rate = Setting::Done;
-                entry.sleep = Setting::Done;
-            }
-        }
+        self.observe_generation(generation);
         for r in readings {
             if !r.online()
                 || r.kind != "mouse"
@@ -144,7 +164,7 @@ impl BatterySaver {
                 .and_then(|p| p.low_battery_mode)
                 .filter(LowBatteryMode::valid);
             if let Some(e) = self.entries.get_mut(&r.key) {
-                if e.target.generation != generation || !e.target.device.matches_reading(r) {
+                if !e.target.device.matches_reading(r) {
                     e.rate = Setting::Done;
                     e.sleep = Setting::Done;
                 }
@@ -167,17 +187,40 @@ impl BatterySaver {
                         target: ControlTarget {
                             device: ConfigurationDevice::from_reading(r),
                             generation,
+                            connection_stamp: None,
                         },
                         choices,
                         low: true,
                         rate: Setting::New,
                         sleep: Setting::New,
+                        rate_stamp: None,
+                        sleep_stamp: None,
                     },
                 );
             }
         }
         self.entries
             .retain(|_, e| e.low || e.rate != Setting::Done || e.sleep != Setting::Done);
+    }
+    /// Cheap epoch rebinding must run even while a worker is in flight, before
+    /// its cancellation outcome is processed. No inventory or native queries.
+    pub fn observe_generation(&mut self, generation: u64) {
+        for entry in self.entries.values_mut() {
+            if entry.target.generation != generation {
+                if entry.rate_stamp.is_none() {
+                    entry.rate = Setting::Done;
+                }
+                if entry.sleep_stamp.is_none() {
+                    entry.sleep = Setting::Done;
+                }
+                entry.target.generation = generation;
+                if let Some(p) = &self.pending
+                    && p.action.key() == entry.target.device.key
+                {
+                    p.cancel.store(true, Ordering::Release);
+                }
+            }
+        }
     }
     pub fn next(
         &mut self,
@@ -252,14 +295,20 @@ impl BatterySaver {
                 let request = if sleep {
                     Action::Sleep(SleepRequest {
                         request: id,
-                        target: e.target.clone(),
+                        target: ControlTarget {
+                            connection_stamp: e.sleep_stamp,
+                            ..e.target.clone()
+                        },
                         seconds: value.map(|v| v as u16),
                         expected: expected.map(|v| v as u16),
                     })
                 } else {
                     Action::Polling(ControlRequest {
                         request: id,
-                        target: e.target.clone(),
+                        target: ControlTarget {
+                            connection_stamp: e.rate_stamp,
+                            ..e.target.clone()
+                        },
                         action: match (value, expected) {
                             (Some(v), Some(x)) => ControlAction::ApplyIf {
                                 rate: PollingRate::try_from(v).unwrap(),
@@ -286,7 +335,14 @@ impl BatterySaver {
             .retain(|_, e| e.low || e.rate != Setting::Done || e.sleep != Setting::Done);
         action
     }
-    fn finish(&mut self, id: u64, value: Option<u32>, failed: bool) {
+    fn finish(
+        &mut self,
+        id: u64,
+        value: Option<u32>,
+        failed: bool,
+        may_have_changed: bool,
+        connection_stamp: Option<ConnectionStamp>,
+    ) {
         if !self.pending.as_ref().is_some_and(|p| p.action.id() == id) {
             return;
         }
@@ -295,12 +351,22 @@ impl BatterySaver {
             return;
         };
         let sleep = matches!(p.action, Action::Sleep(_));
+        if p.action.target().generation != e.target.generation
+            && p.action.target().connection_stamp.is_some()
+            && !may_have_changed
+        {
+            // A refresh before SET cannot have changed the owned setting.
+            // Keep the original; the next request still checks its connection.
+            return;
+        }
         let desired = if sleep {
             e.choices.sleep_seconds.map(u32::from)
         } else {
             e.choices.polling_rate.map(PollingRate::hz)
         };
         let failed = failed
+            || (p.action.target().connection_stamp.is_some()
+                && connection_stamp != p.action.target().connection_stamp)
             || (sleep
                 && value.is_some_and(|v| {
                     !hb_providers::sleep_controls::model(&e.target.device)
@@ -323,6 +389,16 @@ impl BatterySaver {
                 _ => Setting::Done,
             }
         };
+        let stamp = if sleep {
+            &mut e.sleep_stamp
+        } else {
+            &mut e.rate_stamp
+        };
+        *stamp = if *state == Setting::Done {
+            None
+        } else {
+            connection_stamp
+        };
     }
     pub fn polling_complete(&mut self, o: &ControlOutcome) {
         self.finish(
@@ -339,10 +415,20 @@ impl BatterySaver {
                             .is_some_and(|observed| !observed.supported.contains(&wanted))
                     })
                 }),
+            o.may_have_changed,
+            o.observation
+                .as_ref()
+                .and_then(|o| o.target.connection_stamp),
         );
     }
     pub fn sleep_complete(&mut self, o: &SleepOutcome) {
-        self.finish(o.request, o.seconds.map(u32::from), o.failure.is_some());
+        self.finish(
+            o.request,
+            o.seconds.map(u32::from),
+            o.failure.is_some(),
+            o.may_have_changed,
+            o.connection_stamp,
+        );
     }
 }
 
@@ -384,7 +470,10 @@ mod tests {
                 may_have_changed: r.action.rate().is_some(),
                 failure: None,
                 observation: Some(PollingObservation {
-                    target: r.target.clone(),
+                    target: ControlTarget {
+                        connection_stamp: ConnectionStamp::new(1),
+                        ..r.target.clone()
+                    },
                     supported: vec![rate(125), rate(1000), rate(2000)],
                     rate: Some(rate(value)),
                     timestamp: 100,
@@ -395,6 +484,7 @@ mod tests {
                 request: r.request,
                 key: r.target.device.key.clone(),
                 generation: 1,
+                connection_stamp: ConnectionStamp::new(1),
                 seconds: Some(value as u16),
                 may_have_changed: r.seconds.is_some(),
                 failure: None,
@@ -597,9 +687,100 @@ mod tests {
             activate(&mut b, &s, &r, &boost);
             if generation == 1 {
                 r[0].serial = Some("another mouse".into());
+            } else {
+                r[0].connection = Connection::Stale;
+                b.observe_provider("razer", &r);
+                r[0].connection = Connection::Online;
             }
             r[0].charging = Some(true);
             assert!(b.next(&s, generation, &r, 100, &boost).is_none());
+        }
+    }
+    #[test]
+    fn unrelated_refreshes_preserve_both_originals_and_connection_proofs() {
+        let (mut b, s, mut r, boost) = fixture();
+        activate(&mut b, &s, &r, &boost);
+        let mut other = r[0].clone();
+        other.key.push_str(":other-unit");
+        b.observe_provider("razer", &[r[0].clone(), other]);
+        b.observe_provider("razer", &r);
+        for generation in 2..=20 {
+            b.observe_provider("logitech", &[]);
+            b.observe(&s, generation, &r, 100);
+            assert!(!b.needs_action());
+        }
+        r[0].level = Some(25);
+        let polling = b.next(&s, 20, &r, 100, &boost).unwrap();
+        assert_eq!(polling.target().connection_stamp, ConnectionStamp::new(1));
+        assert_eq!(polling.target().generation, 20);
+        assert!(
+            matches!(&polling, Action::Polling(q) if q.action == ControlAction::ApplyIf {rate: rate(1000), expected: rate(125)})
+        );
+        complete(&mut b, &polling, 1000);
+        // A second refresh between the independent restores must preserve sleep.
+        let sleep = b.next(&s, 21, &r, 100, &boost).unwrap();
+        assert_eq!(sleep.target().connection_stamp, ConnectionStamp::new(1));
+        assert!(
+            matches!(&sleep, Action::Sleep(q) if q.seconds == Some(300) && q.expected == Some(60))
+        );
+        complete(&mut b, &sleep, 300);
+        assert!(b.next(&s, 21, &r, 100, &boost).is_none());
+    }
+    #[test]
+    fn safe_refresh_cancellation_preserves_restore_but_uncertain_set_is_not_retried() {
+        for sleep in [false, true] {
+            for changed in [false, true] {
+                let (mut b, s, mut r, boost) = fixture();
+                activate(&mut b, &s, &r, &boost);
+                r[0].level = Some(25);
+                if sleep {
+                    let polling = b.next(&s, 1, &r, 100, &boost).unwrap();
+                    complete(&mut b, &polling, 1000);
+                }
+                let restore = b.next(&s, 1, &r, 100, &boost).unwrap();
+                let guard = b.cancel(restore.id()).unwrap();
+                b.observe_generation(2);
+                assert!(guard.load(Ordering::Acquire));
+                match &restore {
+                    Action::Polling(q) => {
+                        let mut o = ControlOutcome::failed(q, "refresh before SET");
+                        o.may_have_changed = changed;
+                        b.polling_complete(&o);
+                    }
+                    Action::Sleep(q) => {
+                        let mut o = SleepOutcome::failed(q, "refresh before SET");
+                        o.may_have_changed = changed;
+                        b.sleep_complete(&o);
+                    }
+                }
+                let next = b.next(&s, 2, &r, 100, &boost);
+                if !changed {
+                    assert_eq!(next.as_ref().unwrap().target().generation, 2);
+                    assert_eq!(matches!(next, Some(Action::Sleep(_))), sleep);
+                } else {
+                    // Polling uncertainty does not discard the independent sleep restore.
+                    assert_eq!(next.is_some(), !sleep);
+                    if let Some(next) = next {
+                        assert!(matches!(next, Action::Sleep(_)));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn missing_connection_evidence_and_observed_disconnect_discard_originals() {
+        for disconnected in [false, true] {
+            let (mut b, s, mut r, boost) = fixture();
+            activate(&mut b, &s, &r, &boost);
+            if disconnected {
+                b.observe_provider("razer", &[]);
+            } else {
+                let e = b.entries.get_mut(&r[0].key).unwrap();
+                e.rate_stamp = None;
+                e.sleep_stamp = None;
+            }
+            r[0].level = Some(25);
+            assert!(b.next(&s, 2, &r, 100, &boost).is_none());
         }
     }
     #[test]
@@ -627,7 +808,10 @@ mod tests {
             may_have_changed: true,
             failure: None,
             observation: Some(PollingObservation {
-                target: q.target.clone(),
+                target: ControlTarget {
+                    connection_stamp: ConnectionStamp::new(1),
+                    ..q.target.clone()
+                },
                 supported: vec![rate(125), rate(1000), rate(2000)],
                 rate: Some(rate(hz)),
                 timestamp: 100,

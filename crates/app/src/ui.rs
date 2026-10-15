@@ -566,6 +566,7 @@ impl PollingUi {
                 ControlTarget {
                     device: reading,
                     generation: 0,
+                    connection_stamp: None,
                 },
                 ControlAction::Read,
             ),
@@ -591,6 +592,7 @@ impl PollingUi {
                         ControlTarget {
                             device: reading,
                             generation: self.generation,
+                            connection_stamp: None,
                         },
                         ControlAction::Apply(rate),
                     )
@@ -1575,7 +1577,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(0)
             }
             WM_DEVICECHANGE => {
-                s.runtime.send(Command::Refresh);
+                s.runtime.send(Command::DeviceChanged {
+                    arrival_or_removal: matches!(
+                        wp.0 as u32,
+                        DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE
+                    ),
+                });
                 LRESULT(1)
             }
             WM_POWERBROADCAST => {
@@ -2272,6 +2279,10 @@ impl State {
             (*self.context).paint.take();
         }
         self.polling.abandon();
+        self.sleep = SleepUi {
+            next: self.sleep.next,
+            ..SleepUi::default()
+        };
         self.dpi = DpiUi {
             next: self.dpi.next,
             ..DpiUi::default()
@@ -2546,10 +2557,11 @@ impl State {
             }
             let ptr = self.context;
             let dpi = GetDpiForWindow(self.monitor).max(96) as i32;
+            let title = wide(concat!("Halo Continued ", env!("CARGO_PKG_VERSION")));
             match CreateWindowExW(
                 WS_EX_CONTROLPARENT,
                 w!("HaloBatteryNext.Native"),
-                w!("Halo Continued"),
+                PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -4310,6 +4322,7 @@ impl State {
             target: ControlTarget {
                 device: device.clone(),
                 generation: self.polling.generation,
+                connection_stamp: None,
             },
             value,
             expected,
@@ -4734,6 +4747,7 @@ impl State {
             target: ControlTarget {
                 device: device.clone(),
                 generation: self.polling.generation,
+                connection_stamp: None,
             },
             seconds,
             expected: None,
@@ -5022,8 +5036,10 @@ impl State {
                 }
                 Event::Sleep(outcome) => {
                     if outcome.request & crate::battery_saver::REQUEST_BIT != 0 {
-                        self.sleep.outcome = Some(*outcome);
-                        self.polling_controls();
+                        if self.dashboard.is_some() {
+                            self.sleep.outcome = Some(*outcome);
+                            self.polling_controls();
+                        }
                         continue;
                     }
                     if self
@@ -6617,6 +6633,7 @@ mod popup_tests {
                 target: ControlTarget {
                     device: device.clone(),
                     generation: 3,
+                    connection_stamp: None,
                 },
                 supported: vec![rate, PollingRate::try_from(8000).unwrap()],
                 rate: Some(rate),
@@ -6688,6 +6705,7 @@ mod popup_tests {
                 target: ControlTarget {
                     device: device.clone(),
                     generation: 0,
+                    connection_stamp: None,
                 },
                 supported: vec![rate],
                 rate: Some(rate),
@@ -7086,6 +7104,7 @@ mod polling_tests {
                 target: ControlTarget {
                     device: reading(),
                     generation,
+                    connection_stamp: None,
                 },
                 supported: vec![rate(1000), rate(4000), rate(8000)],
                 rate: hz.map(rate),
@@ -7727,6 +7746,7 @@ mod tooltip_polling_tests {
             target: ControlTarget {
                 device: ConfigurationDevice::from_reading(&reading),
                 generation: 3,
+                connection_stamp: None,
             },
             supported: vec![PollingRate::try_from(2000).unwrap()],
             rate: Some(PollingRate::try_from(2000).unwrap()),
@@ -8301,6 +8321,19 @@ mod dashboard_lifecycle_tests {
                 state.series =
                     HistorySeries::calendar(vec![Reading::new("test", "Test", "test", 0)], 0, 10);
                 assert!(!state.series.samples.is_empty());
+                state.sleep.next = 77;
+                state.sleep.pending = Some((77, "test".into()));
+                state.sleep.shown_key = Some("test".into());
+                state.sleep.saver_key = Some("test".into());
+                state.sleep.outcome = Some(SleepOutcome {
+                    connection_stamp: None,
+                    request: 76,
+                    key: "test".into(),
+                    generation: 0,
+                    seconds: Some(300),
+                    may_have_changed: false,
+                    failure: None,
+                });
                 // Synchronous close enters proc while State is borrowed: it
                 // must defer rather than silently use DefWindowProc's destroy.
                 send(dashboard, WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -8313,6 +8346,14 @@ mod dashboard_lifecycle_tests {
             assert!(context.state.borrow().theme.is_none());
             assert!(context.paint.borrow().is_none());
             assert!(context.state.borrow().font.is_invalid());
+            {
+                let state = context.state.borrow();
+                assert_eq!(state.sleep.next, 77);
+                assert!(state.sleep.pending.is_none());
+                assert!(state.sleep.shown_key.is_none());
+                assert!(state.sleep.saver_key.is_none());
+                assert!(state.sleep.outcome.is_none());
+            }
             {
                 let mut state = context.state.borrow_mut();
                 assert!(state.series.samples.is_empty());
@@ -8539,6 +8580,7 @@ mod dashboard_lifecycle_tests {
                 let target = ControlTarget {
                     device: ConfigurationDevice::from_reading(&state.snapshot.devices[0].reading),
                     generation: state.polling.generation,
+                    connection_stamp: None,
                 };
                 state.polling.observations.insert(
                     "synthetic-mouse".into(),
@@ -9545,6 +9587,12 @@ mod dashboard_lifecycle_tests {
                     let mut state = context.state.borrow_mut();
                     state.open();
                     let window = state.dashboard.unwrap();
+                    let mut title = [0u16; 128];
+                    let title_length = GetWindowTextW(window, &mut title) as usize;
+                    assert_eq!(
+                        String::from_utf16_lossy(&title[..title_length]),
+                        concat!("Halo Continued ", env!("CARGO_PKG_VERSION"))
+                    );
                     // Exercise real sleep controls, in both themes, without touching hardware.
                     state.snapshot.devices[0].reading.key = "razer:00bf:SYNTHETIC-SLEEP".into();
                     state.snapshot.devices[0].reading.source = "razer".into();

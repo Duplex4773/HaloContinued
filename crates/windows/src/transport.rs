@@ -71,9 +71,22 @@ const SHORT_RETRY: Duration = Duration::from_secs(30);
 // deliberately much shorter than metadata caching: a new vendor poll or short
 // collection retry must still recover when Windows misses a connection event.
 const CENSUS_TTL: Duration = Duration::from_secs(1);
+struct InterfaceCensus {
+    counts: BTreeMap<u16, usize>,
+    complete: bool,
+}
+#[cfg(test)]
+impl From<BTreeMap<u16, usize>> for InterfaceCensus {
+    fn from(counts: BTreeMap<u16, usize>) -> Self {
+        Self {
+            counts,
+            complete: true,
+        }
+    }
+}
 #[derive(Default)]
 struct CensusCache {
-    sample: Option<(Duration, u64, BTreeMap<u16, usize>)>,
+    sample: Option<(Duration, u64, InterfaceCensus)>,
     queried: BTreeSet<u16>,
 }
 impl CensusCache {
@@ -82,7 +95,7 @@ impl CensusCache {
         vendor: u16,
         generation: u64,
         now: Duration,
-        refresh: impl FnOnce() -> Result<BTreeMap<u16, usize>, ProviderError>,
+        refresh: impl FnOnce() -> Result<InterfaceCensus, ProviderError>,
     ) -> Result<usize, ProviderError> {
         if let Some((at, epoch, counts)) = &self.sample
             && *epoch == generation
@@ -90,16 +103,21 @@ impl CensusCache {
             && now - *at < CENSUS_TTL
             && self.queried.insert(vendor)
         {
-            return Ok(counts.get(&vendor).copied().unwrap_or(0));
+            return Ok(counts.counts.get(&vendor).copied().unwrap_or(0));
         }
         // Do not reuse a stale/partial result if the native scan fails.
         self.sample = None;
         self.queried.clear();
         let counts = refresh()?;
-        let count = counts.get(&vendor).copied().unwrap_or(0);
+        let count = counts.counts.get(&vendor).copied().unwrap_or(0);
         self.sample = Some((now, generation, counts));
         self.queried.insert(vendor);
         Ok(count)
+    }
+    fn proves_absent(&self, vendor: u16) -> bool {
+        self.sample
+            .as_ref()
+            .is_some_and(|(_, _, sample)| sample.complete && !sample.counts.contains_key(&vendor))
     }
 }
 #[derive(Default)]
@@ -244,7 +262,7 @@ fn path_vendor_wide(path: &[u16]) -> Option<u16> {
 }
 /// Count paths without opening devices. HIDAPI may temporarily omit a collection
 /// whose zero-access metadata probe fails; this census makes that omission retryable.
-fn present_counts() -> Result<BTreeMap<u16, usize>, ProviderError> {
+fn present_counts() -> Result<InterfaceCensus, ProviderError> {
     let guid = unsafe { HidD_GetHidGuid() };
     let set = DeviceSet(
         unsafe {
@@ -258,9 +276,13 @@ fn present_counts() -> Result<BTreeMap<u16, usize>, ProviderError> {
         .map_err(|e| ProviderError::new(e.to_string()))?,
     );
     let mut paths: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
+    let mut complete = true;
     // The census only needs one variable-length native detail buffer at a time.
     let mut storage = Vec::<u64>::new();
     for index in 0..65536 {
+        if index == 65535 {
+            complete = false;
+        }
         let mut interface = SP_DEVICE_INTERFACE_DATA {
             cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
             ..Default::default()
@@ -279,6 +301,7 @@ fn present_counts() -> Result<BTreeMap<u16, usize>, ProviderError> {
                 SetupDiGetDeviceInterfaceDetailW(set.0, &interface, None, 0, Some(&mut size), None);
         }
         if !(8..=65536).contains(&size) {
+            complete = false;
             continue;
         }
         // u64 storage provides the alignment required by the variable-length
@@ -295,6 +318,7 @@ fn present_counts() -> Result<BTreeMap<u16, usize>, ProviderError> {
         }
         .is_err()
         {
+            complete = false;
             continue;
         }
         let offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
@@ -310,31 +334,27 @@ fn present_counts() -> Result<BTreeMap<u16, usize>, ProviderError> {
             let mut path = String::from_utf16_lossy(wide);
             path.make_ascii_lowercase();
             paths.entry(vendor).or_default().insert(path);
+        } else {
+            // An opaque virtual/native path could belong to the requested
+            // vendor. Fall back to HIDAPI instead of declaring it absent.
+            complete = false;
         }
     }
     // Only retain counts between polls, not paths or hardware identifiers.
-    Ok(paths
-        .into_iter()
-        .map(|(vendor, paths)| (vendor, paths.len()))
-        .collect())
+    Ok(InterfaceCensus {
+        counts: paths
+            .into_iter()
+            .map(|(vendor, paths)| (vendor, paths.len()))
+            .collect(),
+        complete,
+    })
 }
 fn error(e: hidapi::HidError) -> ProviderError {
     ProviderError::new(e.to_string())
 }
 fn metadata(info: &mut HidInfo) {
     let path = wide(&info.path);
-    let instance = info
-        .path
-        .trim_start_matches("\\\\?\\")
-        .split("#{")
-        .next()
-        .unwrap_or("")
-        .replace('#', "\\");
-    let name = wide(&instance);
-    let mut dev = 0;
-    if unsafe { CM_Locate_DevNodeW(&mut dev, PCWSTR(name.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) }
-        == CR_SUCCESS
-    {
+    if let Some(dev) = devnode(&info.path) {
         info.container = container(dev)
     }
     // Zero desired access preserves access to otherwise exclusive collections.
@@ -363,19 +383,58 @@ fn metadata(info: &mut HidInfo) {
         }
     }
 }
+fn devnode(path: &str) -> Option<u32> {
+    let instance = path
+        .trim_start_matches("\\\\?\\")
+        .split("#{")
+        .next()
+        .unwrap_or("")
+        .replace('#', "\\");
+    let name = wide(&instance);
+    let mut dev = 0;
+    (unsafe { CM_Locate_DevNodeW(&mut dev, PCWSTR(name.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) }
+        == CR_SUCCESS)
+        .then_some(dev)
+}
 impl HidTransport for WindowsHid {
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+    fn connection_stamp(&self, info: &HidInfo) -> Option<ConnectionStamp> {
+        let dev = devnode(&info.path)?;
+        let mut kind = DEVPROPTYPE::default();
+        let mut size = 8;
+        let mut bytes = [0u8; 8];
+        let result = unsafe {
+            CM_Get_DevNode_PropertyW(
+                dev,
+                &DEVPKEY_Device_LastArrivalDate,
+                &mut kind,
+                Some(bytes.as_mut_ptr()),
+                &mut size,
+                0,
+            )
+        };
+        if result != CR_SUCCESS || kind != DEVPROP_TYPE_FILETIME || size != 8 {
+            return None;
+        }
+        ConnectionStamp::new(u64::from_le_bytes(bytes))
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
         let generation = self.generation.load(Ordering::Relaxed);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.enumerate(vendor, generation, self.epoch.elapsed(), || {
-            let present = self
-                .census
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .count(vendor, generation, self.epoch.elapsed(), present_counts)?;
+            let (present, absent) = {
+                let mut census = self.census.lock().unwrap_or_else(|p| p.into_inner());
+                let present =
+                    census.count(vendor, generation, self.epoch.elapsed(), present_counts)?;
+                (present, census.proves_absent(vendor))
+            };
+            if absent {
+                // The shared native scan already proved there are no matching
+                // interfaces. Retain normal empty-cache expiry and event recovery.
+                return Ok((Vec::new(), 0));
+            }
             // add_devices targets a vendor; never enumerate unrelated vendor collections.
             let mut api = self.api.lock().unwrap_or_else(|p| p.into_inner());
             api.reset_devices().map_err(error)?;
@@ -523,7 +582,7 @@ mod cache_tests {
                 let count = cache
                     .count(vendor, generation, Duration::from_millis(millis), || {
                         scans += 1;
-                        Ok(BTreeMap::from([(0x1532, 3), (0x046d, 2)]))
+                        Ok(BTreeMap::from([(0x1532, 3), (0x046d, 2)]).into())
                     })
                     .unwrap();
                 assert_eq!(
@@ -546,7 +605,8 @@ mod cache_tests {
                 cache
                     .count(0x1532, 0, Duration::ZERO, || Ok(BTreeMap::from([(
                         0x1532, count
-                    )])))
+                    )])
+                    .into()))
                     .unwrap(),
                 count
             );
@@ -557,7 +617,7 @@ mod cache_tests {
         let mut cache = CensusCache::default();
         cache
             .count(0x1532, 0, Duration::ZERO, || {
-                Ok(BTreeMap::from([(0x1532, 3)]))
+                Ok(BTreeMap::from([(0x1532, 3)]).into())
             })
             .unwrap();
         assert!(
@@ -572,22 +632,61 @@ mod cache_tests {
             cache
                 .count(0x1532, 1, Duration::ZERO, || Ok(BTreeMap::from([(
                     0x1532, 4
-                )])))
+                )])
+                .into()))
                 .unwrap(),
             4
         );
         // A regressed injected clock cannot keep an entry cached indefinitely.
         cache
-            .count(0x1532, 1, Duration::from_secs(2), || Ok(BTreeMap::new()))
+            .count(0x1532, 1, Duration::from_secs(2), || {
+                Ok(BTreeMap::new().into())
+            })
             .unwrap();
         assert_eq!(
             cache
                 .count(0x1532, 1, Duration::from_secs(1), || Ok(BTreeMap::from([
                     (0x1532, 2)
-                ])))
+                ])
+                .into()))
                 .unwrap(),
             2
         );
+    }
+    #[test]
+    fn only_complete_census_proves_absence_and_failed_refresh_revokes_it() {
+        let mut cache = CensusCache::default();
+        assert!(!cache.proves_absent(0x1532));
+        for complete in [false, true] {
+            assert_eq!(
+                cache
+                    .count(0x1532, 0, Duration::ZERO, || Ok(InterfaceCensus {
+                        counts: BTreeMap::from([(0x046d, 2)]),
+                        complete,
+                    }))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(cache.proves_absent(0x1532), complete);
+            assert!(!cache.proves_absent(0x046d));
+        }
+        assert!(
+            cache
+                .count(0x1532, 1, Duration::ZERO, || {
+                    Err(ProviderError::new("temporarily inaccessible"))
+                })
+                .is_err()
+        );
+        assert!(!cache.proves_absent(0x1532));
+        assert_eq!(
+            cache
+                .count(0x1532, 1, Duration::ZERO, || {
+                    Ok(BTreeMap::from([(0x1532, 1)]).into())
+                })
+                .unwrap(),
+            1
+        );
+        assert!(!cache.proves_absent(0x1532));
     }
     fn infos(n: usize) -> Vec<HidInfo> {
         (0..n)

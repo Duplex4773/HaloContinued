@@ -66,7 +66,11 @@ pub(crate) fn execute(
             "device connection changed or configuration cancelled before opening",
         );
     }
-    let session = match hid.open(info) {
+    let stamp = match crate::controls::connection_stamp(&request.target, hid, info) {
+        Ok(stamp) => stamp,
+        Err(error) => return ControlOutcome::failed(request, error.message),
+    };
+    let session = match crate::controls::open_connected(hid, info, stamp) {
         Ok(session) => session,
         Err(error) => return ControlOutcome::failed(request, error.message),
     };
@@ -83,6 +87,7 @@ pub(crate) fn execute(
         target: ControlTarget {
             device: reading.clone(),
             generation,
+            connection_stamp: stamp,
         },
         supported: result
             .supported_hz

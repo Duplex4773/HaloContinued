@@ -102,6 +102,34 @@ pub fn polling_menu_rates(device: &ConfigurationDevice) -> &'static [u32] {
 #[derive(Default)]
 pub struct HidDeviceController;
 
+/// Pair a verified baseline with this connection, not a refresh-cache epoch.
+pub(crate) fn connection_stamp(
+    target: &ControlTarget,
+    hid: &dyn HidTransport,
+    info: &HidInfo,
+) -> Result<Option<ConnectionStamp>, ProviderError> {
+    let current = hid.connection_stamp(info);
+    if target.connection_stamp.is_some() && current != target.connection_stamp {
+        return Err(ProviderError::new(
+            "Device reconnected or its connection could not be verified; automatic change cancelled",
+        ));
+    }
+    Ok(current)
+}
+pub(crate) fn open_connected(
+    hid: &dyn HidTransport,
+    info: &HidInfo,
+    stamp: Option<ConnectionStamp>,
+) -> Result<Box<dyn HidSession>, ProviderError> {
+    let session = hid.open(info)?;
+    if stamp.is_some() && hid.connection_stamp(info) != stamp {
+        return Err(ProviderError::new(
+            "Device reconnected while opening; no command sent",
+        ));
+    }
+    Ok(session)
+}
+
 /// Enforce the enumeration epoch and cancellation before and after every call,
 /// including every write in a multi-packet operation.
 pub(crate) struct GuardedSession<'a> {
@@ -283,7 +311,11 @@ impl DeviceController for HidDeviceController {
                 "device connection changed or configuration cancelled before opening",
             );
         }
-        let session = match hid.open(info) {
+        let stamp = match connection_stamp(&request.target, hid, info) {
+            Ok(stamp) => stamp,
+            Err(e) => return ControlOutcome::failed(request, e.message),
+        };
+        let session = match open_connected(hid, info, stamp) {
             Ok(s) => s,
             Err(e) => return ControlOutcome::failed(request, e.message),
         };
@@ -302,6 +334,7 @@ impl DeviceController for HidDeviceController {
             target: ControlTarget {
                 device: reading.clone(),
                 generation,
+                connection_stamp: stamp,
             },
             supported: protocol
                 .rates()

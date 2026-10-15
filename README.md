@@ -7,18 +7,25 @@ device controls, history and battery insights. The aim is no noticeable
 performance compromise during work or gaming. The app still consumes resources;
 usage varies with connected devices, settings and dashboard activity.
 
-Current release: **1.0.0** for Windows 11 x64, available as an unsigned per-user
+Current release: **1.0.1** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.0.0 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.0/HaloContinued-1.0.0-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.0.0 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.0/HaloContinued-1.0.0-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. |
+| [**V1.0.1 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.1/HaloContinued-1.0.1-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.0.1 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.1/HaloContinued-1.0.1-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.0/HaloContinued-1.0.0-SHA256SUMS.txt)
-· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.0)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.1/HaloContinued-1.0.1-SHA256SUMS.txt)
+· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.1)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
+
+**New in 1.0.1:** Refresh and changes to other devices no longer discard verified
+original polling rates or sleep timers. Reconnect checks still prevent stale
+restoration. This release also reduces unnecessary device discovery and temporary
+allocations, fixes malformed Insights records, clears unused sleep-control state
+when the dashboard closes, and shows the app version in its title.
+[Read the changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.1).
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -192,6 +199,12 @@ every five seconds when needed; boosting requires ten seconds of stable
 fullscreen gaming, and restoration waits fifteen seconds on the desktop. Some
 borderless games are missed. Keep the app running for restoration.
 
+Refresh and changes to other devices preserve verified original polling rates
+and sleep timers. Before restoring, the app checks the target's Windows connection
+stamp, exact identity and current setting. A reconnect, missing connection proof
+after a refresh, or an uncertain write cancels that setting's automatic recovery.
+These checks run with configuration transactions; they add no background scan or timer.
+
 With device settings enabled, launch also checks supported mice's current polling
 rates in the background. Receivers have up to five minutes to become available;
 failed reads get up to three attempts, at least fifteen seconds apart. A confirmed
@@ -298,11 +311,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.0.0
+.\tools\package-rust.ps1 -Version 1.0.1
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.0.0-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.0.1-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -312,12 +325,12 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.0.0
+.\tools\package-installer.ps1 -Version 1.0.1
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.0.0-windows-x64-setup.exe`
-and `dist/HaloContinued-1.0.0-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.0.1-windows-x64-setup.exe`
+and `dist/HaloContinued-1.0.1-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with
@@ -328,7 +341,7 @@ upgrade from that version, including executable replacement, the Installed apps
 version and preservation of settings and history.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Latest local validation: **709 passing tests**, with
+storage and the application. Latest local validation: **727 passing tests**, with
 four opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
