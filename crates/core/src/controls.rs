@@ -50,26 +50,13 @@ impl ConfigurationDevice {
 
     /// Preferences only: never use this alias for HID authorization or observations.
     pub fn shared_preference_key(&self) -> Option<String> {
-        if self.kind != "mouse" || self.source != "razer" || self.via != "usb" {
-            return None;
-        }
-        let serial = self.serial.as_deref()?.trim().to_ascii_uppercase();
-        if !valid_unit_serial(&serial) {
-            return None;
-        }
-        let ("razer", pid, suffix) = preference_parts(&self.key)? else {
-            return None;
-        };
-        if suffix != serial {
-            return None;
-        }
-        let wireless = match pid {
-            "00be" | "00bf" => "00bf",
-            "00b6" | "00b7" => "00b7",
-            "00c0" | "00c1" => "00c1",
-            _ => return None,
-        };
-        Some(format!("razer:{wireless}:{serial}"))
+        shared_preference_key(
+            &self.key,
+            &self.kind,
+            &self.source,
+            &self.via,
+            self.serial.as_deref(),
+        )
     }
     pub fn from_reading(reading: &Reading) -> Self {
         Self {
@@ -101,6 +88,31 @@ impl Reading {
     pub fn wired_mouse(&self) -> bool {
         wired_mouse(&self.key, &self.kind, &self.source, &self.via)
     }
+}
+pub(crate) fn shared_preference_key(
+    key: &str,
+    kind: &str,
+    source: &str,
+    via: &str,
+    serial: Option<&str>,
+) -> Option<String> {
+    if kind != "mouse" || source != "razer" || via != "usb" {
+        return None;
+    }
+    let ("razer", pid, suffix) = preference_parts(key)? else {
+        return None;
+    };
+    let wireless = match pid {
+        "00be" | "00bf" => "00bf",
+        "00b6" | "00b7" => "00b7",
+        "00c0" | "00c1" => "00c1",
+        _ => return None,
+    };
+    let serial = serial?.trim().to_ascii_uppercase();
+    if !valid_unit_serial(&serial) || suffix != serial {
+        return None;
+    }
+    Some(format!("razer:{wireless}:{serial}"))
 }
 fn wired_mouse(key: &str, kind: &str, source: &str, via: &str) -> bool {
     kind == "mouse"

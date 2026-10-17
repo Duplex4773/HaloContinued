@@ -282,7 +282,7 @@ impl BatterySaver {
                         .sleep_seconds
                         .filter(|s| {
                             hb_providers::sleep_controls::model(&e.target.device)
-                                .is_some_and(|m| m.readable() && m.choices().contains(s))
+                                .is_some_and(|m| m.readable() && m.supports(*s))
                         })
                         .map(u32::from)
                 } else {
@@ -389,7 +389,7 @@ impl BatterySaver {
             || (sleep
                 && value.is_some_and(|v| {
                     !hb_providers::sleep_controls::model(&e.target.device)
-                        .is_some_and(|m| m.choices().contains(&(v as u16)))
+                        .is_some_and(|m| m.supports(v as u16))
                 }));
         let state = if sleep { &mut e.sleep } else { &mut e.rate };
         *state = if failed || p.cancel.load(Ordering::Acquire) || p.restoring {

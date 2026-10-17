@@ -742,9 +742,10 @@ impl Store {
         let mut rows = query
             .query(params![key, until.saturating_sub(30 * 86400), until])
             .map_err(sql_error)?;
-        // Continuity needs only time and awake state, not another owned copy
-        // of every reading and its strings during both chart passes.
+        // Keep time, awake state and one bounded identity; never copy every
+        // full reading during either chart pass.
         let mut previous: Option<(i64, bool, Option<u64>)> = None;
+        let mut identity: Option<usage_sampler::TimingIdentity> = None;
         let mut total = 0i64;
         while let Some(row) = rows.next().map_err(sql_error)? {
             let (Ok(timestamp), Ok(payload)) = (row.get::<_, i64>(0), row_text(row, 1)) else {
@@ -776,8 +777,10 @@ impl Store {
                 },
             };
             let reading_awake = reading.awake();
+            let same_identity = identity.as_ref().is_some_and(|old| old.matches(&reading));
             if let Some((timestamp, true, previous_session)) = previous
                 && reading_awake
+                && same_identity
                 && previous_session == session
                 && reading
                     .timestamp
@@ -785,6 +788,9 @@ impl Store {
                     .is_some_and(|delta| (1..=600).contains(&delta))
             {
                 total = total.saturating_add(reading.timestamp - timestamp);
+            }
+            if !same_identity {
+                identity = Some(usage_sampler::TimingIdentity::from(&reading));
             }
             previous = Some((reading.timestamp, reading_awake, session));
             visit(payload, &reading, total);

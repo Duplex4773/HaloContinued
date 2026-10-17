@@ -8,6 +8,34 @@ use support::allocation_counter::{TrackingAllocator, measure};
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
 #[test]
+fn unrelated_preference_link_checks_borrow_readings_without_allocations() {
+    let sample = reading("synthetic", 0, 80);
+    let mut unrelated_razer = sample.clone();
+    unrelated_razer.key = "razer:ffff:UNIT1234".into();
+    unrelated_razer.source = "razer".into();
+    unrelated_razer.kind = "mouse".into();
+    unrelated_razer.via = "usb".into();
+    unrelated_razer.serial = Some("UNIT1234".into());
+    let samples = [sample, unrelated_razer];
+    let mut settings = Settings::default();
+    let (_, owned) = measure(|| {
+        for sample in samples.iter().cycle().take(1000) {
+            settings.link_device(&ConfigurationDevice::from_reading(sample));
+        }
+    });
+    let (_, borrowed) = measure(|| {
+        for sample in samples.iter().cycle().take(1000) {
+            settings.link_reading(sample);
+        }
+    });
+    println!("1,000 unrelated preference checks: owned={owned:?}; borrowed={borrowed:?}");
+    assert!(owned.calls >= 1000);
+    assert_eq!(borrowed.calls, 0);
+    assert_eq!(borrowed.bytes, 0);
+    assert!(settings.device_links.is_empty());
+}
+
+#[test]
 fn unchanged_discharge_levels_reuse_estimator_identity_without_allocations() {
     let mut estimator = Estimator::default();
     let mut sample = reading("synthetic", 0, 80);

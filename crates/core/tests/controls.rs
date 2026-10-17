@@ -1,5 +1,26 @@
 use hb_core::*;
 #[test]
+fn borrowed_reading_links_preserve_descriptor_proof_and_preference_migration() {
+    for pid in ["00be", "00bf", "00b6", "00b7", "00c0", "00c1", "ffff"] {
+        for serial in [Some("UNIT1234"), Some("00000000"), Some("wrong-unit"), None] {
+            let mut reading = Reading::new(format!("razer:{pid}:UNIT1234"), "Mouse", "razer", 0);
+            reading.kind = "mouse".into();
+            reading.via = "usb".into();
+            reading.serial = serial.map(str::to_owned);
+            let mut owned = Settings::default();
+            owned.device_mut(&reading.key).name = Some("Saved mouse name".into());
+            let mut borrowed = owned.clone();
+            owned.link_device(&ConfigurationDevice::from_reading(&reading));
+            borrowed.link_reading(&reading);
+            assert_eq!(
+                serde_json::to_value(owned).unwrap(),
+                serde_json::to_value(borrowed).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn polling_is_opt_in_and_saved_intent_is_validated_independently() {
     assert!(!Settings::default().polling_controls);
     let settings = Settings::from_value(serde_json::json!({

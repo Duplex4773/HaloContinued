@@ -25,6 +25,7 @@ pub struct SleepModel {
     pub wire: Wire,
 }
 pub use crate::sleep_catalog::MODELS;
+const ASUS_CHOICES: &[u16] = &[0, 60, 120, 180, 300, 600];
 fn prefix(m: &SleepModel) -> String {
     if m.source == "asus" {
         format!("asus:{}:", m.name.to_lowercase().replace(' ', "-"))
@@ -35,9 +36,17 @@ fn prefix(m: &SleepModel) -> String {
 impl SleepModel {
     pub fn choices(&self) -> Vec<u16> {
         if matches!(self.wire, Wire::Asus) {
-            vec![0, 60, 120, 180, 300, 600]
+            ASUS_CHOICES.to_vec()
         } else {
             (self.minimum..=self.maximum).step_by(60).collect()
+        }
+    }
+    pub fn supports(&self, seconds: u16) -> bool {
+        if matches!(self.wire, Wire::Asus) {
+            ASUS_CHOICES.contains(&seconds)
+        } else {
+            (self.minimum..=self.maximum).contains(&seconds)
+                && (seconds - self.minimum).is_multiple_of(60)
         }
     }
     pub fn readable(&self) -> bool {
@@ -48,12 +57,34 @@ pub fn model(device: &ConfigurationDevice) -> Option<&'static SleepModel> {
     if device.kind != "mouse" || device.via != "usb" {
         return None;
     }
+    let (source, rest) = device.key.split_once(':')?;
+    let (code, identity) = rest.split_once(':')?;
+    if source != device.source || identity.is_empty() || identity.contains(":physical:") {
+        return None;
+    }
+    let pid = if source == "asus" {
+        None
+    } else {
+        if code.len() != 4
+            || !code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        Some(u16::from_str_radix(code, 16).ok()?)
+    };
     MODELS.iter().find(|m| {
-        device.source == m.source
-            && device
-                .key
-                .strip_prefix(&prefix(m))
-                .is_some_and(|s| !s.is_empty() && !s.contains(":physical:"))
+        m.source == source
+            && if source == "asus" {
+                m.name
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .map(|c| if c == ' ' { '-' } else { c })
+                    .eq(code.chars())
+            } else {
+                Some(m.pid) == pid
+            }
     })
 }
 fn collection(m: &SleepModel, i: &HidInfo) -> bool {
@@ -147,7 +178,7 @@ pub fn execute(
                 "Device connection changed. Refresh before trying again.",
             ));
         }
-        if request.seconds.is_some_and(|s| !m.choices().contains(&s)) {
+        if request.seconds.is_some_and(|s| !m.supports(s)) {
             return Err(ProviderError::new("Unsupported sleep duration"));
         }
         let infos = hid.enumerate(m.vendor)?;

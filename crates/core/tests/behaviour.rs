@@ -9,6 +9,65 @@ fn engine() -> Engine {
     Engine::new(Settings::default(), Estimator::default())
 }
 #[test]
+fn reused_keys_do_not_inherit_another_units_alerts_or_sound_cooldown() {
+    let mut e = engine();
+    e.settings.low_sound = true;
+    let mut first = reading(10, false, 0);
+    first.serial = Some("SYNTHETIC-FIRST-UNIT".into());
+    assert_eq!(e.apply("razer", Ok(vec![first]), 0.0, false).len(), 1);
+    assert_eq!(e.take_low_battery_sound(), Some(10));
+    let mut replacement = reading(10, false, 60);
+    replacement.serial = Some("SYNTHETIC-SECOND-UNIT".into());
+    let notes = e.apply("razer", Ok(vec![replacement]), 60.0, false);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].kind, NotificationKind::Low);
+    assert_eq!(e.take_low_battery_sound(), Some(10));
+
+    let mut e = engine();
+    let mut first = reading(98, true, 0);
+    first.serial = Some("SYNTHETIC-FIRST-UNIT".into());
+    e.apply("razer", Ok(vec![first.clone()]), 0.0, true);
+    first.level = Some(100);
+    first.timestamp = 60;
+    e.apply("razer", Ok(vec![first]), 60.0, true);
+    assert!(e.has_held_notifications());
+    let mut replacement = reading(100, false, 120);
+    replacement.serial = Some("SYNTHETIC-SECOND-UNIT".into());
+    assert!(
+        e.apply("razer", Ok(vec![replacement]), 120.0, false)
+            .is_empty()
+    );
+    assert!(!e.has_held_notifications());
+}
+#[test]
+fn reused_keys_do_not_inherit_another_units_live_estimate() {
+    for field in 0..4 {
+        let mut e = engine();
+        let old = reading(80, false, 0);
+        e.apply("razer", Ok(vec![old.clone()]), 0.0, false);
+        let estimate = e.estimator.devices.get_mut(&old.key).unwrap();
+        estimate.usage = 600.0;
+        estimate.samples = vec![(0.0, 90), (600.0, 80)];
+        e.estimator
+            .devices
+            .entry("unrelated".into())
+            .or_default()
+            .usage = 123.0;
+        let mut replacement = reading(50, false, 60);
+        match field {
+            0 => replacement.source = "replacement-source".into(),
+            1 => replacement.kind = "replacement-kind".into(),
+            2 => replacement.serial = Some("replacement-unit".into()),
+            _ => replacement.container = Some("replacement-container".into()),
+        }
+        e.apply("razer", Ok(vec![replacement]), 60.0, false);
+        let estimate = &e.estimator.devices[&old.key];
+        assert_eq!(estimate.usage, 0.0, "identity field {field}");
+        assert_eq!(estimate.samples, [(0.0, 50)]);
+        assert_eq!(e.estimator.devices["unrelated"].usage, 123.0);
+    }
+}
+#[test]
 fn conflicting_containers_and_ambiguous_serials_do_not_hide_bluetooth_devices() {
     for ambiguous in [false, true] {
         let mut e = engine();

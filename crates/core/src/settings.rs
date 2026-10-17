@@ -252,7 +252,20 @@ impl Settings {
         }
     }
     pub fn link_device(&mut self, device: &crate::ConfigurationDevice) {
-        let Some(canonical) = device.shared_preference_key() else {
+        self.link_preference(device.shared_preference_key());
+    }
+    /// Battery observations need no owned configuration descriptor to link preferences.
+    pub fn link_reading(&mut self, reading: &crate::Reading) {
+        self.link_preference(crate::controls::shared_preference_key(
+            &reading.key,
+            &reading.kind,
+            &reading.source,
+            &reading.via,
+            reading.serial.as_deref(),
+        ));
+    }
+    fn link_preference(&mut self, canonical: Option<String>) {
+        let Some(canonical) = canonical else {
             return;
         };
         let wired_pid = match canonical.split(':').nth(1) {

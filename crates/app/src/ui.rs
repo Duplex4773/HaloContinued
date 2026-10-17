@@ -4128,10 +4128,15 @@ impl State {
             }
             _ => None,
         };
-        let boost_supported =
-            reading.kind == "mouse" && matches!(reading.capability, PollingCapability::ReadWrite);
+        let observation = self.polling.observations.get(&reading.key).cloned();
+        let boost_supported = boost_controls_visible(
+            &reading,
+            observation.as_ref(),
+            self.settings
+                .device(&reading.key)
+                .and_then(|p| p.fullscreen_boost_rate),
+        );
         let key = reading.key;
-        let observation = self.polling.observations.get(&key).cloned();
         let current = observation.as_ref().and_then(|o| o.rate);
         self.label(
             44,
@@ -5130,8 +5135,7 @@ impl State {
         }
         if let Some(s) = latest {
             for view in &s.devices {
-                self.settings
-                    .link_device(&ConfigurationDevice::from_reading(&view.reading));
+                self.settings.link_reading(&view.reading);
             }
             let changed_labels: Vec<_> = s
                 .devices
@@ -5753,8 +5757,64 @@ fn tray_devices<'a>(snapshot: &'a Snapshot, settings: &Settings) -> Vec<Cow<'a, 
     devices
 }
 
+fn boost_controls_visible(
+    device: &ConfigurationDevice,
+    observation: Option<&PollingObservation>,
+    saved: Option<PollingRate>,
+) -> bool {
+    device.kind == "mouse"
+        && matches!(device.capability, PollingCapability::ReadWrite)
+        && (saved.is_some()
+            || observation.map_or_else(
+                || {
+                    hb_providers::controls::polling_menu_rates(device)
+                        .iter()
+                        .any(|hz| *hz > 1000)
+                },
+                |o| o.supported.iter().any(|rate| rate.hz() > 1000),
+            ))
+}
+
 #[cfg(test)]
 mod behaviour_tests {
+    #[test]
+    fn boost_visibility_respects_model_and_readback_but_allows_disabling_saved_boost() {
+        use super::*;
+        let mut reading = Reading::new("razer:00b7:UNIT1234", "Mouse", "razer", 0);
+        reading.kind = "mouse".into();
+        reading.via = "usb".into();
+        let mut device = ConfigurationDevice::from_reading(&reading);
+        assert!(!boost_controls_visible(&device, None, None));
+        device.key = "razer:00bf:UNIT1234".into();
+        assert!(boost_controls_visible(&device, None, None));
+        let mut observation = PollingObservation {
+            target: ControlTarget {
+                device: device.clone(),
+                generation: 1,
+                connection_stamp: None,
+            },
+            supported: vec![PollingRate::try_from(1000).unwrap()],
+            rate: PollingRate::try_from(1000).ok(),
+            timestamp: 0,
+            evidence: String::new(),
+        };
+        assert!(!boost_controls_visible(&device, Some(&observation), None));
+        assert!(boost_controls_visible(
+            &device,
+            Some(&observation),
+            PollingRate::try_from(2000).ok()
+        ));
+        observation
+            .supported
+            .push(PollingRate::try_from(2000).unwrap());
+        assert!(boost_controls_visible(&device, Some(&observation), None));
+        device.kind = "keyboard".into();
+        assert!(!boost_controls_visible(
+            &device,
+            Some(&observation),
+            PollingRate::try_from(2000).ok()
+        ));
+    }
     #[test]
     fn dpi_ranges_show_steps_axes_and_discrete_choices_without_filling_gaps() {
         use super::*;
@@ -8986,6 +9046,30 @@ mod dashboard_lifecycle_tests {
                                     .fullscreen_boost_rate
                                     .is_none()
                             );
+                            let saved_rates = state.polling.observations["synthetic-mouse"]
+                                .supported
+                                .clone();
+                            state
+                                .polling
+                                .observations
+                                .get_mut("synthetic-mouse")
+                                .unwrap()
+                                .supported
+                                .retain(|rate| rate.hz() <= 1000);
+                            state.polling_controls();
+                            assert!(state.controls.contains_key(&43));
+                            assert!(
+                                !state.controls.contains_key(&49),
+                                "A 1000 Hz-only connection must not offer an empty boost selector"
+                            );
+                            state
+                                .polling
+                                .observations
+                                .get_mut("synthetic-mouse")
+                                .unwrap()
+                                .supported = saved_rates;
+                            state.polling_controls();
+                            assert!(state.controls.contains_key(&49));
                             // A combo's selected-item callback and a static's
                             // color callback reenter the parent while State is
                             // held, exactly as during a page rebuild. Print the

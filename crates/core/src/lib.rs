@@ -82,6 +82,15 @@ impl Reading {
     pub fn online(&self) -> bool {
         self.connection == Connection::Online
     }
+    /// Name changes preserve evidence. Transport changes are separate interval
+    /// boundaries; a changed unit/container must never inherit a battery fit.
+    pub(crate) fn same_battery_identity(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.source == other.source
+            && self.kind == other.kind
+            && self.serial == other.serial
+            && self.container == other.container
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

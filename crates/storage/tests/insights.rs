@@ -18,6 +18,42 @@ fn observation(ts: i64, level: u8, hz: Option<u32>, session: Option<u64>) -> Usa
 }
 
 #[test]
+fn usage_and_insights_do_not_bridge_reused_keys_after_identity_changes() {
+    for field in 0..5 {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+        let first = observation(0, 90, Some(1000), Some(1));
+        let mut second = observation(60, 50, Some(1000), Some(1));
+        match field {
+            0 => second.reading.source = "replacement-source".into(),
+            1 => second.reading.kind = "replacement-kind".into(),
+            2 => second.reading.serial = Some("replacement-unit".into()),
+            3 => second.reading.container = Some("replacement-container".into()),
+            _ => second.reading.via = "replacement-connection".into(),
+        }
+        store.record_usage(&first).unwrap();
+        store.record_usage(&second).unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store
+                .query_usage("synthetic-a", 60, 3600, 100)
+                .unwrap()
+                .until,
+            0,
+            "identity field {field}"
+        );
+        assert_eq!(
+            store
+                .query_insights("synthetic-a", 60)
+                .unwrap()
+                .coverage
+                .awake_seconds,
+            0
+        );
+    }
+}
+
+#[test]
 fn linked_activity_uses_insertion_order_when_event_timestamps_match() {
     use hb_core::{PollingActivity, PollingActivityKind};
     for last_boost in [false, true] {

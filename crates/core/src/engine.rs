@@ -256,8 +256,21 @@ impl Engine {
             return if quiet { Vec::new() } else { self.flush_held() };
         }
         for r in &mut fresh {
-            self.settings
-                .link_device(&crate::ConfigurationDevice::from_reading(r));
+            if self
+                .by_provider
+                .get(provider)
+                .and_then(|previous| previous.iter().find(|old| old.key == r.key))
+                .is_some_and(|old| !old.same_battery_identity(r))
+            {
+                self.estimator.devices.remove(&r.key);
+                self.alerts.remove(&r.key);
+                self.held.retain(|(key, _), _| key != &r.key);
+                // The reused key belongs to a different unit. Shared hardware
+                // cooldowns may still belong to another live connection alias.
+                self.sound_at
+                    .retain(|identity, _| identity.strip_prefix("key:") != Some(r.key.as_str()));
+            }
+            self.settings.link_reading(r);
             if r.level.is_some_and(|l| l > 100) {
                 r.level = None;
             }

@@ -240,7 +240,8 @@ impl InsightsBuilder {
                 self.coverage.discharge_sample_count.saturating_add(1);
         }
         let discontinuity = self.previous.as_ref().is_some_and(|previous| {
-            reading.timestamp <= previous.reading.timestamp || reading.key != previous.reading.key
+            let old = &previous.reading;
+            reading.timestamp <= old.timestamp || !reading.same_battery_identity(old)
         });
         if discontinuity {
             self.reset_continuity();

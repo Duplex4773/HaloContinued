@@ -1,6 +1,30 @@
 use hb_core::*;
 
 #[test]
+fn changed_identity_under_a_reused_key_starts_a_new_partial_cycle() {
+    for field in 0..4 {
+        let mut next = point(60, 50);
+        match field {
+            0 => next.reading.source = "replacement-source".into(),
+            1 => next.reading.kind = "replacement-kind".into(),
+            2 => next.reading.serial = Some("replacement-unit".into()),
+            _ => next.reading.container = Some("replacement-container".into()),
+        }
+        let summary = summarize([point(0, 90), next]);
+        assert_eq!(summary.coverage.awake_seconds, 0, "identity field {field}");
+        assert!(summary.rates.is_empty());
+        assert_eq!(summary.cycles.len(), 2);
+        assert_eq!(summary.cycles[1].evidence, CycleEvidence::Partial);
+    }
+    let mut renamed = point(60, 89);
+    renamed.reading.name = "New display name".into();
+    assert_eq!(
+        summarize([point(0, 90), renamed]).coverage.awake_seconds,
+        60
+    );
+}
+
+#[test]
 fn last_rate_evidence_is_not_inherited_from_older_readings() {
     let first = point(0, 80);
     let mut last = point(60, 79);
