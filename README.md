@@ -242,6 +242,63 @@ stops when no icons need it. Dashboard graphics are released when it closes,
 and hovering an icon does not query hardware. The standard executable is about
 **3.32 MiB**, including HIDAPI, SQLite and the MSVC runtime.
 
+### Matched version comparison, 18 October 2026
+
+This comparison uses **current upstream HaloBattery 1.15.0 source**
+([`2251f05`](https://github.com/HeyOkay/HaloBattery/commit/2251f0534a8e886c9692ead42056059b4f69d8c0))
+and the **1.0.0–1.0.4 release tags** of Halo Continued. Each case has one
+**three-minute sample after a ten-second warm-up**, with fresh data, one simulated
+mouse at 73% and charging, a 60-second refresh interval and the dashboard never
+opened. The two passes differ only in whether charging animation is enabled.
+
+| Source version | CPU: animation off | CPU: animation on | Mean RAM: animation off | Mean RAM: animation on |
+| --- | ---: | ---: | ---: | ---: |
+| HaloBattery 1.15.0 (`2251f05`) | 0.122% | 0.148% | 33.99 MiB | 34.31 MiB |
+| Halo Continued 1.0.0 | 0.009% | 0.052% | 4.50 MiB | 4.57 MiB |
+| Halo Continued 1.0.1 | 0.009% | 0.052% | 4.72 MiB | 4.64 MiB |
+| Halo Continued 1.0.2 | 0.026% | 0.104% | 4.46 MiB | 4.52 MiB |
+| Halo Continued 1.0.3 | 0.026% | 0.061% | 4.58 MiB | 4.67 MiB |
+| Halo Continued 1.0.4 | 0.009% | 0.069% | 4.60 MiB | 4.58 MiB |
+
+CPU is kernel plus user time for the application process tree, expressed as
+**a percentage of one logical core**. RAM is **mean private committed memory**,
+not working set. Sampled peak private memory for Halo Continued 1.0.4 was
+4.73 MiB with animation off and 4.71 MiB with it on. It used approximately
+86–87% less mean private memory than upstream in these two samples.
+
+All cases ran sequentially on Windows 11 (build 26300), a Ryzen 9 9950X3D,
+restricted to the same logical core. The animation-on pass reversed the version
+order. Rust used the same **1.98.0 compiler, standard x64 settings and release
+profile** for every tag; AVX2/AVX512 builds were not used. Upstream ran under
+**Python 3.13.15**, with hidapi 0.15.0, pystray 0.19.5 and Pillow 12.3.0, using
+`pythonw.exe` directly so no virtual-environment redirectors or console host were
+included. Notifications, Bluetooth, status export, automatic updates and optional
+hardware controls were disabled. Real hardware battery readings were replaced
+by the simulated device; no physical-device commands were sent.
+
+These are **source-harness comparisons, not distributed-binary or live-hardware
+benchmarks**. Rust used release-optimised native test harnesses running its
+production monitoring and tray code; upstream used its actual Python application
+loop. Startup, dashboard use, populated history, multiple devices, game frame
+rates and input latency were not measured. Other desktop activity was not
+controlled or included in the application counters.
+
+Each table cell shows **one primary sample**. Small CPU or RAM differences between
+Rust releases can reflect Windows accounting resolution or run-to-run variation;
+the table does not establish a sustained speedup or a reliable ranking. Earlier
+measurements below used a different Python launch path; use this matched series
+for comparisons between the listed versions.
+
+**Test cleanup observation:** upstream's animation-on harness completed its full
+measurement window but timed out during normal exit afterward, on both the first
+run and a verification repeat. Only those test processes were terminated, outside
+the measured window. The table retains the first result; the repeat measured
+0.122% CPU and 33.81 MiB mean private memory. A separate check confirmed that the
+simulated charging icon was visible and animating. The shutdown cause was not
+diagnosed, so this is a harness observation, not a confirmed product defect.
+
+### Earlier measurements
+
 **Controlled comparison, 10 October 2026:** one simulated mouse, three-minute
 samples after warm-up, fresh data and dashboard never opened. CPU percentages
 refer to **one logical core**; RAM means **private committed memory**.
