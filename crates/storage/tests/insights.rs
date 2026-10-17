@@ -18,6 +18,73 @@ fn observation(ts: i64, level: u8, hz: Option<u32>, session: Option<u64>) -> Usa
 }
 
 #[test]
+fn malformed_linked_activity_does_not_hide_valid_battery_readings() {
+    for kind in ["X'FF'", "X'626F6F7374'"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut store = Store::open(&path).unwrap();
+        for ts in [0, 60, 120] {
+            store
+                .record_usage(&observation(ts, 90, Some(1000), Some(1)))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                &format!(
+                    "INSERT INTO polling_events VALUES ('synthetic-a','1',0,{kind},1000,NULL)"
+                ),
+                [],
+            )
+            .unwrap();
+        let data = store.query_insights("synthetic-a", 120).unwrap();
+        assert_eq!(data.coverage.observation_count, 3);
+        assert_eq!(data.coverage.awake_seconds, 120);
+        assert_eq!(data.recent.boost_sessions, 0);
+        assert_eq!(data.recent.manual_changes, 0);
+    }
+}
+#[test]
+fn malformed_payload_types_break_usage_continuity_without_breaking_queries() {
+    for payload in ["X'FF'", "X'7B7D'", "CAST(X'FF' AS TEXT)"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut store = Store::open(&path).unwrap();
+        for ts in [0, 60, 120] {
+            store
+                .record_usage(&observation(ts, 90, Some(1000), Some(1)))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                &format!("UPDATE readings SET payload={payload} WHERE ts=60"),
+                [],
+            )
+            .unwrap();
+        let data = store.query_insights("synthetic-a", 120).unwrap();
+        assert_eq!(data.coverage.unreadable_row_count, 1);
+        assert_eq!(data.coverage.awake_seconds, 0);
+        assert_eq!(
+            store
+                .query_usage("synthetic-a", 120, 120, 500)
+                .unwrap()
+                .until,
+            0
+        );
+        assert_eq!(store.query("synthetic-a", 0, 120, 500).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .query_with_baseline("synthetic-a", 90, 120, 500)
+                .unwrap()[0]
+                .timestamp,
+            0
+        );
+    }
+}
+#[test]
 fn malformed_polling_events_do_not_hide_valid_history_or_inflate_activity_counts() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("history.db");

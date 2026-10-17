@@ -1,7 +1,7 @@
 #requires -Version 7.0
 param(
   [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$')]
-  [string]$Version = '1.0.1',
+  [string]$Version = '1.0.2',
   [string]$Executable,
   [string]$Iscc
 )

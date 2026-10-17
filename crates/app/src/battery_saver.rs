@@ -27,6 +27,22 @@ struct Entry {
     rate_stamp: Option<ConnectionStamp>,
     sleep_stamp: Option<ConnectionStamp>,
 }
+impl Entry {
+    fn needs_action(&self) -> bool {
+        [self.rate, self.sleep].into_iter().any(|s| match s {
+            Setting::New | Setting::Ready(_) => true,
+            Setting::Active { .. } => !self.low,
+            Setting::Done => false,
+        })
+    }
+    fn usable(&self, r: &Reading, now: i64) -> bool {
+        self.target.device.matches_reading(r)
+            && r.online()
+            && (!self.low || (r.level.is_some() && r.charging == Some(false)))
+            && r.timestamp <= now
+            && now.saturating_sub(r.timestamp) <= 120
+    }
+}
 #[derive(Clone)]
 pub enum Action {
     Polling(ControlRequest),
@@ -73,14 +89,25 @@ impl BatterySaver {
                 .any(|p| p.low_battery_mode.is_some())
     }
     /// Cheap preflight: settled low-battery episodes need no inventory clones or Shell calls.
+    #[cfg(test)]
     pub fn needs_action(&self) -> bool {
+        self.pending.is_none() && self.entries.values().any(Entry::needs_action)
+    }
+    /// Check borrowed provider slices before resolving the inventory or asking
+    /// Windows about gaming. Sleeping, stale and boost-owned units need no work.
+    pub fn ready<'a>(
+        &self,
+        boost: &crate::boost::Boost,
+        now: i64,
+        readings: impl Fn(&str) -> &'a [Reading],
+    ) -> bool {
         self.pending.is_none()
-            && self.entries.values().any(|e| {
-                [e.rate, e.sleep].into_iter().any(|s| match s {
-                    Setting::New | Setting::Ready(_) => true,
-                    Setting::Active { .. } => !e.low,
-                    Setting::Done => false,
-                })
+            && self.entries.iter().any(|(key, e)| {
+                e.needs_action()
+                    && !boost.owns(key)
+                    && readings(&e.target.device.source)
+                        .iter()
+                        .any(|r| e.usable(r, now))
             })
     }
     pub fn cancel(&self, id: u64) -> Option<Arc<AtomicBool>> {
@@ -236,15 +263,7 @@ impl BatterySaver {
         self.observe(settings, generation, readings, now);
         let mut action = None;
         for (key, e) in &mut self.entries {
-            if boost.owns(key)
-                || !readings.iter().any(|r| {
-                    e.target.device.matches_reading(r)
-                        && r.online()
-                        && (!e.low || (r.level.is_some() && r.charging == Some(false)))
-                        && r.timestamp <= now
-                        && now.saturating_sub(r.timestamp) <= 120
-                })
-            {
+            if boost.owns(key) || !readings.iter().any(|r| e.usable(r, now)) {
                 continue;
             }
             if e.target.generation != generation {
@@ -342,13 +361,13 @@ impl BatterySaver {
         failed: bool,
         may_have_changed: bool,
         connection_stamp: Option<ConnectionStamp>,
-    ) {
+    ) -> bool {
         if !self.pending.as_ref().is_some_and(|p| p.action.id() == id) {
-            return;
+            return false;
         }
         let p = self.pending.take().unwrap();
         let Some(e) = self.entries.get_mut(p.action.key()) else {
-            return;
+            return false;
         };
         let sleep = matches!(p.action, Action::Sleep(_));
         if p.action.target().generation != e.target.generation
@@ -357,7 +376,7 @@ impl BatterySaver {
         {
             // A refresh before SET cannot have changed the owned setting.
             // Keep the original; the next request still checks its connection.
-            return;
+            return true;
         }
         let desired = if sleep {
             e.choices.sleep_seconds.map(u32::from)
@@ -399,8 +418,9 @@ impl BatterySaver {
         } else {
             connection_stamp
         };
+        true
     }
-    pub fn polling_complete(&mut self, o: &ControlOutcome) {
+    pub fn polling_complete(&mut self, o: &ControlOutcome) -> bool {
         self.finish(
             o.request,
             o.observation
@@ -419,16 +439,16 @@ impl BatterySaver {
             o.observation
                 .as_ref()
                 .and_then(|o| o.target.connection_stamp),
-        );
+        )
     }
-    pub fn sleep_complete(&mut self, o: &SleepOutcome) {
+    pub fn sleep_complete(&mut self, o: &SleepOutcome) -> bool {
         self.finish(
             o.request,
             o.seconds.map(u32::from),
             o.failure.is_some(),
             o.may_have_changed,
             o.connection_stamp,
-        );
+        )
     }
 }
 
@@ -489,7 +509,7 @@ mod tests {
                 may_have_changed: r.seconds.is_some(),
                 failure: None,
             }),
-        }
+        };
     }
     fn activate(b: &mut BatterySaver, s: &Settings, r: &[Reading], boost: &crate::boost::Boost) {
         for value in [1000, 125, 300, 60] {
@@ -497,6 +517,44 @@ mod tests {
             complete(b, &a, value);
         }
         assert!(b.next(s, 1, r, 100, boost).is_none());
+    }
+    #[test]
+    fn borrowed_preflight_defers_unusable_readings_without_resolving_inventory() {
+        let (mut b, s, mut r, mut boost) = fixture();
+        b.observe(&s, 1, &r, 100);
+        assert!(b.ready(&boost, 100, |_| &r));
+        for condition in 0..7 {
+            let mut unavailable = r.clone();
+            match condition {
+                0 => unavailable[0].connection = Connection::Sleeping,
+                1 => unavailable[0].connection = Connection::Stale,
+                2 => unavailable[0].charging = None,
+                3 => unavailable[0].timestamp = 101,
+                4 => unavailable[0].timestamp = -21,
+                5 => unavailable[0].serial = Some("replacement".into()),
+                _ => unavailable[0].level = None,
+            }
+            assert!(!b.ready(&boost, 100, |_| &unavailable));
+        }
+        assert!(!b.ready(&boost, 100, |_| &[]));
+        let now = std::time::Instant::now();
+        let mut s = s;
+        s.devices.get_mut(&r[0].key).unwrap().fullscreen_boost_rate = Some(rate(2000));
+        boost.sample(now, Some(true));
+        boost.sample(now + std::time::Duration::from_secs(10), Some(true));
+        let boost_request = boost.next(&s, 1, &r).unwrap();
+        assert!(!b.ready(&boost, 100, |_| &r));
+        boost.manual(&r[0].key);
+        assert!(!b.ready(&boost, 100, |_| &r));
+        assert!(!boost.complete(&ControlOutcome::failed(&boost_request, "cancelled")));
+        assert!(b.ready(&boost, 100, |_| &r));
+        let action = b.next(&s, 1, &r, 100, &boost).unwrap();
+        assert!(!b.ready(&boost, 100, |_| panic!(
+            "pending work must not query inventory"
+        )));
+        complete(&mut b, &action, 1000);
+        r[0].charging = None;
+        assert!(!b.ready(&boost, 100, |_| &r));
     }
     #[test]
     fn direct_usb_never_starts_reductions_even_when_full_charge_is_not_charging() {

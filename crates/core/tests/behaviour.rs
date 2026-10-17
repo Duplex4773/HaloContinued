@@ -9,6 +9,56 @@ fn engine() -> Engine {
     Engine::new(Settings::default(), Estimator::default())
 }
 #[test]
+fn conflicting_containers_and_ambiguous_serials_do_not_hide_bluetooth_devices() {
+    for ambiguous in [false, true] {
+        let mut e = engine();
+        let mut first = reading(70, false, 100);
+        first.key = "hid:first".into();
+        first.serial = Some("SYNTHETIC-SHARED-SERIAL".into());
+        first.container = Some("physical-first".into());
+        let mut bt = first.clone();
+        bt.key = "bluetooth:separate".into();
+        bt.source = "bluetooth".into();
+        if ambiguous {
+            bt.container = None;
+            let mut second = first.clone();
+            second.key = "hid:second".into();
+            second.container = Some("physical-second".into());
+            e.apply("razer", Ok(vec![first, second]), 0.0, false);
+        } else {
+            bt.container = Some("physical-separate".into());
+            e.apply("razer", Ok(vec![first]), 0.0, false);
+        }
+        e.apply("bluetooth", Ok(vec![bt]), 0.0, false);
+        assert!(e.readings().iter().any(|r| r.key == "bluetooth:separate"));
+    }
+}
+#[test]
+fn proven_container_match_wins_but_known_different_device_kinds_stay_separate() {
+    for different_kind in [false, true] {
+        let mut e = engine();
+        let mut hid = reading(70, false, 100);
+        hid.kind = "mouse".into();
+        hid.container = Some("physical-unit".into());
+        hid.serial = Some("shared-unit".into());
+        let mut bt = hid.clone();
+        bt.key = "bluetooth:unit".into();
+        bt.source = "bluetooth".into();
+        if different_kind {
+            bt.kind = "gamepad".into();
+        }
+        let mut other = hid.clone();
+        other.key = "other-hid".into();
+        other.container = None;
+        e.apply("razer", Ok(vec![hid, other]), 0.0, false);
+        e.apply("bluetooth", Ok(vec![bt]), 0.0, false);
+        assert_eq!(
+            e.readings().iter().any(|r| r.key == "bluetooth:unit"),
+            different_kind
+        );
+    }
+}
+#[test]
 fn inventory_presence_matches_resolved_readings_and_enabled_providers() {
     let mut e = engine();
     assert!(!e.has_readings());

@@ -1843,6 +1843,28 @@ fn changed_configuration(
         .is_none_or(|before| before != rate);
     first_confirmation || changed || outcome.confirmed_change()
 }
+fn finish_sleep_outcome(
+    saver: &mut crate::battery_saver::BatterySaver,
+    outcome: &SleepOutcome,
+) -> bool {
+    let owned = saver.sleep_complete(outcome);
+    outcome.request & crate::battery_saver::REQUEST_BIT == 0 || owned
+}
+fn finish_polling_outcome(
+    boost: &mut crate::boost::Boost,
+    saver: &mut crate::battery_saver::BatterySaver,
+    outcome: &ControlOutcome,
+) -> bool {
+    let boost_owned = boost.complete(outcome);
+    let saver_owned = saver.polling_complete(outcome);
+    if outcome.request & crate::boost::REQUEST_BIT != 0 {
+        boost_owned
+    } else if outcome.request & crate::battery_saver::REQUEST_BIT != 0 {
+        saver_owned
+    } else {
+        true
+    }
+}
 fn validate_polling_completion(outcome: &mut ControlOutcome, generation: u64, permitted: bool) {
     if !permitted
         || outcome
@@ -2474,7 +2496,8 @@ fn run(
                 readings = Some(latest);
                 saver_dirty = false;
             }
-            if saver.needs_action() && hb_windows::system::fullscreen_polling_state() == Some(false)
+            if saver.ready(&boost, clock.unix(), |id| engine.provider_readings(id))
+                && hb_windows::system::fullscreen_polling_state() == Some(false)
             {
                 saver
                     .next(
@@ -2831,9 +2854,11 @@ fn run(
                         "Device connection or permission changed. Refresh Devices before trying again."
                     };
                     let outcome = SleepOutcome::failed(&request, message);
-                    saver.sleep_complete(&outcome);
+                    let publish = finish_sleep_outcome(&mut saver, &outcome);
                     saver_dirty = true;
-                    let _ = events.send(Event::Sleep(Box::new(outcome)));
+                    if publish {
+                        let _ = events.send(Event::Sleep(Box::new(outcome)));
+                    }
                 } else {
                     match jobs.try_send(WorkerJob::Sleep(
                         Box::new(request.clone()),
@@ -2847,9 +2872,11 @@ fn run(
                                 &request,
                                 "Device workers are busy. Try again shortly.",
                             );
-                            saver.sleep_complete(&outcome);
+                            let publish = finish_sleep_outcome(&mut saver, &outcome);
                             saver_dirty = true;
-                            let _ = events.send(Event::Sleep(Box::new(outcome)));
+                            if publish {
+                                let _ = events.send(Event::Sleep(Box::new(outcome)));
+                            }
                         }
                     }
                 }
@@ -2868,9 +2895,11 @@ fn run(
                     outcome.seconds = None;
                     outcome.failure=Some("Connection or permission changed; sleep setting is unknown. Refresh before retrying.".into());
                 }
-                saver.sleep_complete(&outcome);
+                let publish = finish_sleep_outcome(&mut saver, &outcome);
                 saver_dirty = true;
-                let _ = events.send(Event::Sleep(outcome));
+                if publish {
+                    let _ = events.send(Event::Sleep(outcome));
+                }
             }
             Work::Command(Ok(Command::Polling(request, epoch, configuration_epoch))) => {
                 let automatic = request.request & crate::boost::REQUEST_BIT != 0;
@@ -2920,11 +2949,12 @@ fn run(
                         "Enable polling controls and select an online device before configuring it",
                     );
                     usage_tracker.take_activity(&outcome);
-                    boost.complete(&outcome);
-                    saver.polling_complete(&outcome);
+                    let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                     saver_dirty = true;
                     startup_polling.reads.complete(&outcome, Instant::now());
-                    let _ = events.send(Event::Polling(Box::new(outcome)));
+                    if publish {
+                        let _ = events.send(Event::Polling(Box::new(outcome)));
+                    }
                 } else if simulate {
                     let outcome = simulate_control(
                         &request,
@@ -2947,11 +2977,12 @@ fn run(
                     if let Some(activity) = usage_tracker.take_activity(&outcome) {
                         let _ = storage.send(Storage::PollingActivity(activity));
                     }
-                    boost.complete(&outcome);
-                    saver.polling_complete(&outcome);
+                    let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                     saver_dirty = true;
                     startup_polling.reads.complete(&outcome, Instant::now());
-                    let _ = events.send(Event::Polling(Box::new(outcome)));
+                    if publish {
+                        let _ = events.send(Event::Polling(Box::new(outcome)));
+                    }
                 } else {
                     match jobs.try_send(WorkerJob::Polling(
                         Box::new(request.clone()),
@@ -2967,11 +2998,12 @@ fn run(
                                 "Device workers are busy; retry Refresh or Apply",
                             );
                             usage_tracker.take_activity(&outcome);
-                            boost.complete(&outcome);
-                            saver.polling_complete(&outcome);
+                            let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                             saver_dirty = true;
                             startup_polling.reads.complete(&outcome, Instant::now());
-                            let _ = events.send(Event::Polling(Box::new(outcome)));
+                            if publish {
+                                let _ = events.send(Event::Polling(Box::new(outcome)));
+                            }
                         }
                     }
                 }
@@ -3016,11 +3048,12 @@ fn run(
                 if let Some(activity) = usage_tracker.take_activity(&outcome) {
                     let _ = storage.send(Storage::PollingActivity(activity));
                 }
-                boost.complete(&outcome);
-                saver.polling_complete(&outcome);
+                let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                 saver_dirty = true;
                 startup_polling.reads.complete(&outcome, Instant::now());
-                let _ = events.send(Event::Polling(outcome));
+                if publish {
+                    let _ = events.send(Event::Polling(outcome));
+                }
             }
             Work::Command(Ok(
                 Command::SettingsChanged
@@ -3089,6 +3122,83 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_automatic_replies_cannot_replace_manual_polling_or_sleep_status() {
+        use hb_core::settings::LowBatteryMode;
+        for sleep in [false, true] {
+            for pause in [false, true] {
+                let mut reading = Reading::new("razer:00bf:TEST", "Test mouse", "razer", 100);
+                reading.kind = "mouse".into();
+                reading.via = "usb".into();
+                reading.level = Some(20);
+                reading.charging = Some(false);
+                let mut settings = Settings {
+                    polling_controls: true,
+                    ..Default::default()
+                };
+                settings
+                    .devices
+                    .entry(reading.key.clone())
+                    .or_default()
+                    .low_battery_mode = Some(LowBatteryMode {
+                    threshold: 20,
+                    polling_rate: (!sleep).then(|| PollingRate::try_from(125).unwrap()),
+                    sleep_seconds: sleep.then_some(60),
+                });
+                let mut boost = crate::boost::Boost::new(Instant::now());
+                let mut saver = crate::battery_saver::BatterySaver::default();
+                let action = saver
+                    .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                    .unwrap();
+                let guard = saver.cancel(action.id()).unwrap();
+                if pause {
+                    saver.pause();
+                } else {
+                    saver.manual(&reading.key, sleep);
+                }
+                assert!(guard.load(Ordering::Acquire));
+                match action {
+                    crate::battery_saver::Action::Sleep(q) => {
+                        let mut reply = SleepOutcome::failed(&q, "cancelled before SET");
+                        assert!(!finish_sleep_outcome(&mut saver, &reply));
+                        reply.request = 9;
+                        reply.seconds = Some(300);
+                        reply.failure = None;
+                        assert!(finish_sleep_outcome(&mut saver, &reply));
+                    }
+                    crate::battery_saver::Action::Polling(q) => {
+                        let mut reply = ControlOutcome::failed(&q, "cancelled before SET");
+                        assert!(!finish_polling_outcome(&mut boost, &mut saver, &reply));
+                        reply.request = 9;
+                        assert!(finish_polling_outcome(&mut boost, &mut saver, &reply));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn cancelled_boost_reply_is_not_published_after_manual_override() {
+        let now = Instant::now();
+        let mut boost = crate::boost::Boost::new(now);
+        let mut saver = crate::battery_saver::BatterySaver::default();
+        let mut settings = Settings {
+            polling_controls: true,
+            ..Default::default()
+        };
+        let mut reading = Reading::new("simulated:mouse", "Test mouse", "simulation", 100);
+        reading.kind = "mouse".into();
+        settings
+            .devices
+            .entry(reading.key.clone())
+            .or_default()
+            .fullscreen_boost_rate = PollingRate::try_from(2000).ok();
+        boost.sample(now, Some(true));
+        boost.sample(now + Duration::from_secs(10), Some(true));
+        let request = boost.next(&settings, 1, &[reading]).unwrap();
+        boost.manual(&request.target.device.key);
+        let reply = ControlOutcome::failed(&request, "cancelled before SET");
+        assert!(!finish_polling_outcome(&mut boost, &mut saver, &reply));
+    }
     #[test]
     fn panic_after_polling_write_does_not_claim_the_hardware_is_unchanged() {
         let mut hardware_rate = 1000;

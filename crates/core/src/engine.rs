@@ -74,19 +74,15 @@ impl Engine {
         }
     }
     /// Hardware rate changes invalidate the learned discharge slope, never history.
-    /// Clear aliases only when a trustworthy unit serial proves identity.
+    /// Clear only proven aliases, never another unit sharing a vendor serial.
     pub fn reset_estimate(&mut self, key: &str) {
-        let serial = self
-            .by_provider
-            .values()
-            .flatten()
-            .find(|r| r.key == key)
+        let all = self.by_provider.values().flatten();
+        let selected = all.clone().find(|r| r.key == key);
+        let serial = selected
             .and_then(|r| r.serial.as_deref())
             .and_then(trusted_identity);
-        let keys = self
-            .by_provider
-            .values()
-            .flatten()
+        let keys = all
+            .clone()
             .filter(|r| {
                 r.key == key
                     || serial.as_ref().is_some_and(|s| {
@@ -94,6 +90,24 @@ impl Engine {
                             .as_deref()
                             .and_then(trusted_identity)
                             .is_some_and(|other| other.eq_ignore_ascii_case(s))
+                            && (self.settings.preference_key(&r.key)
+                                == self.settings.preference_key(key)
+                                || selected.is_some_and(|target| {
+                                    preferred_duplicate(r, std::iter::once(target))
+                                        && preferred_duplicate(
+                                            r,
+                                            all.clone().filter(|candidate| {
+                                                candidate.source == target.source
+                                                    && candidate
+                                                        .serial
+                                                        .as_deref()
+                                                        .and_then(trusted_identity)
+                                                        .is_some_and(|unit| {
+                                                            unit.eq_ignore_ascii_case(s)
+                                                        })
+                                            }),
+                                        )
+                                }))
                     })
             })
             .map(|r| r.key.clone())
@@ -440,47 +454,30 @@ impl Engine {
             .flat_map(|(_, r)| r.iter());
         let mut kept: Vec<&Reading> = Vec::new();
         for r in all.clone() {
-            let identity = |a: &Reading, b: &Reading| {
-                (a.container
-                    .as_deref()
-                    .and_then(trusted_identity)
-                    .is_some_and(|id| {
-                        b.container
-                            .as_deref()
-                            .and_then(trusted_identity)
-                            .is_some_and(|other| other.eq_ignore_ascii_case(id))
-                    }))
-                    || (a
-                        .serial
-                        .as_deref()
-                        .and_then(trusted_identity)
-                        .is_some_and(|id| {
-                            b.serial
-                                .as_deref()
-                                .and_then(trusted_identity)
-                                .is_some_and(|other| other.eq_ignore_ascii_case(id))
-                        }))
-            };
             if r.source == "bluetooth"
-                && all.clone().any(|o| {
-                    o.source != "bluetooth"
-                        && o.source != "xinput"
-                        && o.online()
-                        && o.level.is_some()
-                        && identity(r, o)
-                })
+                && preferred_duplicate(
+                    r,
+                    all.clone().filter(|o| {
+                        o.source != "bluetooth"
+                            && o.source != "xinput"
+                            && o.online()
+                            && o.level.is_some()
+                    }),
+                )
             {
                 continue;
             }
             if r.source == "xinput"
                 && r.via == "bluetooth"
-                && all.clone().any(|o| {
-                    o.source == "bluetooth"
-                        && o.kind == "gamepad"
-                        && o.online()
-                        && o.level.is_some()
-                        && identity(r, o)
-                })
+                && preferred_duplicate(
+                    r,
+                    all.clone().filter(|o| {
+                        o.source == "bluetooth"
+                            && o.kind == "gamepad"
+                            && o.online()
+                            && o.level.is_some()
+                    }),
+                )
             {
                 continue;
             }
@@ -604,6 +601,48 @@ fn related_sound_identities(
         .collect()
 }
 
+/// Containers are stronger than vendor serials. Conflicting containers cannot
+/// be resolved by a serial alone, and a shared serial needs one unique target.
+/// Borrow the candidates so resolving ambiguity adds no allocation or cache.
+fn preferred_duplicate<'a>(
+    reading: &Reading,
+    candidates: impl Iterator<Item = &'a Reading>,
+) -> bool {
+    let container = reading.container.as_deref().and_then(trusted_identity);
+    let serial = reading.serial.as_deref().and_then(trusted_identity);
+    let mut serial_key: Option<&str> = None;
+    let mut ambiguous = false;
+    for other in candidates {
+        if !reading.kind.is_empty()
+            && reading.kind != "device"
+            && !other.kind.is_empty()
+            && other.kind != "device"
+            && reading.kind != other.kind
+        {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (
+            container,
+            other.container.as_deref().and_then(trusted_identity),
+        ) {
+            if a.eq_ignore_ascii_case(b) {
+                return true;
+            }
+            continue;
+        }
+        if serial.is_some_and(|a| {
+            other
+                .serial
+                .as_deref()
+                .and_then(trusted_identity)
+                .is_some_and(|b| a.eq_ignore_ascii_case(b))
+        }) {
+            ambiguous |= serial_key.is_some_and(|key| key != other.key);
+            serial_key = Some(&other.key);
+        }
+    }
+    serial_key.is_some() && !ambiguous
+}
 fn trusted_identity(value: &str) -> Option<&str> {
     let normalized = value.trim();
     if normalized.is_empty()

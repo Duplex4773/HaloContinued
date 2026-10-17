@@ -291,17 +291,17 @@ impl Boost {
         });
         Some(request)
     }
-    pub fn complete(&mut self, outcome: &ControlOutcome) {
+    pub fn complete(&mut self, outcome: &ControlOutcome) -> bool {
         let Some(p) = self.pending.take() else {
-            return;
+            return false;
         };
         if p.request.request != outcome.request {
             self.pending = Some(p);
-            return;
+            return false;
         }
         let key = &outcome.key;
         let Some(entry) = self.entries.get_mut(key) else {
-            return;
+            return false;
         };
         if entry.target.generation != p.request.target.generation
             && entry.target.connection_stamp.is_some()
@@ -309,7 +309,7 @@ impl Boost {
         {
             // Refresh cancelled before any SET: retain the verified original,
             // then let the next transaction revalidate this connection.
-            return;
+            return true;
         }
         let observation = outcome.observation.as_ref();
         if outcome.failure.is_some()
@@ -323,7 +323,7 @@ impl Boost {
         {
             // Never retry an uncertain automatic SET, including restore.
             self.entries.remove(key);
-            return;
+            return true;
         }
         let o = observation.unwrap();
         match p.request.action {
@@ -344,6 +344,7 @@ impl Boost {
                 self.entries.remove(key);
             }
         }
+        true
     }
 }
 

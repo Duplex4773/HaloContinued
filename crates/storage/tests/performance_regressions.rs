@@ -345,12 +345,20 @@ fn borrowed_history_queries_preserve_escaped_strings_and_corrupt_row_boundaries(
         endpoints.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
         [0, 240]
     );
-    // A schema type error is still an error rather than an adjacency bridge.
+    // A damaged SQLite value also breaks adjacency; valid neighbours remain usable.
     db.execute("UPDATE readings SET payload=X'FF' WHERE ts=60", [])
         .unwrap();
-    assert!(store.query_insights("invented", 240).is_err());
-    assert!(store.query_usage("invented", 240, 3600, 100).is_err());
-    assert!(store.query_with_baseline("invented", 61, 240, 100).is_err());
+    let insights = store.query_insights("invented", 240).unwrap();
+    assert_eq!(insights.coverage.unreadable_row_count, 2);
+    assert_eq!(insights.coverage.awake_seconds, 60);
+    assert_eq!(
+        store.query_usage("invented", 240, 3600, 100).unwrap().until,
+        60
+    );
+    assert_eq!(
+        store.query_with_baseline("invented", 61, 240, 100).unwrap()[0].timestamp,
+        0
+    );
 }
 
 #[test]

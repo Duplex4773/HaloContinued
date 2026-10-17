@@ -86,6 +86,54 @@ fn changed_rate_clears_proven_aliases_and_preserves_unrelated_receiver_devices()
 }
 
 #[test]
+fn changing_rate_preserves_a_different_unit_with_the_same_serial() {
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    let mut a = Reading::new("razer:first", "Mouse", "razer", 100);
+    a.serial = Some("SHARED1234".into());
+    a.container = Some("first-physical-unit".into());
+    let mut b = a.clone();
+    b.key = "razer:second".into();
+    b.container = Some("second-physical-unit".into());
+    let mut ambiguous_bt = a.clone();
+    ambiguous_bt.key = "bluetooth:ambiguous".into();
+    ambiguous_bt.source = "bluetooth".into();
+    ambiguous_bt.container = None;
+    engine.apply("razer", Ok(vec![a.clone(), b.clone()]), 0.0, false);
+    engine.apply("bluetooth", Ok(vec![ambiguous_bt.clone()]), 0.0, false);
+    for r in [&a, &b, &ambiguous_bt] {
+        engine
+            .estimator
+            .devices
+            .insert(r.key.clone(), Default::default());
+    }
+    engine.reset_estimate(&a.key);
+    assert!(!engine.estimator.devices.contains_key(&a.key));
+    assert!(engine.estimator.devices.contains_key(&b.key));
+    assert!(engine.estimator.devices.contains_key(&ambiguous_bt.key));
+}
+#[test]
+fn changing_rate_clears_proven_wired_wireless_preference_aliases() {
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    let mut radio = Reading::new("razer:00bf:SYNTHETICUNIT", "Mouse", "razer", 100);
+    radio.kind = "mouse".into();
+    radio.via = "usb".into();
+    radio.serial = Some("SYNTHETICUNIT".into());
+    radio.container = Some("radio-container".into());
+    let mut wired = radio.clone();
+    wired.key = "razer:00be:SYNTHETICUNIT".into();
+    wired.container = Some("wired-container".into());
+    engine.apply("razer", Ok(vec![radio.clone(), wired.clone()]), 0.0, false);
+    for r in [&radio, &wired] {
+        engine
+            .estimator
+            .devices
+            .insert(r.key.clone(), Default::default());
+    }
+    engine.reset_estimate(&radio.key);
+    assert!(!engine.estimator.devices.contains_key(&radio.key));
+    assert!(!engine.estimator.devices.contains_key(&wired.key));
+}
+#[test]
 fn configuration_identity_is_independent_of_battery_state() {
     let mut reading = Reading::new("razer:026b:SYNTHETIC", "Keyboard", "razer", 10);
     reading.kind = "keyboard".into();

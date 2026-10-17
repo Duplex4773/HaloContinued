@@ -332,8 +332,10 @@ fn row_text<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> rusqlite::Result<&'
     })
 }
 fn history_reading(row: &rusqlite::Row<'_>, key: &str) -> rusqlite::Result<Option<Reading>> {
-    let timestamp: i64 = row.get(0)?;
-    Ok(serde_json::from_str::<Reading>(row_text(row, 1)?)
+    let (Ok(timestamp), Ok(payload)) = (row.get::<_, i64>(0), row_text(row, 1)) else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str::<Reading>(payload)
         .ok()
         .filter(|reading| {
             reading.key == key
@@ -465,8 +467,10 @@ impl Store {
             .map_err(sql_error)?;
         let mut builder = InsightsBuilder::default().recent_since(until.saturating_sub(7 * 86400));
         while let Some(row) = rows.next().map_err(sql_error)? {
-            let timestamp: i64 = row.get(0).map_err(sql_error)?;
-            let payload = row_text(row, 1).map_err(sql_error)?;
+            let (Ok(timestamp), Ok(payload)) = (row.get::<_, i64>(0), row_text(row, 1)) else {
+                builder.break_continuity();
+                continue;
+            };
             let Ok(reading) = serde_json::from_str::<Reading>(payload) else {
                 builder.break_continuity();
                 continue;
@@ -503,10 +507,9 @@ impl Store {
                     }
                 },
             };
-            let activity_text = match row.get_ref(4).map_err(sql_error)? {
-                rusqlite::types::ValueRef::Null => None,
-                _ => Some(row_text(row, 4).map_err(sql_error)?),
-            };
+            // Activity classification is optional; damaged event text must not
+            // discard independently valid battery/rate evidence.
+            let activity_text = row.get_ref(4).map_err(sql_error)?.as_str().ok();
             let activity = match activity_text {
                 Some("boost") => Some(PollingActivityKind::Boost),
                 Some("restore") => Some(PollingActivityKind::Restore),
@@ -622,11 +625,7 @@ impl Store {
             .query(params![key, retained_since, since.min(until)])
             .map_err(sql_error)?;
         while let Some(row) = rows.next().map_err(sql_error)? {
-            let timestamp: i64 = row.get(0).map_err(sql_error)?;
-            let payload = row_text(row, 1).map_err(sql_error)?;
-            if let Ok(reading) = serde_json::from_str::<Reading>(payload)
-                && reading.key == key
-                && reading.timestamp == timestamp
+            if let Some(reading) = history_reading(row, key).map_err(sql_error)?
                 && reading.level.is_some_and(|level| level <= 100)
             {
                 baseline = Some(reading);
@@ -740,8 +739,10 @@ impl Store {
         let mut previous: Option<(i64, bool, Option<u64>)> = None;
         let mut total = 0i64;
         while let Some(row) = rows.next().map_err(sql_error)? {
-            let timestamp: i64 = row.get(0).map_err(sql_error)?;
-            let payload = row_text(row, 1).map_err(sql_error)?;
+            let (Ok(timestamp), Ok(payload)) = (row.get::<_, i64>(0), row_text(row, 1)) else {
+                previous = None;
+                continue;
+            };
             let Ok(reading) = serde_json::from_str::<usage_sampler::TimingReading<'_>>(payload)
             else {
                 previous = None;
