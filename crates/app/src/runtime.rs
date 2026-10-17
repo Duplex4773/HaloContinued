@@ -723,6 +723,17 @@ impl Runtime {
     pub fn configuration_visible(&self) -> bool {
         self.configuration.visible.load(Ordering::Acquire)
     }
+    pub fn request_history(&self, command: Command) -> Result<(), ProviderError> {
+        if !matches!(
+            command,
+            Command::History { .. } | Command::UsageHistory { .. }
+        ) {
+            return Err(ProviderError::new("Not a battery history request"));
+        }
+        self.commands.try_send(command).map_err(|_| {
+            ProviderError::new("Battery history is busy. Select Refresh to try again.")
+        })
+    }
     pub fn request_insights(
         &self,
         key: String,
@@ -4942,7 +4953,38 @@ mod tests {
                 .is_err()
         );
         assert!(runtime.request_insights("device".into(), 100, 1).is_err());
+        let history = |usage, request| {
+            if usage {
+                Command::UsageHistory {
+                    key: "device".into(),
+                    seconds: 100,
+                    until: 100,
+                    width: 50,
+                    request,
+                }
+            } else {
+                Command::History {
+                    key: "device".into(),
+                    since: 0,
+                    until: 100,
+                    width: 50,
+                    request,
+                }
+            }
+        };
+        for usage in [false, true] {
+            assert!(runtime.request_history(history(usage, 1)).is_err());
+        }
         let _ = _rx.recv().unwrap();
+        assert!(runtime.request_history(Command::Resume).is_err());
+        assert!(_rx.is_empty());
+        for usage in [false, true] {
+            runtime.request_history(history(usage, 2)).unwrap();
+            assert!(matches!(
+                _rx.recv().unwrap(),
+                Command::History { request: 2, .. } | Command::UsageHistory { request: 2, .. }
+            ));
+        }
         runtime.request_insights("device".into(), 100, 2).unwrap();
         assert!(matches!(
             _rx.recv().unwrap(),
@@ -4950,6 +4992,8 @@ mod tests {
         ));
         drop(_rx);
         assert!(runtime.request_insights("device".into(), 100, 3).is_err());
+        assert!(runtime.request_history(history(false, 3)).is_err());
+        assert!(runtime.request_history(history(true, 3)).is_err());
     }
     #[test]
     fn full_queue_cannot_lose_configuration_revocation_or_revive_old_jobs() {

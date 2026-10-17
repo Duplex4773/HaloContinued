@@ -372,6 +372,7 @@ pub struct Store {
     has_usage_metadata: bool,
     has_polling_events: bool,
 }
+const INSIGHTS_WITH_ACTIVITY: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,(SELECT CASE WHEN e.rate=m.polling_rate THEN e.kind END FROM polling_events e WHERE e.device=r.device AND e.session=m.session AND e.ts<=r.ts ORDER BY e.ts DESC,e.rowid DESC LIMIT 1) FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts";
 impl Store {
     pub fn open(path: &Path) -> Result<Self, ProviderError> {
         if let Some(parent) = path.parent() {
@@ -380,6 +381,9 @@ impl Store {
         let db = Connection::open(path).map_err(sql_error)?;
         db.busy_timeout(std::time::Duration::from_secs(2))
             .map_err(sql_error)?;
+        // The activity lookup orders by timestamp, then insertion order. The
+        // primary key ends in kind, so SQLite otherwise prefers the broader
+        // device/time index and repeatedly scans events from unrelated sessions.
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-512;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS readings(device TEXT NOT NULL, ts INTEGER NOT NULL, level INTEGER, payload TEXT NOT NULL, PRIMARY KEY(device,ts));
@@ -390,6 +394,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS polling_events(device TEXT NOT NULL, session TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, rate INTEGER NOT NULL, previous_rate INTEGER, PRIMARY KEY(device,session,ts,kind));
             CREATE INDEX IF NOT EXISTS polling_events_time ON polling_events(ts);
             CREATE INDEX IF NOT EXISTS polling_events_device_time ON polling_events(device,ts);
+            CREATE INDEX IF NOT EXISTS polling_events_device_session_time ON polling_events(device,session,ts);
             PRAGMA user_version=3; COMMIT;").map_err(sql_error)?;
         Ok(Self {
             db,
@@ -455,7 +460,7 @@ impl Store {
     /// As with history queries, flush pending observations before querying.
     pub fn query_insights(&self, key: &str, until: i64) -> Result<BatteryInsights, ProviderError> {
         let sql = if self.has_usage_metadata && self.has_polling_events {
-            "SELECT r.ts,r.payload,m.polling_rate,m.session,(SELECT CASE WHEN e.rate=m.polling_rate THEN e.kind END FROM polling_events e WHERE e.device=r.device AND e.session=m.session AND e.ts<=r.ts ORDER BY e.ts DESC,e.rowid DESC LIMIT 1) FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts"
+            INSIGHTS_WITH_ACTIVITY
         } else if self.has_usage_metadata {
             "SELECT r.ts,r.payload,m.polling_rate,m.session,NULL FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts"
         } else {
@@ -546,6 +551,9 @@ impl Store {
                 let Ok(previous) = row.get::<_, Option<u32>>(2) else {
                     continue;
                 };
+                if previous.is_some_and(|hz| PollingRate::try_from(hz).is_err()) {
+                    continue;
+                }
                 match kind {
                     "boost" => {
                         result.recent.boost_sessions += 1;
@@ -1024,6 +1032,50 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn insights_activity_lookup_does_not_scan_unrelated_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+        for index in 0..256 {
+            store
+                .record_polling_activity(&hb_core::PollingActivity {
+                    key: "synthetic".into(),
+                    timestamp: index,
+                    session: 1,
+                    kind: hb_core::PollingActivityKind::Manual,
+                    rate: PollingRate::try_from(1000).unwrap(),
+                    previous: None,
+                })
+                .unwrap();
+            let mut reading = Reading::new("synthetic", "Synthetic mouse", "test", 1000 + index);
+            reading.level = Some(80 - (index % 2) as u8);
+            reading.charging = Some(false);
+            store
+                .record_usage(&UsageObservation {
+                    reading,
+                    polling_rate: PollingRate::try_from(1000).ok(),
+                    session: Some(2),
+                })
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let mut statement = store.db.prepare(INSIGHTS_WITH_ACTIVITY).unwrap();
+        {
+            let mut rows = statement.query(params!["synthetic", 0, 2000]).unwrap();
+            let mut count = 0;
+            while let Some(row) = rows.next().unwrap() {
+                assert_eq!(row.get::<_, Option<String>>(4).unwrap(), None);
+                count += 1;
+            }
+            assert_eq!(count, 256);
+        }
+        let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+        println!("256 readings with 256 unrelated polling events: {steps} SQL VM steps");
+        assert!(
+            steps < 256 * 100,
+            "Session lookup scanned unrelated events: {steps} SQL VM steps"
+        );
+    }
     #[test]
     fn persistent_flush_failure_bounds_pending_and_recovers_without_losing_queued_rows() {
         let directory = tempfile::tempdir().unwrap();

@@ -84,7 +84,20 @@ impl Estimator {
             self.pause(&r.key);
             return;
         }
-        let d = self.devices.entry(r.key.clone()).or_default();
+        // Existing devices are the steady-state path. Borrow the key instead
+        // of allocating a replacement identity on every battery observation.
+        if let Some(d) = self.devices.get_mut(&r.key) {
+            Self::record_sample(d, r, monotonic, level);
+        } else {
+            Self::record_sample(
+                self.devices.entry(r.key.clone()).or_default(),
+                r,
+                monotonic,
+                level,
+            );
+        }
+    }
+    fn record_sample(d: &mut Discharge, r: &Reading, monotonic: f64, level: u8) {
         if r.timestamp < d.seen {
             d.last = None;
             return;

@@ -18,6 +18,41 @@ fn observation(ts: i64, level: u8, hz: Option<u32>, session: Option<u64>) -> Usa
 }
 
 #[test]
+fn linked_activity_uses_insertion_order_when_event_timestamps_match() {
+    use hb_core::{PollingActivity, PollingActivityKind};
+    for last_boost in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+        let events = if last_boost {
+            [PollingActivityKind::Restore, PollingActivityKind::Boost]
+        } else {
+            [PollingActivityKind::Boost, PollingActivityKind::Restore]
+        };
+        for kind in events {
+            store
+                .record_polling_activity(&PollingActivity {
+                    key: "synthetic-a".into(),
+                    timestamp: 0,
+                    session: 1,
+                    kind,
+                    rate: PollingRate::try_from(1000).unwrap(),
+                    previous: PollingRate::try_from(500).ok(),
+                })
+                .unwrap();
+        }
+        for ts in [0, 60, 120] {
+            store
+                .record_usage(&observation(ts, 90, Some(1000), Some(1)))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let data = store.query_insights("synthetic-a", 120).unwrap();
+        assert_eq!(data.recent.boost_seconds, if last_boost { 120 } else { 0 });
+        assert_eq!(data.coverage.awake_seconds, 120);
+    }
+}
+
+#[test]
 fn malformed_linked_activity_does_not_hide_valid_battery_readings() {
     for kind in ["X'FF'", "X'626F6F7374'"] {
         let directory = tempfile::tempdir().unwrap();
@@ -107,7 +142,9 @@ fn malformed_polling_events_do_not_hide_valid_history_or_inflate_activity_counts
         ('synthetic-a','7',7,'boost',4000,'damaged'),
         ('synthetic-a','8',8,X'FF',4000,1000),
         ('synthetic-a','9',9,'restore',-1,2000),
-        ('synthetic-a','10',10,'manual',1234,NULL);",
+        ('synthetic-a','10',10,'manual',1234,NULL),
+        ('synthetic-a','11',11,'boost',4000,1234),
+        ('synthetic-a','12',12,'boost',4000,0);",
     )
     .unwrap();
     let insights = store.query_insights("synthetic-a", 120).unwrap();

@@ -5001,12 +5001,15 @@ impl State {
                 let _ = InvalidateRect(Some(h), None, false);
             }
         }
-        self.runtime.send(self.history.command(
+        let result = self.runtime.request_history(self.history.command(
             d.reading.key.clone(),
             until,
             (r.right - 80).max(20) as usize,
             self.request,
         ));
+        if let Err(error) = result {
+            self.history_outcome(self.request, Err(error));
+        }
     }
     fn drain(&mut self) {
         let mut latest = None;
@@ -5156,11 +5159,11 @@ impl State {
                 .devices
                 .get(self.selected)
                 .map(|d| d.reading.key.clone());
-            let previous_device = self.current_device().map(|(d, _)| d);
-            let previous_charging = self
+            let (previous_device, previous_charging) = self
                 .current_device()
-                .and_then(|(_, b)| b)
-                .and_then(|b| b.reading.charging);
+                .map_or((None, None), |(device, battery)| {
+                    (Some(device), battery.and_then(|b| b.reading.charging))
+                });
             self.snapshot = s;
             self.tooltip_rates.retain(|key, observation| {
                 self.snapshot.devices.iter().any(|d| {
@@ -5171,12 +5174,12 @@ impl State {
             });
             self.tray_polling
                 .retain_inventory(&self.snapshot.devices, &[]);
-            let current_device = self.current_device().map(|(d, _)| d);
-            let charging_changed = previous_charging
-                != self
-                    .current_device()
-                    .and_then(|(_, b)| b)
-                    .and_then(|b| b.reading.charging);
+            let (current_device, current_charging) = self
+                .current_device()
+                .map_or((None, None), |(device, battery)| {
+                    (Some(device), battery.and_then(|b| b.reading.charging))
+                });
+            let charging_changed = previous_charging != current_charging;
             self.selected_device = current_device.as_ref().map(|d| d.key.clone());
             if previous_device != current_device {
                 self.polling.abandon();
@@ -8398,6 +8401,7 @@ mod dashboard_lifecycle_tests {
                     Err(ProviderError::new("Active history error")),
                 );
                 assert_eq!(state.error, "Active history error");
+                assert!(state.text(97).contains("Couldn't load battery history"));
                 state.command(1, 0);
             }
             {

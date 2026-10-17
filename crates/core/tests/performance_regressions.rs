@@ -7,6 +7,26 @@ use support::allocation_counter::{TrackingAllocator, measure};
 #[global_allocator]
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
+#[test]
+fn unchanged_discharge_levels_reuse_estimator_identity_without_allocations() {
+    let mut estimator = Estimator::default();
+    let mut sample = reading("synthetic", 0, 80);
+    estimator.record(&sample, 0.0);
+    let (_, allocations) = measure(|| {
+        for index in 1..1000 {
+            sample.timestamp = index;
+            estimator.record(&sample, index as f64);
+        }
+    });
+    assert_eq!(
+        allocations.calls, 0,
+        "Repeated identity allocations: {allocations:?}"
+    );
+    assert_eq!(allocations.bytes, 0);
+    assert_eq!(estimator.devices["synthetic"].usage, 999.0);
+    assert_eq!(estimator.devices["synthetic"].samples.len(), 1);
+}
+
 fn reading(key: &str, timestamp: i64, level: u8) -> Reading {
     let mut reading = Reading::new(key, "Invented mouse 雪", "test", timestamp);
     reading.level = Some(level);

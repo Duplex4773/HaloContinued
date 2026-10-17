@@ -7,25 +7,24 @@ device controls, history and battery insights. The aim is no noticeable
 performance compromise during work or gaming. The app still consumes resources;
 usage varies with connected devices, settings and dashboard activity.
 
-Current release: **1.0.2** for Windows 11 x64, available as an unsigned per-user
+Current release: **1.0.3** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.0.2 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.2/HaloContinued-1.0.2-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.0.2 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.2/HaloContinued-1.0.2-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. |
+| [**V1.0.3 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.3/HaloContinued-1.0.3-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.0.3 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.3/HaloContinued-1.0.3-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.2/HaloContinued-1.0.2-SHA256SUMS.txt)
-· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.2)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.3/HaloContinued-1.0.3-SHA256SUMS.txt)
+· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.3)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
-**New in 1.0.2:** Devices with ambiguous identifiers stay separate, and changing
-one device's polling rate preserves other devices' battery estimates. Insights
-and History tolerate damaged records without counting gaps as use. Cancelled
-automatic changes no longer replace newer manual status, and low-battery mode
-skips unnecessary checks while the device is asleep or fullscreen boost is active.
-[Read the changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.2).
+**New in 1.0.3:** Insights finds the right polling session without repeatedly
+scanning unrelated events. Damaged polling-rate records no longer distort boost
+counts or the normal-rate baseline. History reports a busy request instead of
+staying on “Loading…”, and battery updates avoid repeated temporary allocations.
+[Read the changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.3).
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -310,6 +309,26 @@ the patched code before its version update. The small differences may be Windows
 accounting or run-to-run variation; they do not establish a sustained speedup.
 No new background timers, workers or caches were added.
 
+The follow-up **1.0.3 audit** removed repeated estimator identity allocations and
+duplicate selected-device copies. A session-specific database index reduced the
+Insights lookup from 400,402 to 7,954 SQLite instruction steps in a synthetic
+fixture with 256 readings and 256 unrelated polling events. The existing 512 KiB
+SQLite page-cache budget stays fixed; the index adds disk storage, not a new RAM
+cache or periodic task.
+
+Matched two-minute simulated background samples of published 1.0.2 source and
+the patched source used for 1.0.3, before its version update, used one animated
+charging device and the dashboard closed:
+
+| Simulated build | CPU, one logical core | Mean private RAM | Peak private RAM |
+| --- | ---: | ---: | ---: |
+| Published 1.0.2 source | 0.078% | 4.88 MiB | 4.95 MiB |
+| Patched source used for 1.0.3 | 0.052% | 4.76 MiB | 4.82 MiB |
+
+These are single regression samples, not a new comparison with HaloBattery or
+live-hardware benchmarks. Windows accounting resolution and run-to-run variation
+can explain small differences; they do not establish a sustained speedup.
+
 ## Build from source
 
 Requirements: Windows, Rust's MSVC toolchain (Rust 1.88 or newer), Visual Studio
@@ -320,11 +339,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.0.2
+.\tools\package-rust.ps1 -Version 1.0.3
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.0.2-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.0.3-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -334,12 +353,12 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.0.2
+.\tools\package-installer.ps1 -Version 1.0.3
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.0.2-windows-x64-setup.exe`
-and `dist/HaloContinued-1.0.2-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.0.3-windows-x64-setup.exe`
+and `dist/HaloContinued-1.0.3-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with
@@ -350,7 +369,7 @@ upgrade from that version, including executable replacement, the Installed apps
 version and preservation of settings and history.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Latest local validation: **736 passing tests**, with
+storage and the application. Latest local validation: **739 passing tests**, with
 four opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
