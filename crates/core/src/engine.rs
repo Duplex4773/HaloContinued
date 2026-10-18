@@ -30,12 +30,14 @@ pub struct Notification {
     pub kind: NotificationKind,
     pub title: String,
     pub text: String,
+    generation: u64,
 }
 #[derive(Default)]
 struct AlertState {
     low: bool,
     full: u8,
     threshold: Option<u8>,
+    generation: u64,
 }
 pub struct Engine {
     pub settings: Settings,
@@ -47,6 +49,7 @@ pub struct Engine {
     errors: BTreeMap<String, String>,
     sound_at: BTreeMap<String, f64>,
     pending_sound: Option<u8>,
+    notification_sequence: u64,
     suspended: bool,
 }
 impl Engine {
@@ -62,6 +65,7 @@ impl Engine {
             errors: BTreeMap::new(),
             sound_at: BTreeMap::new(),
             pending_sound: None,
+            notification_sequence: 0,
             suspended: false,
         }
     }
@@ -126,6 +130,15 @@ impl Engine {
     }
     /// Delivery belongs to the UI. A failed delivery is retried only while relevant.
     pub fn notification_failed(&mut self, notification: Notification) {
+        // UI delivery can fail after this key was replaced or a new battery
+        // episode began. Old failures must never overwrite a newer held alert.
+        if !self
+            .alerts
+            .get(&notification.key)
+            .is_some_and(|alert| alert.generation == notification.generation)
+        {
+            return;
+        }
         self.held
             .insert((notification.key.clone(), notification.kind), notification);
     }
@@ -318,22 +331,28 @@ impl Engine {
             let low = self.settings.low_for(&r.key);
             // Only this provider's fresh, selected reading can trigger a sound.
             // Cached readings of other providers must not restart a low alarm.
-            if self.settings.low_sound && fresh_here && r.online() {
-                let identities = sound_identities(&r);
-                if let Some(level) = r.level {
+            if self.settings.low_sound
+                && fresh_here
+                && r.online()
+                && let Some(level) = r.level
+            {
+                if low == 0 || level > low || r.charging == Some(true) {
+                    // With no active cooldown there is nothing to clear. Avoid
+                    // constructing identity/alias strings on every healthy poll.
+                    if !self.sound_at.is_empty() {
+                        for identity in related_sound_identities(&r, &self.by_provider) {
+                            self.sound_at.remove(&identity);
+                        }
+                    }
+                } else {
+                    let identities = sound_identities(&r);
                     let last = identities
                         .iter()
                         .flatten()
                         .filter_map(|id| self.sound_at.get(id))
                         .copied()
                         .max_by(f64::total_cmp);
-                    if low == 0 || level > low || r.charging == Some(true) {
-                        for identity in related_sound_identities(&r, &self.by_provider) {
-                            self.sound_at.remove(&identity);
-                        }
-                    } else if monotonic.is_finite()
-                        && last.is_none_or(|last| monotonic >= last + 300.0)
-                    {
+                    if monotonic.is_finite() && last.is_none_or(|last| monotonic >= last + 300.0) {
                         for identity in identities.into_iter().flatten() {
                             self.sound_at.insert(identity, monotonic);
                         }
@@ -363,9 +382,20 @@ impl Engine {
                 alert.threshold = Some(low);
             }
             if let Some(level) = r.level.filter(|_| r.online()) {
-                if r.charging == Some(true) || level > low.saturating_add(5) {
+                let recovered = r.charging == Some(true) || level > low.saturating_add(5);
+                let low_notification =
+                    !recovered && low > 0 && level <= low && !alert.low && self.settings.notify;
+                let full_notification = level == 100
+                    && alert.full == 1
+                    && self.settings.full_alert
+                    && self.settings.notify;
+                if low_notification || full_notification {
+                    self.notification_sequence = self.notification_sequence.wrapping_add(1).max(1);
+                    alert.generation = self.notification_sequence;
+                }
+                if recovered {
                     alert.low = false;
-                } else if low > 0 && level <= low && !alert.low && self.settings.notify {
+                } else if low_notification {
                     alert.low = true;
                     notifications.push(Notification {
                         key: r.key.clone(),
@@ -376,18 +406,16 @@ impl Engine {
                         } else {
                             format!("{name}: {level}% left. Time to charge.")
                         },
+                        generation: alert.generation,
                     });
                 }
-                if level == 100
-                    && alert.full == 1
-                    && self.settings.full_alert
-                    && self.settings.notify
-                {
+                if full_notification {
                     notifications.push(Notification {
                         key: r.key.clone(),
                         kind: NotificationKind::Full,
                         title: "Fully charged".into(),
                         text: format!("{name} is fully charged."),
+                        generation: alert.generation,
                     });
                 }
                 if level == 100 {
@@ -411,7 +439,11 @@ impl Engine {
         let readings = self.readings();
         let mut ready = Vec::new();
         for mut n in std::mem::take(&mut self.held).into_values() {
-            if !self.settings.notify
+            if !self
+                .alerts
+                .get(&n.key)
+                .is_some_and(|alert| alert.generation == n.generation)
+                || !self.settings.notify
                 || (n.kind == NotificationKind::Full && !self.settings.full_alert)
                 || self.settings.device(&n.key).is_some_and(|d| d.hidden)
             {

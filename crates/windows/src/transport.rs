@@ -484,6 +484,30 @@ impl HidTransport for WindowsHid {
     }
 }
 struct Session(HidDevice);
+/// Most HID reads are small and drains often return no report. Keep the scratch
+/// buffer on the existing worker stack; allocate only for bytes actually read.
+/// Larger reports retain their original full buffer and are never truncated.
+fn read_input(
+    length: usize,
+    read: impl FnOnce(&mut [u8]) -> Result<usize, ProviderError>,
+) -> Result<Vec<u8>, ProviderError> {
+    if length <= 128 {
+        let mut buffer = [0u8; 128];
+        let count = read(&mut buffer[..length])?;
+        if count > length {
+            return Err(ProviderError::new("HID read exceeded its buffer"));
+        }
+        Ok(buffer[..count].to_vec())
+    } else {
+        let mut buffer = vec![0u8; length];
+        let count = read(&mut buffer)?;
+        if count > length {
+            return Err(ProviderError::new("HID read exceeded its buffer"));
+        }
+        buffer.truncate(count);
+        Ok(buffer)
+    }
+}
 impl HidSession for Session {
     fn input_report(&mut self, id: u8, length: usize) -> Result<Vec<u8>, ProviderError> {
         if length == 0 {
@@ -503,13 +527,11 @@ impl HidSession for Session {
         Ok(())
     }
     fn read(&mut self, length: usize, timeout: Duration) -> Result<Vec<u8>, ProviderError> {
-        let mut data = vec![0; length];
-        let n = self
-            .0
-            .read_timeout(&mut data, timeout.as_millis().min(i32::MAX as u128) as i32)
-            .map_err(error)?;
-        data.truncate(n);
-        Ok(data)
+        read_input(length, |data| {
+            self.0
+                .read_timeout(data, timeout.as_millis().min(i32::MAX as u128) as i32)
+                .map_err(error)
+        })
     }
     fn send_feature(&mut self, data: &[u8]) -> Result<(), ProviderError> {
         self.0.send_feature_report(data).map_err(error)
@@ -528,6 +550,30 @@ impl HidSession for Session {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    #[test]
+    fn empty_small_reads_allocate_nothing_and_live_reports_keep_their_bytes() {
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(read_input(64, |_| Ok(0)).unwrap().is_empty());
+            }
+        });
+        assert_eq!(allocations.calls, 0, "{allocations:?}");
+        assert_eq!(allocations.bytes, 0);
+        for length in [0, 20, 64, 65, 91, 128, 129, 512] {
+            for used in [0, length / 2, length] {
+                let report = read_input(length, |buffer| {
+                    assert_eq!(buffer.len(), length);
+                    assert!(buffer.iter().all(|byte| *byte == 0));
+                    buffer[..used].fill(0x7d);
+                    Ok(used)
+                })
+                .unwrap();
+                assert_eq!(report, vec![0x7d; used]);
+            }
+            assert!(read_input(length, |_| Ok(length + 1)).is_err());
+            assert!(read_input(length, |_| Err(ProviderError::new("synthetic failure"))).is_err());
+        }
+    }
     #[test]
     fn empty_boot_inventory_refreshes_at_ten_seconds_without_revoking_siblings() {
         let mut cache = EnumerationCache::default();

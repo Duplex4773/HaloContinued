@@ -1218,8 +1218,15 @@ fn wide(s: &str) -> Vec<u16> {
 fn copy(dst: &mut [u16], s: &str) {
     dst.fill(0);
     let limit = dst.len().saturating_sub(1);
-    for (target, character) in dst.iter_mut().take(limit).zip(s.encode_utf16()) {
-        *target = character;
+    let mut position = 0;
+    for character in s.chars() {
+        let mut encoded = [0; 2];
+        let units = character.encode_utf16(&mut encoded);
+        if position + units.len() > limit {
+            break;
+        }
+        dst[position..position + units.len()].copy_from_slice(units);
+        position += units.len();
     }
 }
 fn cache_tooltip_rate(
@@ -7792,6 +7799,18 @@ mod tray_registration_tests {
 #[cfg(test)]
 mod tooltip_polling_tests {
     use super::*;
+    #[test]
+    fn notification_text_truncation_keeps_complete_unicode_characters() {
+        let mut notification = [0u16; 256];
+        let message = format!("{}🖱 battery is low", "a".repeat(254));
+        copy(&mut notification, &message);
+        assert_eq!(text(&notification), "a".repeat(254));
+        assert_eq!(notification[255], 0);
+        copy(&mut [], &message);
+        let mut tiny = [7u16; 2];
+        copy(&mut tiny, "🖱");
+        assert_eq!(tiny, [0, 0]);
+    }
     fn fixture() -> (DeviceView, ControlOutcome) {
         let mut reading = Reading::new("synthetic", "Test mouse", "simulation", 10);
         reading.kind = "mouse".into();

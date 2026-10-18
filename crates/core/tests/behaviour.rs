@@ -9,6 +9,74 @@ fn engine() -> Engine {
     Engine::new(Settings::default(), Estimator::default())
 }
 #[test]
+fn delayed_failed_notifications_do_not_transfer_to_reused_device_keys() {
+    for full in [false, true] {
+        for changed in 0..4 {
+            let mut e = engine();
+            let mut first = reading(if full { 98 } else { 19 }, full, 0);
+            let note = if full {
+                assert!(
+                    e.apply("razer", Ok(vec![first.clone()]), 0.0, false)
+                        .is_empty()
+                );
+                first.level = Some(100);
+                first.timestamp = 60;
+                e.apply("razer", Ok(vec![first.clone()]), 60.0, false)
+            } else {
+                e.apply("razer", Ok(vec![first.clone()]), 0.0, false)
+            }
+            .pop()
+            .unwrap();
+            let mut replacement = first;
+            replacement.timestamp = 120;
+            replacement.charging = Some(false);
+            match changed {
+                0 => replacement.serial = Some("SYNTHETIC-REPLACEMENT".into()),
+                1 => replacement.container = Some("SYNTHETIC-REPLACEMENT".into()),
+                2 => replacement.source = "replacement-source".into(),
+                _ => replacement.kind = "replacement-kind".into(),
+            }
+            let replacement_notes = e.apply("razer", Ok(vec![replacement]), 120.0, false);
+            assert_eq!(replacement_notes.len(), usize::from(!full));
+            // This models a delayed UI delivery failure arriving after discovery
+            // already replaced the unit. It must not revive the prior unit's alert.
+            e.notification_failed(note);
+            assert!(
+                e.flush_held().is_empty(),
+                "full={full}, identity field={changed}"
+            );
+            assert!(!e.has_held_notifications());
+        }
+    }
+}
+
+#[test]
+fn delayed_retry_cannot_replace_a_new_low_battery_episode() {
+    let mut e = engine();
+    let old = e
+        .apply("razer", Ok(vec![reading(19, false, 0)]), 0.0, false)
+        .pop()
+        .unwrap();
+    e.apply("razer", Ok(vec![reading(80, true, 60)]), 60.0, false);
+    let current = e.apply("razer", Ok(vec![reading(15, false, 120)]), 120.0, true);
+    assert!(current.is_empty());
+    assert!(e.has_held_notifications());
+    e.notification_failed(old.clone());
+    let current = e.flush_held();
+    assert_eq!(current.len(), 1);
+    // A failure from the previous episode must not remain valid after this
+    // current notification is delivered successfully.
+    let current = current.into_iter().next().unwrap();
+    e.notification_failed(old);
+    assert!(e.flush_held().is_empty());
+    e.notification_failed(current.clone());
+    assert_eq!(e.flush_held().len(), 1);
+    e.notification_failed(current);
+    e.apply("razer", Ok(vec![reading(80, true, 180)]), 180.0, false);
+    assert!(!e.has_held_notifications());
+}
+
+#[test]
 fn reused_keys_do_not_inherit_another_units_alerts_or_sound_cooldown() {
     let mut e = engine();
     e.settings.low_sound = true;

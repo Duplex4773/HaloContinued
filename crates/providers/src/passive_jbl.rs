@@ -13,7 +13,6 @@ type ListeningResult = Result<(Option<u8>, bool), ProviderError>;
 pub(crate) struct PassiveJbl {
     sessions: BTreeMap<String, Box<dyn HidSession>>,
     retry: BTreeMap<String, (Duration, String)>,
-    power: BTreeMap<String, bool>,
     generation: Option<u64>,
     pub probe_listen: bool,
 }
@@ -21,7 +20,6 @@ impl PassiveJbl {
     pub fn clear(&mut self) {
         self.sessions.clear();
         self.retry.clear();
-        self.power.clear();
         self.generation = None;
     }
     pub fn delay(&self) -> Option<Duration> {
@@ -40,7 +38,6 @@ impl PassiveJbl {
         self.generation = Some(generation);
         self.sessions.retain(|p, _| paths.contains(p));
         self.retry.retain(|p, _| paths.contains(p));
-        self.power.retain(|p, _| paths.contains(p));
     }
     pub fn listen(
         &mut self,
@@ -115,7 +112,6 @@ impl PassiveJbl {
                     } else if r.first() == Some(&9)
                         && let Some(on) = r.get(1)
                     {
-                        self.power.insert(path.clone(), *on != 0);
                         if *on == 0 {
                             fresh_online = false;
                         }

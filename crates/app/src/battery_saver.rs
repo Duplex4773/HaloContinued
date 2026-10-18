@@ -73,6 +73,7 @@ struct Pending {
     old: Setting,
     restoring: bool,
     cancel: Arc<AtomicBool>,
+    settings_cancelled: bool,
 }
 #[derive(Default)]
 pub struct BatterySaver {
@@ -81,6 +82,12 @@ pub struct BatterySaver {
     sequence: u64,
 }
 impl BatterySaver {
+    pub fn settings_changed(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.settings_cancelled = true;
+            pending.cancel.store(true, Ordering::Release);
+        }
+    }
     pub fn wanted(&self, settings: &Settings) -> bool {
         !self.entries.is_empty()
             || settings
@@ -342,6 +349,7 @@ impl BatterySaver {
                     old: *state,
                     restoring,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    settings_cancelled: false,
                 });
                 action = Some(request);
                 break;
@@ -370,11 +378,11 @@ impl BatterySaver {
             return false;
         };
         let sleep = matches!(p.action, Action::Sleep(_));
-        if p.action.target().generation != e.target.generation
+        if (p.action.target().generation != e.target.generation || p.settings_cancelled)
             && p.action.target().connection_stamp.is_some()
             && !may_have_changed
         {
-            // A refresh before SET cannot have changed the owned setting.
+            // Refresh/settings before SET cannot have changed the owned setting.
             // Keep the original; the next request still checks its connection.
             return true;
         }
@@ -783,6 +791,72 @@ mod tests {
         );
         complete(&mut b, &sleep, 300);
         assert!(b.next(&s, 21, &r, 100, &boost).is_none());
+    }
+    #[test]
+    fn settings_cancellation_without_connection_proof_cannot_resume_sleep_restore() {
+        let (mut saver, settings, mut readings, boost) = fixture();
+        activate(&mut saver, &settings, &readings, &boost);
+        readings[0].level = Some(25);
+        let polling = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+        complete(&mut saver, &polling, 1000);
+        saver.entries.get_mut(&readings[0].key).unwrap().sleep_stamp = None;
+        let Action::Sleep(restore) = saver.next(&settings, 1, &readings, 100, &boost).unwrap()
+        else {
+            panic!("Expected independent sleep restoration");
+        };
+        let guard = saver.cancel(restore.request).unwrap();
+        saver.settings_changed();
+        assert!(guard.load(Ordering::Acquire));
+        saver.sleep_complete(&SleepOutcome::failed(
+            &restore,
+            "Settings revoked permission",
+        ));
+        assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+    }
+    #[test]
+    fn unrelated_settings_do_not_lose_original_polling_or_sleep_restore() {
+        for sleep in [false, true] {
+            for may_have_changed in [false, true] {
+                let (mut saver, mut settings, mut readings, boost) = fixture();
+                activate(&mut saver, &settings, &readings, &boost);
+                readings[0].level = Some(25);
+                if sleep {
+                    let polling = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                    complete(&mut saver, &polling, 1000);
+                }
+                let restore = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                settings.animation = !settings.animation;
+                saver.settings_changed();
+                match &restore {
+                    Action::Polling(request) => {
+                        let mut failed =
+                            ControlOutcome::failed(request, "Settings revoked permission");
+                        failed.may_have_changed = may_have_changed;
+                        saver.polling_complete(&failed);
+                    }
+                    Action::Sleep(request) => {
+                        let mut failed =
+                            SleepOutcome::failed(request, "Settings revoked permission");
+                        failed.may_have_changed = may_have_changed;
+                        saver.sleep_complete(&failed);
+                    }
+                }
+                let next = saver.next(&settings, 1, &readings, 100, &boost);
+                if !may_have_changed {
+                    let next = next.unwrap();
+                    assert_eq!(matches!(next, Action::Sleep(_)), sleep);
+                    assert_eq!(
+                        next.target().connection_stamp,
+                        restore.target().connection_stamp
+                    );
+                } else {
+                    assert_eq!(next.is_some(), !sleep);
+                    if let Some(next) = next {
+                        assert!(matches!(next, Action::Sleep(_)));
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn safe_refresh_cancellation_preserves_restore_but_uncertain_set_is_not_retried() {

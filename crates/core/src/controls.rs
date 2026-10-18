@@ -96,23 +96,47 @@ pub(crate) fn shared_preference_key(
     via: &str,
     serial: Option<&str>,
 ) -> Option<String> {
+    let unit = preference_unit(key, kind, source, via, serial)?;
+    Some(format!("razer:{}:{}", unit.wireless_pid, unit.serial))
+}
+
+pub(crate) struct PreferenceUnit<'a> {
+    pub wired_pid: &'static str,
+    pub wireless_pid: &'static str,
+    pub serial: &'a str,
+}
+pub(crate) fn preference_unit<'a>(
+    key: &'a str,
+    kind: &str,
+    source: &str,
+    via: &str,
+    serial: Option<&str>,
+) -> Option<PreferenceUnit<'a>> {
     if kind != "mouse" || source != "razer" || via != "usb" {
         return None;
     }
     let ("razer", pid, suffix) = preference_parts(key)? else {
         return None;
     };
-    let wireless = match pid {
-        "00be" | "00bf" => "00bf",
-        "00b6" | "00b7" => "00b7",
-        "00c0" | "00c1" => "00c1",
+    let (wired_pid, wireless_pid) = match pid {
+        "00be" | "00bf" => ("00be", "00bf"),
+        "00b6" | "00b7" => ("00b6", "00b7"),
+        "00c0" | "00c1" => ("00c0", "00c1"),
         _ => return None,
     };
-    let serial = serial?.trim().to_ascii_uppercase();
-    if !valid_unit_serial(&serial) || suffix != serial {
+    // Provider keys contain the canonical ASCII serial. Validate the borrowed
+    // suffix instead of allocating an uppercase copy on every observation.
+    if !valid_unit_serial(suffix)
+        || suffix.bytes().any(|byte| byte.is_ascii_lowercase())
+        || !suffix.eq_ignore_ascii_case(serial?.trim())
+    {
         return None;
     }
-    Some(format!("razer:{wireless}:{serial}"))
+    Some(PreferenceUnit {
+        wired_pid,
+        wireless_pid,
+        serial: suffix,
+    })
 }
 fn wired_mouse(key: &str, kind: &str, source: &str, via: &str) -> bool {
     kind == "mouse"

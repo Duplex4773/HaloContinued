@@ -30,6 +30,14 @@ impl Estimator {
             d.last = None;
         }
     }
+    /// The state owner detected a backward wall-clock change. Keep the learned
+    /// monotonic-time fit, but allow fresh readings in the new clock epoch.
+    pub fn clock_changed(&mut self, now: i64) {
+        for discharge in self.devices.values_mut() {
+            discharge.last = None;
+            discharge.seen = discharge.seen.min(now.max(0));
+        }
+    }
     /// Recover valid entries independently; loading never counts time while closed.
     pub fn from_value(value: serde_json::Value, now: i64) -> Self {
         let mut estimator = Self::default();
@@ -98,6 +106,12 @@ impl Estimator {
         }
     }
     fn record_sample(d: &mut Discharge, r: &Reading, monotonic: f64, level: u8) {
+        // Cached and inferred charging are not proof of a new charge cycle.
+        // They must not clear a valid fit or advance its fresh-reading clock.
+        if !r.online() || r.charging_inferred {
+            d.last = None;
+            return;
+        }
         if r.timestamp < d.seen {
             d.last = None;
             return;
@@ -110,7 +124,7 @@ impl Estimator {
             };
             return;
         }
-        if !r.online() || r.charging != Some(false) || r.charging_inferred {
+        if r.charging != Some(false) {
             d.last = None;
             return;
         }

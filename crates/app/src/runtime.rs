@@ -541,6 +541,20 @@ fn battery_affects_snapshot(engine: &Engine, provider: &str, result: &PollResult
         Err(error) => engine.provider_error(provider) != Some(error.message.as_str()),
     }
 }
+/// A delayed/cached result can come from before a clock adjustment. Preserve
+/// the last-known value, but never treat its future timestamp as fresh evidence.
+fn reject_future_battery_readings(result: &mut PollResult, now: i64) -> bool {
+    let mut future = false;
+    if let Ok(readings) = result {
+        for reading in readings {
+            if reading.timestamp > now {
+                reading.connection = Connection::Stale;
+                future = true;
+            }
+        }
+    }
+    future
+}
 /// Availability is an event at detection time, not a correction to an old poll.
 fn availability_boundary(mut reading: Reading, state: Connection, now: i64) -> Reading {
     reading.timestamp = if now == reading.timestamp {
@@ -1557,6 +1571,15 @@ fn execute_job(
             ))
         })
     };
+    // Some bounded providers finish their loop with an empty or partial list.
+    // Expiry/cancellation is not a completed inventory and cannot prove absence.
+    let result = if result.is_ok() && !context.active() {
+        Err(ProviderError::new(
+            "Battery query cancelled or deadline exceeded",
+        ))
+    } else {
+        result
+    };
     Completed {
         provider: job.provider,
         result,
@@ -1861,6 +1884,22 @@ fn finish_sleep_outcome(
     let owned = saver.sleep_complete(outcome);
     outcome.request & crate::battery_saver::REQUEST_BIT == 0 || owned
 }
+/// Revocation can arrive while the state owner is waiting for a completion,
+/// before its next settings acknowledgment. Preserve only pre-write ownership;
+/// the policy still requires its original connection proof before another SET.
+fn control_epoch_current(
+    epoch: u64,
+    current: u64,
+    boost: &mut crate::boost::Boost,
+    saver: &mut crate::battery_saver::BatterySaver,
+) -> bool {
+    if epoch == current {
+        return true;
+    }
+    boost.settings_changed();
+    saver.settings_changed();
+    false
+}
 fn finish_polling_outcome(
     boost: &mut crate::boost::Boost,
     saver: &mut crate::battery_saver::BatterySaver,
@@ -2006,11 +2045,13 @@ impl UsageTracker {
             previous: outcome.previous,
         })
     }
-    fn synchronize_clock(&mut self, now: i64) {
-        if self.wall_clock.is_some_and(|previous| now < previous) {
+    fn synchronize_clock(&mut self, now: i64) -> bool {
+        let moved_back = self.wall_clock.is_some_and(|previous| now < previous);
+        if moved_back {
             self.invalidate(self.generation, self.enabled);
         }
         self.wall_clock = Some(now);
+        moved_back
     }
     fn samples(&mut self, readings: Vec<Reading>) -> Vec<UsageObservation> {
         readings
@@ -2018,8 +2059,15 @@ impl UsageTracker {
             .map(|reading| {
                 let unavailable_transition = !reading.online()
                     && self.connections.get(&reading.key) != Some(&reading.connection);
-                let revoked_rate = reading.connection == Connection::Stale
-                    && self.rates.remove(&reading.key).is_some();
+                // A successful observation of a different unit/transport must
+                // revoke readback, not merely hide it until old metadata returns.
+                let revoked_rate = self.rates.get(&reading.key).is_some_and(|observed| {
+                    reading.connection == Connection::Stale
+                        || !observed.target.device.matches_reading(&reading)
+                });
+                if revoked_rate {
+                    self.rates.remove(&reading.key);
+                }
                 if unavailable_transition || revoked_rate {
                     self.session = self.session.saturating_add(1);
                     self.set_device_session(&reading.key);
@@ -2027,18 +2075,18 @@ impl UsageTracker {
                 if !self.device_sessions.contains_key(&reading.key) {
                     self.set_device_session(&reading.key);
                 }
-                self.connections
-                    .insert(reading.key.clone(), reading.connection.clone());
+                if let Some(connection) = self.connections.get_mut(&reading.key) {
+                    *connection = reading.connection.clone();
+                } else {
+                    self.connections
+                        .insert(reading.key.clone(), reading.connection.clone());
+                }
                 let polling_rate = self
                     .rates
                     .get(&reading.key)
                     .filter(|o| {
-                        let target = &o.target.device;
                         reading.timestamp >= o.timestamp
-                            && reading.source == target.source
-                            && reading.via == target.via
-                            && reading.serial == target.serial
-                            && reading.container == target.container
+                            && o.target.device.matches_reading(&reading)
                     })
                     .and_then(|o| o.rate);
                 let session = self.device_sessions.get(&reading.key).copied();
@@ -2058,8 +2106,19 @@ impl UsageTracker {
             self.rates.remove(&expired);
             self.connections.remove(&expired);
         }
-        self.device_sessions.insert(key.to_owned(), self.session);
+        if let Some(session) = self.device_sessions.get_mut(key) {
+            *session = self.session;
+        } else {
+            self.device_sessions.insert(key.to_owned(), self.session);
+        }
     }
+}
+fn synchronize_battery_clock(engine: &mut Engine, tracker: &mut UsageTracker, now: i64) -> bool {
+    let moved_back = tracker.synchronize_clock(now);
+    if moved_back {
+        engine.estimator.clock_changed(now);
+    }
+    moved_back
 }
 struct Apartment(bool);
 impl Apartment {
@@ -2202,6 +2261,8 @@ fn run(
             .take();
         if let Some((s, epoch)) = latest_settings {
             startup_polling.cancel();
+            boost.settings_changed();
+            saver.settings_changed();
             let previous = engine.readings();
             snapshots.changed = true;
             let remove = engine.settings.status_file && !s.status_file;
@@ -2271,7 +2332,6 @@ fn run(
             hid.generation(),
             engine.settings.polling_controls && !suspended,
         );
-        usage_tracker.synchronize_clock(clock.unix());
         boost.observe_generation(hid.generation());
         if saver_generation != hid.generation() {
             saver.observe_generation(hid.generation());
@@ -2455,7 +2515,8 @@ fn run(
         let keyboard_epoch =
             (visible && configuration_valid && configuration_generation == hid.generation())
                 .then(|| configuration.epoch.load(Ordering::Acquire));
-        let startup_command = if !startup_polling.active() {
+        let startup_worker_available = simulate || !jobs.is_full();
+        let startup_command = if !startup_polling.active() || !startup_worker_available {
             None
         } else {
             startup_polling.next(
@@ -2469,7 +2530,7 @@ fn run(
                     .map(ConfigurationDevice::from_reading)
                     .chain(configuration_devices.iter().cloned()),
                 keyboard_epoch,
-                simulate || !jobs.is_full(),
+                startup_worker_available,
             )
         };
         let boost_command = if startup_command.is_none()
@@ -2541,6 +2602,11 @@ fn run(
         } else {
             select! {recv(commands)->m=>Work::Command(m),recv(event_rx)->m=>Work::Command(m),recv(result_rx)->r=>Work::Completed(r),default(wait)=>Work::Idle}
         };
+        let observed_now = clock.unix();
+        if synchronize_battery_clock(&mut engine, &mut usage_tracker, observed_now) {
+            snapshots.changed = true;
+            estimator_dirty = true;
+        }
         match work {
             Work::Command(Ok(Command::Quit)) | Work::Command(Err(_)) => {
                 stop = true;
@@ -2676,6 +2742,8 @@ fn run(
             }
             Work::Completed(Ok(WorkerCompleted::Battery(mut r))) => {
                 inflight = inflight.saturating_sub(1);
+                let timestamps_confirmed =
+                    !reject_future_battery_readings(&mut r.result, observed_now);
                 let id = r.provider.id();
                 let current = battery_completion_current(
                     &r,
@@ -2690,11 +2758,11 @@ fn run(
                 let observations = completed_observations(
                     engine.provider_readings(id),
                     &r.result,
-                    clock.unix(),
+                    observed_now,
                     current,
                 );
                 if current {
-                    let inventory_confirmed = r.result.is_ok();
+                    let inventory_confirmed = r.result.is_ok() && timestamps_confirmed;
                     for n in engine.apply(id, r.result, clock.monotonic().as_secs_f64(), quiet) {
                         let _ = events.send(Event::Alert(n));
                     }
@@ -2894,8 +2962,12 @@ fn run(
             }
             Work::Completed(Ok(WorkerCompleted::Sleep(mut outcome, epoch, visible))) => {
                 inflight = inflight.saturating_sub(1);
-                if epoch != permission.epoch.load(Ordering::Acquire)
-                    || !permission.enabled.load(Ordering::Acquire)
+                if !control_epoch_current(
+                    epoch,
+                    permission.epoch.load(Ordering::Acquire),
+                    &mut boost,
+                    &mut saver,
+                ) || !permission.enabled.load(Ordering::Acquire)
                     || !permission.desired_enabled.load(Ordering::Acquire)
                     || suspended
                     || stop
@@ -3025,8 +3097,12 @@ fn run(
                 configuration_epoch,
             ))) => {
                 inflight = inflight.saturating_sub(1);
-                let permitted = epoch == permission.epoch.load(Ordering::Acquire)
-                    && permission.enabled.load(Ordering::Acquire)
+                let permitted = control_epoch_current(
+                    epoch,
+                    permission.epoch.load(Ordering::Acquire),
+                    &mut boost,
+                    &mut saver,
+                ) && permission.enabled.load(Ordering::Acquire)
                     && permission.desired_enabled.load(Ordering::Acquire)
                     && permission.acknowledged.load(Ordering::Acquire) == epoch
                     && engine.settings.polling_controls
@@ -3133,6 +3209,92 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn permission_revocation_before_settings_acknowledgment_preserves_only_unwritten_restores() {
+        fn next(
+            boosting: bool,
+            boost: &mut crate::boost::Boost,
+            saver: &mut crate::battery_saver::BatterySaver,
+            settings: &Settings,
+            readings: &[Reading],
+        ) -> Option<ControlRequest> {
+            if boosting {
+                boost.next(settings, 1, readings)
+            } else {
+                saver.next(settings, 1, readings, 100, boost).map(|action| {
+                    let crate::battery_saver::Action::Polling(request) = action else {
+                        panic!("No sleep policy configured in this fixture");
+                    };
+                    request
+                })
+            }
+        }
+        for boosting in [false, true] {
+            for may_have_changed in [false, true] {
+                let now = Instant::now();
+                let mut boost = crate::boost::Boost::new(now);
+                let mut saver = crate::battery_saver::BatterySaver::default();
+                let mut settings = Settings {
+                    polling_controls: true,
+                    ..Default::default()
+                };
+                let mut readings = vec![control_reading()];
+                readings[0].timestamp = 100;
+                readings[0].level = Some(19);
+                readings[0].charging = Some(false);
+                let device = settings.device_mut(&readings[0].key);
+                device.fullscreen_boost_rate = PollingRate::try_from(2000).ok();
+                device.low_battery_mode = Some(hb_core::settings::LowBatteryMode {
+                    threshold: 20,
+                    polling_rate: PollingRate::try_from(125).ok(),
+                    sleep_seconds: None,
+                });
+                if boosting {
+                    boost.sample(now, Some(true));
+                    boost.sample(now + Duration::from_secs(10), Some(true));
+                }
+                let mut hardware = PollingRate::try_from(1000).unwrap();
+                for _ in 0..2 {
+                    let request =
+                        next(boosting, &mut boost, &mut saver, &settings, &readings).unwrap();
+                    let outcome = simulate_control(&request, &mut hardware, 1, 100);
+                    assert!(outcome.failure.is_none());
+                    assert!(finish_polling_outcome(&mut boost, &mut saver, &outcome));
+                }
+                readings[0].level = Some(25);
+                if boosting {
+                    boost.sample(now + Duration::from_secs(30), Some(false));
+                    boost.sample(now + Duration::from_secs(45), Some(false));
+                }
+                let restore = next(boosting, &mut boost, &mut saver, &settings, &readings).unwrap();
+                let cancelled = if boosting {
+                    boost.guard(restore.request).unwrap().cancel
+                } else {
+                    saver.cancel(restore.request).unwrap()
+                };
+                assert!(control_epoch_current(1, 1, &mut boost, &mut saver));
+                assert!(!cancelled.load(Ordering::Acquire));
+                // UI revocation won the race; the state owner has not applied
+                // the settings mailbox yet. Process this old completion first.
+                let permitted = control_epoch_current(1, 2, &mut boost, &mut saver);
+                assert!(!permitted);
+                assert!(cancelled.load(Ordering::Acquire));
+                let mut outcome = ControlOutcome::failed(&restore, "Permission revoked before SET");
+                outcome.may_have_changed = may_have_changed;
+                validate_polling_completion(&mut outcome, 1, permitted);
+                assert!(finish_polling_outcome(&mut boost, &mut saver, &outcome));
+                let retry = next(boosting, &mut boost, &mut saver, &settings, &readings);
+                assert_eq!(retry.is_some(), !may_have_changed);
+                if let Some(retry) = retry {
+                    assert_eq!(
+                        retry.target.connection_stamp,
+                        restore.target.connection_stamp
+                    );
+                    assert_eq!(retry.action, restore.action);
+                }
+            }
+        }
+    }
     #[test]
     fn cancelled_automatic_replies_cannot_replace_manual_polling_or_sleep_status() {
         use hb_core::settings::LowBatteryMode;
@@ -3963,6 +4125,32 @@ mod tests {
         );
     }
     #[test]
+    fn same_rate_confirmation_retains_manual_ownership_evidence() {
+        let mut tracker = UsageTracker::new(2, true);
+        let mut rate = PollingRate::try_from(1000).unwrap();
+        let request = control_request(ControlAction::Apply(rate), 2);
+        tracker.begin_control(&request, None);
+        let outcome = simulate_control(&request, &mut rate, 2, 20);
+        tracker.observe(&outcome);
+        assert!(!outcome.may_have_changed);
+        // Choosing the already boosted rate still takes manual ownership, so
+        // retain this event. Storage excludes it from actual change counts.
+        let event = tracker.take_activity(&outcome).unwrap();
+        assert_eq!(event.kind, PollingActivityKind::Manual);
+        assert_eq!(event.previous, Some(event.rate));
+        assert!(tracker.actions.is_empty());
+        assert_eq!(tracker.rates[&outcome.key].rate, Some(rate));
+
+        let request = control_request(ControlAction::Apply(2000.try_into().unwrap()), 2);
+        tracker.begin_control(&request, None);
+        let outcome = simulate_control(&request, &mut rate, 2, 21);
+        tracker.observe(&outcome);
+        assert_eq!(
+            tracker.take_activity(&outcome).unwrap().kind,
+            PollingActivityKind::Manual
+        );
+    }
+    #[test]
     fn usage_learning_requires_fresh_readback_and_matching_connection() {
         let mut tracker = UsageTracker::new(2, true);
         let request = control_request(ControlAction::Read, 2);
@@ -4004,6 +4192,39 @@ mod tests {
         tracker.observe(&outcome);
         reading.via = "other transport".into();
         assert!(tracker.samples(vec![reading])[0].polling_rate.is_none());
+    }
+    #[test]
+    fn changed_identity_revokes_rate_evidence_until_a_new_readback() {
+        for field in 0..5 {
+            let mut tracker = UsageTracker::new(2, true);
+            let request = control_request(ControlAction::Read, 2);
+            let mut rate = PollingRate::try_from(1000).unwrap();
+            let outcome = simulate_control(&request, &mut rate, 2, 20);
+            tracker.observe(&outcome);
+            let mut reading = control_reading();
+            reading.timestamp = 21;
+            let original_session = tracker.samples(vec![reading.clone()])[0].session;
+            let mut changed = reading.clone();
+            match field {
+                0 => changed.kind = "headset".into(),
+                1 => changed.source = "other-provider".into(),
+                2 => changed.via = "other-connection".into(),
+                3 => changed.serial = Some("different-unit".into()),
+                _ => changed.container = Some("different-container".into()),
+            }
+            let sample = tracker.samples(vec![changed]).remove(0);
+            assert!(sample.polling_rate.is_none(), "identity field {field}");
+            assert_ne!(sample.session, original_session, "identity field {field}");
+            assert!(!tracker.rates.contains_key(&reading.key));
+            assert!(
+                tracker.samples(vec![reading.clone()])[0]
+                    .polling_rate
+                    .is_none(),
+                "returning metadata must not revive old evidence: {field}"
+            );
+            tracker.observe(&outcome);
+            assert_eq!(tracker.samples(vec![reading])[0].polling_rate, Some(rate));
+        }
     }
     #[test]
     fn automatic_boost_restore_history_keeps_rates_and_transition_boundaries_separate() {
@@ -4110,6 +4331,50 @@ mod tests {
         tracker.synchronize_clock(30);
         tracker.synchronize_clock(29);
         assert!(tracker.samples(vec![reading])[0].polling_rate.is_none());
+    }
+    #[test]
+    fn wall_clock_rollback_resumes_estimates_and_rejects_future_cached_readings() {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut tracker = UsageTracker::new(2, true);
+        let mut reading = control_reading();
+        reading.charging = Some(false);
+        for step in 0..=180 {
+            reading.timestamp = 1000 + step * 60;
+            reading.level = Some(100 - (step / 12) as u8);
+            engine.apply(
+                "simulation",
+                Ok(vec![reading.clone()]),
+                step as f64 * 60.0,
+                false,
+            );
+        }
+        let key = reading.key.clone();
+        let before = engine.estimator.seconds_left(&key, reading.level);
+        assert!(before.is_some());
+        assert!(!synchronize_battery_clock(&mut engine, &mut tracker, 11800));
+        assert!(synchronize_battery_clock(&mut engine, &mut tracker, 5000));
+        assert_eq!(engine.estimator.devices[&key].seen, 5000);
+        assert_eq!(engine.estimator.seconds_left(&key, reading.level), before);
+        let mut cached = reading.clone();
+        cached.charging = Some(true);
+        let mut late = Ok(vec![cached]);
+        assert!(reject_future_battery_readings(&mut late, 5000));
+        assert_eq!(late.as_ref().unwrap()[0].connection, Connection::Stale);
+        assert!(engine.apply("simulation", late, 10830.0, false).is_empty());
+        assert_eq!(engine.estimator.seconds_left(&key, reading.level), before);
+        assert_eq!(engine.estimator.devices[&key].seen, 5000);
+        reading.timestamp = 5000;
+        let mut fresh = Ok(vec![reading.clone()]);
+        assert!(!reject_future_battery_readings(&mut fresh, 5000));
+        engine.apply("simulation", fresh, 10860.0, false);
+        assert_eq!(engine.estimator.devices[&key].usage, 10800.0);
+        reading.timestamp = 5060;
+        engine.apply("simulation", Ok(vec![reading]), 10920.0, false);
+        assert_eq!(engine.estimator.devices[&key].usage, 10860.0);
+        assert!(!synchronize_battery_clock(&mut engine, &mut tracker, 5060));
+        let mut failed = Err(ProviderError::new("synthetic failure"));
+        assert!(!reject_future_battery_readings(&mut failed, 5060));
+        assert!(failed.is_err());
     }
     #[test]
     fn insights_worker_flushes_rate_metadata_before_query() {
@@ -4232,6 +4497,73 @@ mod tests {
         s.playstation_full_mode = true;
         s.disabled_providers.insert("playstation".into());
         assert!(!poll_is_due(&s, "playstation", Some(now), now, false));
+    }
+    #[test]
+    fn expired_or_cancelled_provider_success_cannot_confirm_disconnection() {
+        struct Clock(std::sync::atomic::AtomicU64);
+        impl hb_core::Clock for Clock {
+            fn unix(&self) -> i64 {
+                100 + self.0.load(Ordering::Relaxed) as i64
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::from_secs(self.0.load(Ordering::Relaxed))
+            }
+            fn sleep(&self, duration: Duration) {
+                self.0.fetch_add(duration.as_secs(), Ordering::Relaxed);
+            }
+        }
+        struct Provider(u8);
+        impl BatteryProvider for Provider {
+            fn id(&self) -> &'static str {
+                "simulation"
+            }
+            fn diagnostics(&self) -> Vec<String> {
+                vec![]
+            }
+            fn poll(&mut self, _: &dyn HidTransport, context: &PollContext<'_>) -> PollResult {
+                if self.0 == 1 || self.0 == 2 {
+                    context.sleep(Duration::from_secs(25));
+                } else if self.0 == 3 {
+                    context.cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(if self.0 == 2 {
+                    vec![Reading::new("partial", "Partial result", "simulation", 125)]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        struct NoHid;
+        impl HidTransport for NoHid {
+            fn enumerate(&self, _: u16) -> Result<Vec<HidInfo>, ProviderError> {
+                panic!("No native discovery in this test")
+            }
+            fn open(&self, _: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
+                panic!("No hardware access in this test")
+            }
+        }
+        for mode in 0..=3 {
+            let clock = Clock(std::sync::atomic::AtomicU64::new(0));
+            let cancel = AtomicBool::new(false);
+            let job = Job::new(Box::new(Provider(mode)), &Settings::default());
+            let completed = execute_job(job, &NoHid, &clock, &cancel);
+            let mut engine = Engine::new(Settings::default(), Estimator::default());
+            let mut reading = Reading::new("known", "Known mouse", "simulation", 100);
+            reading.level = Some(75);
+            engine.apply("simulation", Ok(vec![reading]), 0.0, false);
+            if mode == 0 {
+                assert!(completed.result.as_ref().unwrap().is_empty());
+                engine.apply("simulation", completed.result, 1.0, false);
+            } else {
+                assert!(
+                    completed.result.is_err(),
+                    "mode {mode} must not confirm inventory"
+                );
+                engine.apply("simulation", completed.result, 25.0, false);
+                assert_eq!(engine.readings()[0].key, "known");
+                assert_eq!(engine.readings()[0].connection, Connection::Stale);
+            }
+        }
     }
     #[test]
     fn full_mode_setting_reaches_provider_context_and_cancelled_jobs_do_not_poll() {
@@ -5265,6 +5597,53 @@ mod tests {
             std::fs::read(d.path().join("history.db")).unwrap(),
             b"invalid SQLite database"
         );
+    }
+    #[test]
+    fn history_queries_recover_deferred_samples_without_waiting_for_the_minute_retry() {
+        for query in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("history.db");
+            std::fs::create_dir(&database).unwrap();
+            let (tx, events, worker) = storage(directory.path().to_owned());
+            let mut reading = Reading::new("mouse", "Mouse", "test", 100);
+            reading.level = Some(80);
+            reading.charging = Some(false);
+            tx.send(Storage::unconfirmed(vec![reading])).unwrap();
+            tx.send(Storage::History("mouse".into(), 0, 100, 40, 99))
+                .unwrap();
+            loop {
+                if let Event::History(99, result) =
+                    events.recv_timeout(Duration::from_secs(5)).unwrap()
+                {
+                    assert!(result.is_err());
+                    break;
+                }
+            }
+            std::fs::remove_dir(&database).unwrap();
+            tx.send(match query {
+                0 => Storage::History("mouse".into(), 0, 100, 40, 1),
+                1 => Storage::UsageHistory("mouse".into(), 3600, 100, 40, 1),
+                _ => Storage::Insights("mouse".into(), 100, 1),
+            })
+            .unwrap();
+            loop {
+                match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    Event::History(1, result) => {
+                        let series = result.unwrap();
+                        assert_eq!(series.samples.len(), 1);
+                        assert_eq!(series.samples[0].reading.level, Some(80));
+                        break;
+                    }
+                    Event::Insights(1, result) => {
+                        assert_eq!(result.unwrap().coverage.observation_count, 1);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            tx.send(Storage::Quit).unwrap();
+            worker.join().unwrap();
+        }
     }
     #[test]
     fn usage_history_flushes_pending_rows_and_preserves_real_timestamps() {

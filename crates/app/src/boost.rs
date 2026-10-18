@@ -31,6 +31,7 @@ struct Entry {
 struct Pending {
     request: ControlRequest,
     guard: Guard,
+    settings_cancelled: bool,
 }
 pub struct Boost {
     entries: BTreeMap<String, Entry>,
@@ -64,6 +65,12 @@ impl Boost {
     }
     pub fn due(&self, now: Instant) -> bool {
         now >= self.next_sample
+    }
+    pub fn settings_changed(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.settings_cancelled = true;
+            pending.guard.cancel.store(true, Ordering::Release);
+        }
     }
     pub fn observe_generation(&mut self, generation: u64) {
         self.entries.retain(|_, entry| {
@@ -284,6 +291,7 @@ impl Boost {
         };
         self.pending = Some(Pending {
             request: request.clone(),
+            settings_cancelled: false,
             guard: Guard {
                 fullscreen,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -303,11 +311,12 @@ impl Boost {
         let Some(entry) = self.entries.get_mut(key) else {
             return false;
         };
-        if entry.target.generation != p.request.target.generation
+        if (entry.target.generation != p.request.target.generation || p.settings_cancelled)
             && entry.target.connection_stamp.is_some()
+            && p.request.target.connection_stamp.is_some()
             && !outcome.may_have_changed
         {
-            // Refresh cancelled before any SET: retain the verified original,
+            // Refresh/settings cancelled before SET: retain the verified original,
             // then let the next transaction revalidate this connection.
             return true;
         }
@@ -595,6 +604,65 @@ mod tests {
         );
         complete(&mut b, &restore, 1000);
         assert!(!b.owns(&readings[0].key));
+    }
+    #[test]
+    fn settings_cancellation_without_connection_proof_cannot_resume_restore() {
+        let now = Instant::now();
+        let (settings, readings) = fixture();
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        let apply = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &apply, 2000);
+        boost
+            .entries
+            .get_mut(&readings[0].key)
+            .unwrap()
+            .target
+            .connection_stamp = None;
+        settle(&mut boost, now + Duration::from_secs(30), false);
+        let restore = boost.next(&settings, 1, &readings).unwrap();
+        let guard = boost.guard(restore.request).unwrap();
+        boost.settings_changed();
+        assert!(guard.cancel.load(Ordering::Acquire));
+        boost.complete(&ControlOutcome::failed(
+            &restore,
+            "Settings revoked permission",
+        ));
+        assert!(boost.next(&settings, 1, &readings).is_none());
+    }
+    #[test]
+    fn unrelated_settings_preserve_verified_restore_only_before_any_write() {
+        for may_have_changed in [false, true] {
+            let now = Instant::now();
+            let (mut settings, readings) = fixture();
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost.next(&settings, 1, &readings).unwrap();
+            complete(&mut boost, &read, 1000);
+            let apply = boost.next(&settings, 1, &readings).unwrap();
+            complete(&mut boost, &apply, 2000);
+            settle(&mut boost, now + Duration::from_secs(30), false);
+            let restore = boost.next(&settings, 1, &readings).unwrap();
+            settings.animation = !settings.animation;
+            boost.settings_changed();
+            let mut cancelled =
+                ControlOutcome::failed(&restore, "Settings revoked the old permission epoch");
+            cancelled.may_have_changed = may_have_changed;
+            boost.complete(&cancelled);
+            let retry = boost.next(&settings, 1, &readings);
+            assert_eq!(retry.is_some(), !may_have_changed);
+            if let Some(retry) = retry {
+                assert_eq!(
+                    retry.target.connection_stamp,
+                    restore.target.connection_stamp
+                );
+                assert_eq!(retry.action, restore.action);
+                boost.complete(&ControlOutcome::failed(&retry, "Connection stamp changed"));
+                assert!(boost.next(&settings, 1, &readings).is_none());
+            }
+        }
     }
     #[test]
     fn refresh_before_set_preserves_ownership_but_uncertain_write_does_not() {

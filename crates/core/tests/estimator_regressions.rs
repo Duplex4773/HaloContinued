@@ -78,6 +78,9 @@ fn uncertain_readings_do_not_extend_discharge_evidence() {
     for uncertainty in [
         "charging",
         "inferred",
+        "inferred_charge",
+        "sleeping_charge",
+        "stale_charge",
         "precision",
         "old_timestamp",
         "negative_timestamp",
@@ -90,6 +93,18 @@ fn uncertain_readings_do_not_extend_discharge_evidence() {
         match uncertainty {
             "charging" => uncertain.charging = None,
             "inferred" => uncertain.charging_inferred = true,
+            "inferred_charge" => {
+                uncertain.charging = Some(true);
+                uncertain.charging_inferred = true;
+            }
+            "sleeping_charge" => {
+                uncertain.charging = Some(true);
+                uncertain.connection = Connection::Sleeping;
+            }
+            "stale_charge" => {
+                uncertain.charging = Some(true);
+                uncertain.connection = Connection::Stale;
+            }
             "precision" => uncertain.precision = Precision::Estimated,
             "old_timestamp" => uncertain.timestamp = 99,
             "negative_timestamp" => uncertain.timestamp = -1,
@@ -176,4 +191,32 @@ fn impossible_saved_drops_and_negative_times_are_recovered_independently() {
     negative.timestamp = -1;
     empty.record(&negative, 0.0);
     assert!(empty.devices.is_empty());
+}
+
+#[test]
+fn detected_wall_clock_rollback_preserves_learning_and_resumes_fresh_samples() {
+    let mut estimator = learned();
+    let before = estimator.seconds_left("device", Some(85));
+    estimator.clock_changed(50);
+    let mut fresh = reading(85);
+    fresh.timestamp = 50;
+    estimator.record(&fresh, 10_860.0);
+    assert_eq!(estimator.devices["device"].usage, 10_800.0);
+    assert_eq!(estimator.seconds_left("device", Some(85)), before);
+    fresh.timestamp = 51;
+    estimator.record(&fresh, 10_920.0);
+    assert_eq!(estimator.devices["device"].usage, 10_860.0);
+    assert_eq!(estimator.devices["device"].seen, 51);
+    estimator.validate(51);
+    assert!(estimator.devices.contains_key("device"));
+}
+
+#[test]
+fn only_confirmed_online_charging_resets_a_learned_discharge() {
+    let mut estimator = learned();
+    let mut charging = reading(90);
+    charging.charging = Some(true);
+    estimator.record(&charging, 10_860.0);
+    assert_eq!(estimator.devices["device"].usage, 0.0);
+    assert!(estimator.devices["device"].samples.is_empty());
 }

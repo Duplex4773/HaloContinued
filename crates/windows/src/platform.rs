@@ -15,7 +15,10 @@ use windows::{
     System::Power::BatteryStatus,
     Win32::{
         Devices::{DeviceAndDriverInstallation::*, Properties::*},
-        Foundation::{DEVPROPKEY, ERROR_NO_MORE_ITEMS, GetLastError},
+        Foundation::{
+            DEVPROPKEY, ERROR_DEVICE_NOT_CONNECTED, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS,
+            GetLastError,
+        },
         UI::Input::XboxController::*,
     },
     core::{GUID, PCWSTR},
@@ -70,6 +73,24 @@ fn battery_percent(bytes: Vec<u8>) -> Option<u8> {
     };
     (value <= 100).then_some(value as u8)
 }
+fn bluetooth_instance_id(wide: &[u16]) -> Option<String> {
+    // Most PnP nodes are unrelated to Bluetooth. Reject them directly in the
+    // native buffer, before decoding or allocating a normalized identifier.
+    if !wide.get(..3).is_some_and(|prefix| {
+        prefix.iter().zip(b"BTH").all(|(&unit, &expected)| {
+            unit == u16::from(expected) || unit == u16::from(expected.to_ascii_lowercase())
+        })
+    }) {
+        return None;
+    }
+    let length = wide
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(wide.len());
+    let mut id = String::from_utf16_lossy(&wide[..length]);
+    id.make_ascii_uppercase();
+    Some(id)
+}
 fn mac_of(id: &str) -> Option<String> {
     let id = id.to_ascii_uppercase();
     if let Some(at) = id.find("DEV_") {
@@ -122,6 +143,14 @@ struct Node {
 enum Link {
     Classic(BluetoothDevice, Option<i64>),
     Le(BluetoothLEDevice, Option<i64>),
+}
+fn bluetooth_connection(
+    native: Option<bool>,
+    fallback: Option<bool>,
+) -> Result<bool, ProviderError> {
+    native.or(fallback).ok_or_else(|| {
+        ProviderError::new("Windows could not determine the Bluetooth connection state")
+    })
 }
 impl Link {
     fn connected(&self) -> windows::core::Result<bool> {
@@ -292,13 +321,9 @@ impl BluetoothProvider {
             if unsafe { SetupDiGetDeviceInstanceIdW(set.0, &info, Some(&mut id), None) }.is_err() {
                 continue;
             }
-            let id = String::from_utf16_lossy(
-                &id[..id.iter().position(|x| *x == 0).unwrap_or(id.len())],
-            )
-            .to_ascii_uppercase();
-            if !id.starts_with("BTH") {
+            let Some(id) = bluetooth_instance_id(&id) else {
                 continue;
-            }
+            };
             let Some(mac) = mac_of(&id) else { continue };
             let node = nodes.entry(mac).or_default();
             node.le |= id.starts_with("BTHLE");
@@ -331,28 +356,29 @@ impl BluetoothProvider {
         let mut out = Vec::new();
         self.diagnostics.clear();
         for (mac, node) in nodes {
-            if self.links.get(&mac).is_some_and(|d| d.connected().is_err()) {
+            // Reuse a successful status query within this snapshot. A failed
+            // query can require a new WinRT object, not a false disconnection.
+            let native = self.links.get(&mac).and_then(|d| d.connected().ok());
+            let native = native.or_else(|| {
                 self.links.remove(&mac);
-            }
+                if let Err(e) = self.connect(&mac, node.le, c) {
+                    self.diagnostics
+                        .push(format!("{mac}: {e}; using PnP connection fallback"));
+                }
+                self.links.get(&mac).and_then(|d| d.connected().ok())
+            });
             if let Some(level) = node.level {
                 self.levels.insert(mac.clone(), level);
-            }
-            if let Err(e) = self.connect(&mac, node.le, c) {
-                self.diagnostics
-                    .push(format!("{mac}: {e}; using PnP connection fallback"));
-            }
-            let connected = self
-                .links
-                .get(&mac)
-                .and_then(|d| d.connected().ok())
-                .or(node.fallback)
-                .unwrap_or(false);
-            if !connected {
-                continue;
             }
             let Some(level) = self.levels.get(&mac).copied() else {
                 continue;
             };
+            // Non-battery nodes need no connection evidence. For a battery
+            // device, unknown state is a failed snapshot and retains its last
+            // reading through the existing bounded recovery path.
+            if !bluetooth_connection(native, node.fallback)? {
+                continue;
+            }
             let name = if !node.root_name.is_empty() {
                 node.root_name
             } else if !node.name.is_empty() {
@@ -441,6 +467,24 @@ impl BatteryProvider for BluetoothProvider {
     }
 }
 pub struct ControllerProvider;
+fn controller_query<T>(
+    result: windows::core::Result<T>,
+    operation: &str,
+) -> Result<T, ProviderError> {
+    result.map_err(|error| {
+        ProviderError::new(format!("Windows controller {operation} failed: {error}"))
+    })
+}
+fn xinput_connected(code: u32, slot: u32) -> Result<bool, ProviderError> {
+    match code {
+        value if value == ERROR_SUCCESS.0 => Ok(true),
+        value if value == ERROR_DEVICE_NOT_CONNECTED.0 => Ok(false),
+        value => Err(ProviderError::new(format!(
+            "XInput controller {} state query failed: {value}",
+            slot + 1
+        ))),
+    }
+}
 fn xbox_bluetooth(vid: u16, pid: u16) -> bool {
     vid == 0x045e
         && matches!(
@@ -514,61 +558,67 @@ impl BatteryProvider for ControllerProvider {
         vec![]
     }
     fn poll(&mut self, _: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
+        if !c.active() {
+            return Err(ProviderError::new("Controller snapshot deadline exceeded"));
+        }
         let mut out = Vec::new();
-        if let Ok(controllers) = RawGameController::RawGameControllers() {
-            for raw in controllers {
-                if !c.active() {
-                    return Err(ProviderError::new("Controller snapshot deadline exceeded"));
-                }
-                if Gamepad::FromGameController(&raw).is_err() {
-                    continue;
-                }
-                let Ok(id) = raw.NonRoamableId() else {
-                    continue;
-                };
-                if id.is_empty() {
-                    continue;
-                }
-                let mut r = Reading::new(
-                    format!("wgi:{id}"),
-                    raw.DisplayName()
-                        .map(|x| x.to_string())
-                        .unwrap_or("Controller".into()),
-                    "xinput",
-                    c.clock.unix(),
-                );
-                r.kind = "gamepad".into();
-                let bt = xbox_bluetooth(
-                    raw.HardwareVendorId().unwrap_or(0),
-                    raw.HardwareProductId().unwrap_or(0),
-                );
-                r.via = if bt { "bluetooth" } else { "wireless" }.into();
-                if let Ok(report) = raw.TryGetBatteryReport() {
-                    r.level = wgi_percentage(
-                        raw.HardwareVendorId().unwrap_or(0),
-                        raw.HardwareProductId().unwrap_or(0),
-                        report
-                            .RemainingCapacityInMilliwattHours()
-                            .and_then(|v| v.Value())
-                            .ok(),
-                        report
-                            .FullChargeCapacityInMilliwattHours()
-                            .and_then(|v| v.Value())
-                            .ok(),
-                    );
-                    r.charging = wgi_charging(report.Status().ok());
-                }
-                if bt {
-                    r.approx = Some("Battery available through Windows Bluetooth devices".into())
-                }
-                out.push(r);
+        let controllers = controller_query(RawGameController::RawGameControllers(), "discovery")?;
+        // The projected iterator hides enumeration errors as end-of-list.
+        // Check size/entries so partial discovery cannot imply disconnection.
+        let count = controller_query(controllers.Size(), "inventory size")?;
+        for index in 0..count {
+            if !c.active() {
+                return Err(ProviderError::new("Controller snapshot deadline exceeded"));
             }
+            let raw = controller_query(controllers.GetAt(index), "inventory entry")?;
+            if Gamepad::FromGameController(&raw).is_err() {
+                continue;
+            }
+            let id = controller_query(raw.NonRoamableId(), "device identity")?;
+            if id.is_empty() {
+                continue;
+            }
+            let mut r = Reading::new(
+                format!("wgi:{id}"),
+                raw.DisplayName()
+                    .map(|x| x.to_string())
+                    .unwrap_or("Controller".into()),
+                "xinput",
+                c.clock.unix(),
+            );
+            r.kind = "gamepad".into();
+            let vendor = raw.HardwareVendorId().unwrap_or(0);
+            let product = raw.HardwareProductId().unwrap_or(0);
+            let bt = xbox_bluetooth(vendor, product);
+            r.via = if bt { "bluetooth" } else { "wireless" }.into();
+            if let Ok(report) = raw.TryGetBatteryReport() {
+                r.level = wgi_percentage(
+                    vendor,
+                    product,
+                    report
+                        .RemainingCapacityInMilliwattHours()
+                        .and_then(|v| v.Value())
+                        .ok(),
+                    report
+                        .FullChargeCapacityInMilliwattHours()
+                        .and_then(|v| v.Value())
+                        .ok(),
+                );
+                r.charging = wgi_charging(report.Status().ok());
+            }
+            if bt {
+                r.approx = Some("Battery available through Windows Bluetooth devices".into())
+            }
+            out.push(r);
         }
         // Windows exposes no dependable WGI-to-XInput slot identity. Keep every slot;
         // a WGI report from one pad must never hide another pad's XInput report.
         for slot in 0..4 {
+            if !c.active() {
+                return Err(ProviderError::new("Controller snapshot deadline exceeded"));
+            }
             let mut state = XINPUT_STATE::default();
-            if unsafe { XInputGetState(slot, &mut state) } != 0 {
+            if !xinput_connected(unsafe { XInputGetState(slot, &mut state) }, slot)? {
                 continue;
             }
             let mut battery = XINPUT_BATTERY_INFORMATION::default();
@@ -585,6 +635,107 @@ impl BatteryProvider for ControllerProvider {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bluetooth_inventory_filters_native_ids_before_allocating_strings() {
+        fn previous(wide: &[u16]) -> Option<String> {
+            let length = wide
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(wide.len());
+            let id = String::from_utf16_lossy(&wide[..length]).to_ascii_uppercase();
+            id.starts_with("BTH").then_some(id)
+        }
+        for id in [
+            "",
+            "BT",
+            "USB\\VID_1532&PID_00BF",
+            "HID\\SYNTHETIC",
+            "bthle\\DEV_aabbccddeeff",
+            "BtHeNuM\\SYNTHETIC",
+            "BTH\0ignored",
+            "雪BTH",
+            "BTH雪",
+        ] {
+            let mut wide: Vec<_> = id.encode_utf16().collect();
+            for suffix in [vec![], vec![0], vec![0xd800], vec![0xdc00], vec![0, 0xd800]] {
+                let mut variant = wide.clone();
+                variant.extend(suffix);
+                assert_eq!(bluetooth_instance_id(&variant), previous(&variant));
+            }
+            wide.push(0);
+            wide.resize(1024, 0);
+            assert_eq!(bluetooth_instance_id(&wide), previous(&wide));
+        }
+        let unrelated: Vec<_> = "USB\\VID_1532&PID_00BF\\SYNTHETIC\0"
+            .encode_utf16()
+            .collect();
+        let (_, before) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(previous(&unrelated).is_none());
+            }
+        });
+        let (_, after) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(bluetooth_instance_id(&unrelated).is_none());
+            }
+        });
+        assert!(before.calls >= 2000, "{before:?}");
+        assert_eq!(after.calls, 0);
+        assert_eq!(after.bytes, 0);
+        println!("1,000 unrelated PnP IDs: before={before:?}; after={after:?}");
+    }
+    #[test]
+    fn unknown_bluetooth_connection_is_not_confirmed_disconnection() {
+        for native in [None, Some(false), Some(true)] {
+            for fallback in [None, Some(false), Some(true)] {
+                match native.or(fallback) {
+                    Some(expected) => {
+                        assert_eq!(bluetooth_connection(native, fallback).unwrap(), expected)
+                    }
+                    None => assert!(bluetooth_connection(native, fallback).is_err()),
+                }
+            }
+        }
+        let mut reading = Reading::new("bluetooth:SYNTHETIC", "Mouse", "bluetooth", 100);
+        reading.level = Some(75);
+        let mut provider = BluetoothProvider::default();
+        provider.complete_snapshot(Ok(vec![reading.clone()]), Duration::ZERO);
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        engine.apply("bluetooth", Ok(vec![reading]), 0.0, false);
+        let result = bluetooth_connection(None, None).map(|connected| {
+            assert!(!connected);
+            vec![]
+        });
+        provider.complete_snapshot(result.clone(), Duration::from_secs(1));
+        assert!(provider.snapshot_error.is_some());
+        assert_eq!(provider.readings.len(), 1);
+        engine.apply("bluetooth", result, 1.0, false);
+        assert_eq!(engine.readings()[0].connection, Connection::Stale);
+    }
+    #[test]
+    fn controller_query_failures_preserve_known_devices_until_a_confirmed_empty_inventory() {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let reading = xinput_reading(0, None, 100);
+        let key = reading.key.clone();
+        engine.apply("xinput", Ok(vec![reading]), 0.0, false);
+        let error =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32));
+        let result: PollResult = controller_query(Err(error), "discovery");
+        assert!(result.is_err());
+        engine.apply("xinput", result, 60.0, false);
+        assert_eq!(engine.readings()[0].key, key);
+        assert_eq!(engine.readings()[0].connection, Connection::Stale);
+        assert!(engine.provider_error("xinput").is_some());
+        for code in [1, 5, 6, 8, 259] {
+            assert!(xinput_connected(code, 0).is_err());
+        }
+        assert!(xinput_connected(ERROR_SUCCESS.0, 0).unwrap());
+        assert!(!xinput_connected(ERROR_DEVICE_NOT_CONNECTED.0, 0).unwrap());
+        let empty: PollResult = controller_query(Ok(Vec::new()), "discovery");
+        engine.apply("xinput", empty, 120.0, false);
+        assert!(engine.readings().is_empty());
+        assert!(engine.provider_error("xinput").is_none());
+    }
     #[test]
     fn bluetooth_level_cache_tracks_inventory_and_retains_sleeping_paired_devices() {
         let mut provider = BluetoothProvider::default();
@@ -676,6 +827,20 @@ mod scheduling_tests {
         fn open(&self, _: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
             panic!("Bluetooth must not open HID")
         }
+    }
+    #[test]
+    fn cancelled_controller_discovery_stops_before_native_queries() {
+        let clock = FakeClock(Duration::from_secs(1));
+        let cancelled = AtomicBool::new(true);
+        let context = PollContext {
+            clock: &clock,
+            cancelled: &cancelled,
+            deadline: Duration::from_secs(10),
+            playstation_full_mode: false,
+        };
+        let mut provider = ControllerProvider;
+        let error = provider.poll(&NoHid, &context).unwrap_err();
+        assert_eq!(error.message, "Controller snapshot deadline exceeded");
     }
     #[test]
     fn arrival_retries_and_minute_refresh() {

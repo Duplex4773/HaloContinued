@@ -1817,17 +1817,55 @@ pub(crate) fn trusted_identity(info: &HidInfo) -> String {
     valid_identity_value(&info.serial).unwrap_or_else(|| receiver_key(info))
 }
 fn valid_identity_value(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_uppercase();
-    if normalized.is_empty()
-        || matches!(normalized.as_str(), "UNKNOWN" | "NONE" | "N/A" | "NULL")
-        || normalized
+    usable_identity_value(value).then(|| value.trim().to_ascii_uppercase())
+}
+fn usable_identity_value(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !["UNKNOWN", "NONE", "N/A", "NULL"]
+            .iter()
+            .any(|placeholder| value.eq_ignore_ascii_case(placeholder))
+        && value
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
-            .all(|c| c == '0')
-    {
-        None
-    } else {
-        Some(normalized)
+            .any(|c| c != '0')
+}
+/// Remove only a proven sleeping transport alias. Inspect the existing vector
+/// instead of cloning every live reading at each Razer battery refresh.
+fn remove_cached_razer_aliases(output: &mut Vec<Reading>) {
+    // With no mix of live/cached transports there is nothing to deduplicate.
+    // Keep the common one-device and all-sleeping paths linear.
+    if output.iter().all(Reading::online) || !output.iter().any(Reading::online) {
+        return;
+    }
+    let mut index = 0;
+    while index < output.len() {
+        let cached = &output[index];
+        let duplicate = !cached.online()
+            && output.iter().any(|online| {
+                online.online()
+                    && online.name == cached.name
+                    && online.key.split(':').nth(1) != cached.key.split(':').nth(1)
+                    && (online
+                        .serial
+                        .as_ref()
+                        .zip(cached.serial.as_ref())
+                        .is_some_and(|(a, b)| {
+                            a.eq_ignore_ascii_case(b) && usable_identity_value(a)
+                        })
+                        || online
+                            .container
+                            .as_ref()
+                            .zip(cached.container.as_ref())
+                            .is_some_and(|(a, b)| {
+                                a.eq_ignore_ascii_case(b) && usable_identity_value(a)
+                            }))
+            });
+        if duplicate {
+            output.remove(index);
+        } else {
+            index += 1;
+        }
     }
 }
 fn candidate(id: &str, d: &Device, i: &HidInfo) -> bool {
@@ -2571,29 +2609,7 @@ impl BatteryProvider for HidProvider {
                     }
                 }
             }
-            let live: Vec<_> = output.iter().filter(|r| r.online()).cloned().collect();
-            output.retain(|r| {
-                r.online()
-                    || !live.iter().any(|online| {
-                        let shared_serial = online
-                            .serial
-                            .as_ref()
-                            .zip(r.serial.as_ref())
-                            .is_some_and(|(a, b)| {
-                                a.eq_ignore_ascii_case(b) && valid_identity_value(a).is_some()
-                            });
-                        let shared_container = online
-                            .container
-                            .as_ref()
-                            .zip(r.container.as_ref())
-                            .is_some_and(|(a, b)| {
-                                a.eq_ignore_ascii_case(b) && valid_identity_value(a).is_some()
-                            });
-                        online.name == r.name
-                            && online.key.split(':').nth(1) != r.key.split(':').nth(1)
-                            && (shared_serial || shared_container)
-                    })
-            });
+            remove_cached_razer_aliases(&mut output);
         }
         if self.id == "mchose" {
             for key in self.last.keys() {
@@ -2660,6 +2676,93 @@ mod allocation_tests {
         COUNT.with(|c| c.set(Some(0)));
         f();
         COUNT.with(|c| c.replace(None).unwrap())
+    }
+    #[test]
+    fn razer_alias_filter_preserves_identity_rules_without_allocating() {
+        fn reading(pid: &str, serial: Option<&str>, container: Option<&str>) -> Reading {
+            let mut reading = Reading::new(
+                format!("razer:{pid}:SYNTHETIC"),
+                "Razer test mouse",
+                "razer",
+                100,
+            );
+            reading.kind = "mouse".into();
+            reading.serial = serial.map(str::to_owned);
+            reading.container = container.map(str::to_owned);
+            reading
+        }
+        fn previous_filter(output: &mut Vec<Reading>) {
+            let live: Vec<_> = output.iter().filter(|r| r.online()).cloned().collect();
+            output.retain(|cached| {
+                cached.online()
+                    || !live.iter().any(|online| {
+                        let same = |a: &Option<String>, b: &Option<String>| {
+                            a.as_ref().zip(b.as_ref()).is_some_and(|(a, b)| {
+                                a.eq_ignore_ascii_case(b) && valid_identity_value(a).is_some()
+                            })
+                        };
+                        online.name == cached.name
+                            && online.key.split(':').nth(1) != cached.key.split(':').nth(1)
+                            && (same(&online.serial, &cached.serial)
+                                || same(&online.container, &cached.container))
+                    })
+            });
+        }
+        for serial in [None, Some("SYNTHETIC-001"), Some("None"), Some("000-000")] {
+            for container in [None, Some("{SYNTHETIC-CONTAINER}"), Some("UNKNOWN")] {
+                for (same_pid, same_name, online_first) in [
+                    (false, true, true),
+                    (false, true, false),
+                    (true, true, true),
+                    (false, false, true),
+                ] {
+                    let live = reading("00bf", serial, container);
+                    let mut cached =
+                        reading(if same_pid { "00bf" } else { "00c4" }, serial, container);
+                    cached.connection = Connection::Sleeping;
+                    if !same_name {
+                        cached.name = "Separate test mouse".into();
+                    }
+                    let mut actual = if online_first {
+                        vec![live, cached]
+                    } else {
+                        vec![cached, live]
+                    };
+                    let mut expected = actual.clone();
+                    previous_filter(&mut expected);
+                    assert_eq!(allocations(|| remove_cached_razer_aliases(&mut actual)), 0);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        let mut live = vec![reading("00bf", Some("SYNTHETIC-001"), None)];
+        let before = allocations(|| {
+            for _ in 0..1000 {
+                previous_filter(&mut live);
+            }
+        });
+        let after = allocations(|| {
+            for _ in 0..1000 {
+                remove_cached_razer_aliases(&mut live);
+            }
+        });
+        assert!(before >= 5000, "previous filter: {before}");
+        assert_eq!(after, 0);
+        println!("1,000 Razer alias passes: allocations before={before}, after={after}");
+        let mut sleeping: Vec<_> = (0..32)
+            .map(|index| {
+                let mut device = reading("00bf", Some("SYNTHETIC-001"), None);
+                device.key = format!("razer:00bf:SYNTHETIC-{index}");
+                device.connection = Connection::Sleeping;
+                device
+            })
+            .collect();
+        let expected = sleeping.clone();
+        assert_eq!(
+            allocations(|| remove_cached_razer_aliases(&mut sleeping)),
+            0
+        );
+        assert_eq!(sleeping, expected);
     }
     #[test]
     fn bounded_reply_diagnostics_keep_exact_hex_with_one_allocation_then_none_at_cap() {

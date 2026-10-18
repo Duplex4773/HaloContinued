@@ -589,3 +589,39 @@ fn recent_window_clips_intervals_without_changing_long_term_learning() {
     assert_eq!(data.recent.current_level, None);
     assert_eq!(data.recent.boost_sessions, 0);
 }
+
+#[test]
+fn same_rate_manual_choice_ends_boost_ownership_without_inflating_change_counts() {
+    use hb_core::{PollingActivity, PollingActivityKind};
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+    let rate = PollingRate::try_from(2000).unwrap();
+    for timestamp in [0, 60, 120, 180, 240] {
+        store
+            .record_usage(&observation(timestamp, 90, Some(2000), Some(1)))
+            .unwrap();
+    }
+    let event = PollingActivity {
+        key: "synthetic-a".into(),
+        timestamp: 0,
+        session: 1,
+        kind: PollingActivityKind::Boost,
+        rate,
+        previous: PollingRate::try_from(1000).ok(),
+    };
+    store.record_polling_activity(&event).unwrap();
+    store
+        .record_polling_activity(&PollingActivity {
+            timestamp: 120,
+            kind: PollingActivityKind::Manual,
+            previous: Some(rate),
+            ..event.clone()
+        })
+        .unwrap();
+    store.flush().unwrap();
+    let data = store.query_insights("synthetic-a", 240).unwrap();
+    assert_eq!(data.recent.boost_sessions, 1);
+    assert_eq!(data.recent.manual_changes, 0);
+    assert_eq!(data.recent.boost_seconds, 60);
+    assert_eq!(data.recent.total_seconds, 240);
+}

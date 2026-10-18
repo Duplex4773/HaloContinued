@@ -252,11 +252,17 @@ impl Settings {
         }
     }
     pub fn link_device(&mut self, device: &crate::ConfigurationDevice) {
-        self.link_preference(device.shared_preference_key());
+        self.link_preference(crate::controls::preference_unit(
+            &device.key,
+            &device.kind,
+            &device.source,
+            &device.via,
+            device.serial.as_deref(),
+        ));
     }
     /// Battery observations need no owned configuration descriptor to link preferences.
     pub fn link_reading(&mut self, reading: &crate::Reading) {
-        self.link_preference(crate::controls::shared_preference_key(
+        self.link_preference(crate::controls::preference_unit(
             &reading.key,
             &reading.kind,
             &reading.source,
@@ -264,25 +270,33 @@ impl Settings {
             reading.serial.as_deref(),
         ));
     }
-    fn link_preference(&mut self, canonical: Option<String>) {
-        let Some(canonical) = canonical else {
+    fn link_preference(&mut self, unit: Option<crate::controls::PreferenceUnit<'_>>) {
+        let Some(unit) = unit else {
             return;
         };
-        let wired_pid = match canonical.split(':').nth(1) {
-            Some("00bf") => "00be",
-            Some("00b7") => "00b6",
-            Some("00c1") => "00c0",
-            _ => return,
-        };
-        let serial = canonical.splitn(3, ':').nth(2).unwrap();
-        let wired = format!("razer:{wired_pid}:{serial}");
-        if self.device_links.len() >= 512 && !self.device_links.contains_key(&wired) {
+        // The validated serial is ASCII and at most 128 bytes. A stack key
+        // avoids persistent caches and repeated heap work for either transport.
+        let mut key = [0u8; 139];
+        key[..6].copy_from_slice(b"razer:");
+        key[6..10].copy_from_slice(unit.wired_pid.as_bytes());
+        key[10] = b':';
+        key[11..11 + unit.serial.len()].copy_from_slice(unit.serial.as_bytes());
+        let wired = std::str::from_utf8(&key[..11 + unit.serial.len()]).expect("ASCII unit key");
+        let linked = self.device_links.contains_key(wired);
+        if self.device_links.len() >= 512 && !linked {
             return;
         }
-        if let Some(old) = self.devices.remove(&wired) {
+        let old = self.devices.remove(wired);
+        if linked && old.is_none() {
+            return;
+        }
+        let canonical = format!("razer:{}:{}", unit.wireless_pid, unit.serial);
+        if let Some(old) = old {
             self.devices.entry(canonical.clone()).or_insert(old);
         }
-        self.device_links.entry(wired).or_insert(canonical);
+        if !linked {
+            self.device_links.insert(wired.into(), canonical);
+        }
     }
     pub fn enabled(&self, provider: &str) -> bool {
         !self.disabled_providers.contains(provider) && (provider != "bluetooth" || self.bluetooth)

@@ -1,7 +1,7 @@
 #requires -Version 7.0
 param(
   [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$')]
-  [string]$Version = '1.0.4',
+  [string]$Version = '1.0.5',
   [string]$Executable,
   [string]$Iscc
 )
@@ -36,11 +36,13 @@ try {
   if ((Get-AuthenticodeSignature -LiteralPath $setup).Status -ne 'NotSigned') {
     throw 'Expected an unsigned installer.'
   }
-  $checksums = foreach ($artifact in @($setup, $zip)) {
+  $standalone = Join-Path $dist "HaloContinued-$Version-windows-x64.exe"
+  Copy-Item -LiteralPath (Join-Path $stage 'HaloContinued.exe') -Destination $standalone -Force
+  $checksums = foreach ($artifact in @($setup, $zip, $standalone)) {
     '{0}  {1}' -f (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash, [IO.Path]::GetFileName($artifact)
   }
   $checksums | Set-Content -LiteralPath (Join-Path $dist "HaloContinued-$Version-SHA256SUMS.txt") -Encoding ascii
-  Get-Item -LiteralPath $setup, $zip | Select-Object FullName,Length
+  Get-Item -LiteralPath $setup, $zip, $standalone | Select-Object FullName,Length
 } finally {
   $resolved = [IO.Path]::GetFullPath($stage)
   if (!$resolved.StartsWith($dist + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or

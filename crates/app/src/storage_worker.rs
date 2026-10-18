@@ -131,6 +131,19 @@ fn recover_and_flush(
     save_latest(estimator, |state| db.save_estimator(state))?;
     db.flush()
 }
+/// An explicit history request is also a recovery opportunity. Drain the
+/// worker's bounded backlog before answering, just as the scheduled retry does.
+fn query_database<'a>(
+    database: &'a mut Result<Store, ProviderError>,
+    path: &std::path::Path,
+    pending_usage: &mut Vec<UsageObservation>,
+    estimator: &mut Option<Estimator>,
+    pending_activities: &mut VecDeque<PollingActivity>,
+) -> Result<&'a Store, ProviderError> {
+    recover_and_flush(database, path, pending_usage, estimator)?;
+    flush_activities(database, pending_activities)?;
+    database.as_ref().map_err(Clone::clone)
+}
 pub(super) fn run(
     folder: PathBuf,
     messages: Receiver<Storage>,
@@ -175,13 +188,14 @@ pub(super) fn run(
                 }
             }
             Ok(Storage::Insights(key, until, id)) => {
-                let result =
-                    flush_activities(&mut database, &mut pending_activities).and_then(|_| {
-                        match &mut database {
-                            Ok(db) => db.flush().and_then(|_| db.query_insights(&key, until)),
-                            Err(e) => Err(e.clone()),
-                        }
-                    });
+                let result = query_database(
+                    &mut database,
+                    &folder.join("history.db"),
+                    &mut pending_usage,
+                    &mut estimator,
+                    &mut pending_activities,
+                )
+                .and_then(|db| db.query_insights(&key, until));
                 let _ = events.send(Event::Insights(id, result.map(Box::new)));
                 Ok(())
             }
@@ -210,23 +224,27 @@ pub(super) fn run(
                 }
             }
             Ok(Storage::History(key, since, until, width, id)) => {
-                let result = match &mut database {
-                    Ok(db) => db
-                        .flush()
-                        .and_then(|_| db.query_with_baseline(&key, since, until, width))
-                        .map(|readings| HistorySeries::calendar(readings, since, until)),
-                    Err(e) => Err(e.clone()),
-                };
+                let result = query_database(
+                    &mut database,
+                    &folder.join("history.db"),
+                    &mut pending_usage,
+                    &mut estimator,
+                    &mut pending_activities,
+                )
+                .and_then(|db| db.query_with_baseline(&key, since, until, width))
+                .map(|readings| HistorySeries::calendar(readings, since, until));
                 let _ = events.send(Event::History(id, result));
                 Ok(())
             }
             Ok(Storage::UsageHistory(key, seconds, until, width, id)) => {
-                let result = match &mut database {
-                    Ok(db) => db
-                        .flush()
-                        .and_then(|_| db.query_usage(&key, until, seconds, width)),
-                    Err(e) => Err(e.clone()),
-                };
+                let result = query_database(
+                    &mut database,
+                    &folder.join("history.db"),
+                    &mut pending_usage,
+                    &mut estimator,
+                    &mut pending_activities,
+                )
+                .and_then(|db| db.query_usage(&key, until, seconds, width));
                 let _ = events.send(Event::History(id, result));
                 Ok(())
             }

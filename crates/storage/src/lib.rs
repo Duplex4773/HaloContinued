@@ -554,6 +554,12 @@ impl Store {
                 if previous.is_some_and(|hz| PollingRate::try_from(hz).is_err()) {
                     continue;
                 }
+                // Same-rate confirmations can transfer ownership from an
+                // automatic boost to a manual choice. Keep those events for
+                // interval classification, but do not count a hardware change.
+                if previous == Some(rate) {
+                    continue;
+                }
                 match kind {
                     "boost" => {
                         result.recent.boost_sessions += 1;
@@ -606,7 +612,11 @@ impl Store {
                 || reading.timestamp.saturating_sub(r.timestamp) >= 60
         });
         if changed {
-            self.last.insert(reading.key.clone(), observation.clone());
+            if let Some(previous) = self.last.get_mut(&reading.key) {
+                *previous = observation.clone();
+            } else {
+                self.last.insert(reading.key.clone(), observation.clone());
+            }
             self.pending.push(observation.clone());
         }
         if self.pending.len() >= 4096 {

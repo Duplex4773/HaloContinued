@@ -14,6 +14,41 @@ use rusqlite::{Connection, params};
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
 #[test]
+fn recurring_history_samples_reuse_existing_map_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+    let observations: Vec<_> = (0..=1000)
+        .map(|minute| UsageObservation {
+            reading: reading(minute * 60, 80),
+            polling_rate: PollingRate::try_from(1000).ok(),
+            session: Some(1),
+        })
+        .collect();
+    store.record_usage(&observations[0]).unwrap();
+    let (_, copies) = measure(|| {
+        for observation in &observations[1..] {
+            std::hint::black_box(observation.clone());
+            std::hint::black_box(observation.clone());
+        }
+    });
+    let (_, actual) = measure(|| {
+        for observation in &observations[1..] {
+            store.record_usage(observation).unwrap();
+        }
+    });
+    println!("1,000 history samples: required observation copies={copies:?}, actual={actual:?}");
+    // Allow bounded growth of the pending batch, but no repeated key allocation.
+    assert!(
+        actual.calls <= copies.calls + 16,
+        "copies={copies:?}; actual={actual:?}"
+    );
+    store.flush().unwrap();
+    let restored = store.query("invented", 0, 60_000, 2000).unwrap();
+    assert_eq!(restored.len(), 1001);
+    assert_eq!(restored.last(), Some(&observations[1000].reading));
+}
+
+#[test]
 fn sampled_usage_matches_previous_output_with_bounded_allocation_traffic() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("history.db");
