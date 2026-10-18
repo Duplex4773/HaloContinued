@@ -7,6 +7,27 @@ device controls, history and battery insights. The aim is no noticeable
 performance compromise during work or gaming. The app still consumes resources;
 usage varies with connected devices, settings and dashboard activity.
 
+**Added controls and insights, with low measured background resource use:**
+
+- **Extra device controls:** change polling rates, mouse sensitivity (DPI) and
+  hardware sleep timers on supported devices. Opt into fullscreen polling boosts
+  or low-battery power saving, and explore 30-day history and battery-life
+  estimates that account for changing polling rates in the native dashboard.
+- **Substantially lower measured RAM:** version 1.0.4 used **4.58–4.60 MiB mean
+  private memory**, compared with **33.99–34.31 MiB** for upstream HaloBattery
+  in the matched tests—approximately **86–87% less**.
+- **Very low measured CPU overhead:** version 1.0.4 recorded **0.009% of one
+  logical core with animation off** and **0.069% with charging animation on**.
+  Upstream recorded **0.122% and 0.148%**, respectively.
+
+**Test scope:** these are single three-minute **simulated source-harness samples**
+with one charging mouse, fresh data and the dashboard closed. Optional hardware
+controls were disabled, so the figures do not measure the cost of actively using
+those controls. They are not distributed-executable or live-hardware benchmarks,
+and do not measure game frame rates or input latency. Small CPU differences can
+reflect counter resolution or run-to-run variation; actual usage varies.
+[See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
+
 Current release: **1.0.4** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
@@ -127,7 +148,7 @@ protocols and community hardware reports. Halo Continued builds on that work
 with optional hardware settings and a dashboard for history and battery analysis.
 
 This comparison refers to the reviewed [HaloBattery 1.15.0 revision](https://github.com/HeyOkay/HaloBattery/tree/2251f0534a8e886c9692ead42056059b4f69d8c0)
-and Halo Continued 1.0.0:
+and Halo Continued 1.0.4:
 
 | Area | HaloBattery | Halo Continued |
 | --- | --- | --- |
