@@ -132,15 +132,18 @@ impl Engine {
     pub fn notification_failed(&mut self, notification: Notification) {
         // UI delivery can fail after this key was replaced or a new battery
         // episode began. Old failures must never overwrite a newer held alert.
-        if !self
-            .alerts
-            .get(&notification.key)
-            .is_some_and(|alert| alert.generation == notification.generation)
-        {
+        if !self.notification_current(&notification) {
             return;
         }
         self.held
             .insert((notification.key.clone(), notification.kind), notification);
+    }
+    /// Check before queuing a delayed retry as well as before delivery. An old
+    /// UI failure must not overwrite a current episode in an outer retry queue.
+    pub fn notification_current(&self, notification: &Notification) -> bool {
+        self.alerts
+            .get(&notification.key)
+            .is_some_and(|alert| alert.generation == notification.generation)
     }
     /// An unchanged empty provider cannot alter a published device/error view.
     pub fn provider_has_snapshot_data(&self, provider: &str) -> bool {

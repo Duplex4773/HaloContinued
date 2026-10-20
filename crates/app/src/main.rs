@@ -1,4 +1,11 @@
 #![windows_subsystem = "windows"]
+#[cfg(test)]
+#[path = "../../core/tests/support/allocation_counter.rs"]
+mod allocation_counter;
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: allocation_counter::TrackingAllocator =
+    allocation_counter::TrackingAllocator;
 mod battery_saver;
 mod boost;
 mod chart;

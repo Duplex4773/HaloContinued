@@ -158,6 +158,26 @@ impl Boost {
             }
         }
     }
+    /// A queued restore can wait for a sleeping device for hours. Check the
+    /// borrowed provider cache before resolving/cloning the combined inventory.
+    pub fn ready<'a>(&self, settings: &Settings, readings: impl Fn(&str) -> &'a [Reading]) -> bool {
+        self.needs_inventory(settings)
+            && (self.stable != Some(false)
+                || self.entries.values().any(|entry| {
+                    if !entry.active {
+                        return false;
+                    }
+                    let cached = readings(&entry.target.device.source);
+                    // Missing/replaced hardware still needs the normal inventory
+                    // pass to retire ownership. Skip only a known unavailable unit.
+                    !cached
+                        .iter()
+                        .any(|r| entry.target.device.matches_reading(r))
+                        || cached
+                            .iter()
+                            .any(|r| r.online() && entry.target.device.matches_reading(r))
+                }))
+    }
     pub fn owns(&self, key: &str) -> bool {
         self.entries.contains_key(key)
             || self
@@ -311,13 +331,18 @@ impl Boost {
         let Some(entry) = self.entries.get_mut(key) else {
             return false;
         };
-        if (entry.target.generation != p.request.target.generation || p.settings_cancelled)
+        let interrupted_restore =
+            entry.active && !p.guard.fullscreen && p.guard.cancel.load(Ordering::Acquire);
+        if (entry.target.generation != p.request.target.generation
+            || p.settings_cancelled
+            || interrupted_restore)
             && entry.target.connection_stamp.is_some()
             && p.request.target.connection_stamp.is_some()
             && !outcome.may_have_changed
         {
-            // Refresh/settings cancelled before SET: retain the verified original,
-            // then let the next transaction revalidate this connection.
+            // Refresh/settings or a fullscreen transition cancelled before SET.
+            // Retain the verified original; a later stable desktop must still
+            // revalidate the connection and expected rate before restoring it.
             return true;
         }
         let observation = outcome.observation.as_ref();
@@ -750,6 +775,48 @@ mod tests {
         );
     }
     #[test]
+    fn waiting_for_a_sleeping_restore_skips_inventory_allocations() {
+        let now = Instant::now();
+        let (settings, mut readings) = fixture();
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        let apply = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &apply, 2000);
+        settle(&mut boost, now + Duration::from_secs(30), false);
+        for connection in [Connection::Sleeping, Connection::Stale] {
+            readings[0].connection = connection;
+            let (_, before) = crate::allocation_counter::measure(|| {
+                for _ in 0..1000 {
+                    if boost.needs_inventory(&settings) {
+                        assert!(boost.next(&settings, 1, &readings.clone()).is_none());
+                    }
+                }
+            });
+            let (_, after) = crate::allocation_counter::measure(|| {
+                for _ in 0..1000 {
+                    assert!(!boost.ready(&settings, |_| &readings));
+                }
+            });
+            println!("1,000 unavailable restore checks: before={before:?}, after={after:?}");
+            assert!(before.calls > 0);
+            assert_eq!(after.calls, 0);
+            assert_eq!(after.bytes, 0);
+        }
+        assert!(boost.ready(&settings, |_| &[]));
+        readings[0].connection = Connection::Online;
+        assert!(boost.ready(&settings, |_| &readings));
+        readings[0].serial = Some("SYNTHETIC-REPLACEMENT".into());
+        assert!(boost.ready(&settings, |_| &readings));
+        readings[0].serial = None;
+        let restore = boost.next(&settings, 1, &readings).unwrap();
+        assert_eq!(restore.action.rate(), Some(rate(1000)));
+        assert!(!boost.ready(&settings, |_| &readings));
+        complete(&mut boost, &restore, 1000);
+        assert!(!boost.ready(&settings, |_| &readings));
+    }
+    #[test]
     fn sleeping_device_keeps_original_until_it_wakes() {
         let now = Instant::now();
         let (settings, mut readings) = fixture();
@@ -769,6 +836,55 @@ mod tests {
             b.next(&settings, 2, &readings).unwrap().action.rate(),
             Some(rate(1000))
         );
+    }
+    #[test]
+    fn interrupted_restore_keeps_original_only_with_connection_proof_and_no_write() {
+        for state in [Some(true), None] {
+            for proof in [true, false] {
+                for may_have_changed in [false, true] {
+                    let now = Instant::now();
+                    let (settings, readings) = fixture();
+                    let mut boost = Boost::new(now);
+                    settle(&mut boost, now, true);
+                    let read = boost.next(&settings, 1, &readings).unwrap();
+                    complete(&mut boost, &read, 1000);
+                    let apply = boost.next(&settings, 1, &readings).unwrap();
+                    complete(&mut boost, &apply, 2000);
+                    if !proof {
+                        boost
+                            .entries
+                            .get_mut(&readings[0].key)
+                            .unwrap()
+                            .target
+                            .connection_stamp = None;
+                    }
+                    settle(&mut boost, now + Duration::from_secs(30), false);
+                    let restore = boost.next(&settings, 1, &readings).unwrap();
+                    let guard = boost.guard(restore.request).unwrap();
+                    boost.sample(now + Duration::from_secs(60), state);
+                    assert!(guard.cancel.load(Ordering::Acquire));
+                    let mut outcome = ControlOutcome::failed(&restore, "Fullscreen state changed");
+                    outcome.may_have_changed = may_have_changed;
+                    boost.complete(&outcome);
+                    assert!(boost.next(&settings, 1, &readings).is_none());
+                    settle(&mut boost, now + Duration::from_secs(90), false);
+                    let retry = boost.next(&settings, 1, &readings);
+                    assert_eq!(retry.is_some(), proof && !may_have_changed);
+                    if let Some(retry) = retry {
+                        assert_eq!(retry.target.connection_stamp, ConnectionStamp::new(1));
+                        assert_eq!(
+                            retry.action,
+                            ControlAction::ApplyIf {
+                                rate: rate(1000),
+                                expected: rate(2000)
+                            }
+                        );
+                        complete(&mut boost, &retry, 1000);
+                        assert!(!boost.owns(&readings[0].key));
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn unknown_state_cancels_queued_work_and_clear_revokes_guard() {

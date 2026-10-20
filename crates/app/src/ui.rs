@@ -1091,11 +1091,11 @@ fn device_row_index(
     }
     None
 }
-fn current_device_row(
-    batteries: &[DeviceView],
-    configuration: &[ConfigurationDevice],
+fn selected_device_sources<'a>(
+    batteries: &'a [DeviceView],
+    configuration: &'a [ConfigurationDevice],
     selected: Option<&str>,
-) -> Option<(ConfigurationDevice, Option<DeviceView>)> {
+) -> (Option<&'a ConfigurationDevice>, Option<&'a DeviceView>) {
     let battery = selected.and_then(|key| batteries.iter().find(|d| d.reading.key == key));
     let standalone = selected.and_then(|key| configuration.iter().find(|d| d.key == key));
     if let Some(battery) = battery.or_else(|| {
@@ -1107,16 +1107,89 @@ fn current_device_row(
     }) {
         let device = configuration
             .iter()
-            .find(|d| d.matches_reading(&battery.reading))
-            .cloned()
-            .unwrap_or_else(|| ConfigurationDevice::from_reading(&battery.reading));
-        Some((device, Some(battery.clone())))
+            .find(|d| d.matches_reading(&battery.reading));
+        (device, Some(battery))
     } else {
-        standalone
-            .or_else(|| configuration.first())
-            .cloned()
-            .map(|d| (d, None))
+        (standalone.or_else(|| configuration.first()), None)
     }
+}
+fn current_device_row(
+    batteries: &[DeviceView],
+    configuration: &[ConfigurationDevice],
+    selected: Option<&str>,
+) -> Option<(ConfigurationDevice, Option<DeviceView>)> {
+    let (configured, battery) = selected_device_sources(batteries, configuration, selected);
+    let device = configured
+        .cloned()
+        .or_else(|| battery.map(|battery| ConfigurationDevice::from_reading(&battery.reading)))?;
+    Some((device, battery.cloned()))
+}
+/// Temporary borrowed metadata, never a retained cache or a copy of display text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceDescriptorRef<'a> {
+    key: &'a str,
+    name: &'a str,
+    kind: &'a str,
+    source: &'a str,
+    via: &'a str,
+    connection: &'a Connection,
+    serial: Option<&'a str>,
+    container: Option<&'a str>,
+    capability: &'a PollingCapability,
+}
+impl DeviceDescriptorRef<'_> {
+    fn same_identity(self, other: Self) -> bool {
+        self.key == other.key
+            && self.kind == other.kind
+            && self.source == other.source
+            && self.via == other.via
+            && self.serial == other.serial
+            && self.container == other.container
+    }
+}
+impl<'a> From<&'a ConfigurationDevice> for DeviceDescriptorRef<'a> {
+    fn from(device: &'a ConfigurationDevice) -> Self {
+        Self {
+            key: &device.key,
+            name: &device.name,
+            kind: &device.kind,
+            source: &device.source,
+            via: &device.via,
+            connection: &device.connection,
+            serial: device.serial.as_deref(),
+            container: device.container.as_deref(),
+            capability: &device.capability,
+        }
+    }
+}
+impl<'a> From<&'a Reading> for DeviceDescriptorRef<'a> {
+    fn from(reading: &'a Reading) -> Self {
+        Self {
+            key: &reading.key,
+            name: &reading.name,
+            kind: &reading.kind,
+            source: &reading.source,
+            via: &reading.via,
+            connection: &reading.connection,
+            serial: reading.serial.as_deref(),
+            container: reading.container.as_deref(),
+            capability: &PollingCapability::ReadWrite,
+        }
+    }
+}
+fn current_device_state<'a>(
+    batteries: &'a [DeviceView],
+    configuration: &'a [ConfigurationDevice],
+    selected: Option<&str>,
+) -> Option<(DeviceDescriptorRef<'a>, Option<bool>)> {
+    let (configured, battery) = selected_device_sources(batteries, configuration, selected);
+    let descriptor = configured
+        .map(DeviceDescriptorRef::from)
+        .or_else(|| battery.map(|battery| DeviceDescriptorRef::from(&battery.reading)))?;
+    Some((
+        descriptor,
+        battery.and_then(|battery| battery.reading.charging),
+    ))
 }
 struct State {
     context: *const UiContext,
@@ -1603,11 +1676,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(1)
             }
             TRAY => {
+                let event = (lp.0 as u32) & 0xffff;
+                let opens_dashboard = matches!(event, WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT)
+                    || event == (NIN_SELECT | 1);
+                let opens_menu = matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP);
+                // Hover/tooltip and button-down callbacks are passive. Avoid
+                // selecting a device, cloning its key or querying history here.
+                if !opens_dashboard && !opens_menu {
+                    return LRESULT(0);
+                }
                 let key = s
                     .trays
                     .iter()
                     .find(|(_, t)| t.data.uID == wp.0 as u32)
                     .map(|(key, _)| key.clone());
+                let mut selection_changed = false;
                 if let Some(key) = &key
                     && let Some(i) = s
                         .snapshot
@@ -1615,25 +1698,28 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         .iter()
                         .position(|d| &d.reading.key == key)
                 {
+                    selection_changed =
+                        s.selected != i || s.selected_device.as_deref() != Some(key.as_str());
                     s.selected_device = Some(key.clone());
-                    if s.selected != i && s.page == 6 {
-                        s.selected = i;
+                    s.selected = i;
+                    if selection_changed {
+                        s.polling.abandon();
                         s.insights.abandon();
-                        s.build();
-                        s.query_insights();
-                    } else {
-                        s.selected = i;
+                        if s.dashboard.is_some() && matches!(s.page, 1 | 2 | 6) {
+                            s.page_scroll = 0;
+                            s.build();
+                            s.query_insights();
+                        }
                     }
                 }
-                let event = (lp.0 as u32) & 0xffff;
-                if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
+                if opens_menu {
                     s.menu(key.clone())
-                } else if event == WM_LBUTTONUP
-                    || event == WM_LBUTTONDBLCLK
-                    || event == NIN_SELECT
-                    || event == (NIN_SELECT | 1)
-                {
-                    s.open()
+                } else if opens_dashboard {
+                    let was_open = s.dashboard.is_some();
+                    s.open();
+                    if selection_changed && was_open {
+                        s.read_polling();
+                    }
                 }
                 LRESULT(0)
             }
@@ -3928,6 +4014,16 @@ impl State {
         let selection_changed = previous != current;
         if selection_changed {
             self.polling.abandon();
+            if previous
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(before, after)| {
+                    !DeviceDescriptorRef::from(before)
+                        .same_identity(DeviceDescriptorRef::from(after))
+                })
+            {
+                self.invalidate_mouse_readbacks();
+            }
         }
         self.polling
             .retain_inventory(&self.snapshot.devices, &self.configuration_devices);
@@ -3942,6 +4038,19 @@ impl State {
         self.runtime.send(Command::ConfigurationVisible(
             self.dashboard_visible() && self.page == 1,
         ));
+    }
+    fn invalidate_mouse_readbacks(&mut self) {
+        // Keep request counters monotonic so late results cannot match a new
+        // device's request. Preserve DPI backups on disk for the original unit.
+        self.dpi = DpiUi {
+            next: self.dpi.next,
+            ..DpiUi::default()
+        };
+        self.sleep = SleepUi {
+            next: self.sleep.next,
+            ..SleepUi::default()
+        };
+        self.device_form_key = None;
     }
     fn dashboard_visible(&self) -> bool {
         self.dashboard.is_some_and(|hwnd| unsafe {
@@ -5169,12 +5278,34 @@ impl State {
                 .snapshot
                 .devices
                 .get(self.selected)
-                .map(|d| d.reading.key.clone());
-            let (previous_device, previous_charging) = self
-                .current_device()
-                .map_or((None, None), |(device, battery)| {
-                    (Some(device), battery.and_then(|b| b.reading.charging))
-                });
+                .map(|d| d.reading.key.as_str());
+            let selected = previous_key
+                .and_then(|key| s.devices.iter().position(|d| d.reading.key == key))
+                .unwrap_or_else(|| self.selected.min(s.devices.len().saturating_sub(1)));
+            let battery_selection_changed =
+                previous_key != s.devices.get(selected).map(|d| d.reading.key.as_str());
+            let previous_device = current_device_state(
+                &self.snapshot.devices,
+                &self.configuration_devices,
+                self.selected_device.as_deref(),
+            );
+            let current_device = current_device_state(
+                &s.devices,
+                &self.configuration_devices,
+                self.selected_device.as_deref(),
+            );
+            let charging_changed = previous_device.and_then(|(_, charging)| charging)
+                != current_device.and_then(|(_, charging)| charging);
+            let device_changed = previous_device.map(|(device, _)| device)
+                != current_device.map(|(device, _)| device);
+            let replaced_device = device_changed
+                && previous_device
+                    .zip(current_device)
+                    .is_some_and(|((before, _), (after, _))| !before.same_identity(after));
+            let current_key = current_device.map(|(device, _)| device.key);
+            if self.selected_device.as_deref() != current_key {
+                self.selected_device = current_key.map(str::to_owned);
+            }
             self.snapshot = s;
             self.tooltip_rates.retain(|key, observation| {
                 self.snapshot.devices.iter().any(|d| {
@@ -5185,44 +5316,31 @@ impl State {
             });
             self.tray_polling
                 .retain_inventory(&self.snapshot.devices, &[]);
-            let (current_device, current_charging) = self
-                .current_device()
-                .map_or((None, None), |(device, battery)| {
-                    (Some(device), battery.and_then(|b| b.reading.charging))
-                });
-            let charging_changed = previous_charging != current_charging;
-            self.selected_device = current_device.as_ref().map(|d| d.key.clone());
-            if previous_device != current_device {
+            if device_changed {
                 self.polling.abandon();
                 polling_selection_changed = true;
+                if replaced_device {
+                    self.invalidate_mouse_readbacks();
+                }
             }
             self.polling
                 .retain_inventory(&self.snapshot.devices, &self.configuration_devices);
-            self.selected = previous_key
-                .as_ref()
-                .and_then(|key| {
-                    self.snapshot
-                        .devices
-                        .iter()
-                        .position(|d| &d.reading.key == key)
-                })
-                .unwrap_or_else(|| {
-                    self.selected
-                        .min(self.snapshot.devices.len().saturating_sub(1))
-                });
+            self.selected = selected;
             let selected_key = self
                 .snapshot
                 .devices
                 .get(self.selected)
                 .map(|d| &d.reading.key);
-            if previous_key.as_ref() != selected_key {
+            if battery_selection_changed {
                 self.polling.abandon();
                 self.insights.select(selected_key.cloned());
                 polling_selection_changed = true;
             }
             self.refresh_device_details();
             self.sync_trays(TrayUpdate::Changed);
-            if (identity_changed && self.page != 3) || (charging_changed && self.page == 1) {
+            if (identity_changed && self.page != 3)
+                || ((charging_changed || replaced_device) && self.page == 1)
+            {
                 self.build()
             } else if let Some(h) = self.controls.get(&10) {
                 for i in changed_labels {
@@ -7476,6 +7594,93 @@ mod configuration_device_ui_tests {
         );
     }
     #[test]
+    fn borrowed_device_state_matches_owned_selection_without_inventory_copies() {
+        let mut batteries = vec![battery("mouse"), battery("second")];
+        for device in &mut batteries {
+            device.reading.charging = Some(false);
+            device.reading.kind = "mouse".into();
+            device.reading.via = "usb".into();
+            device.reading.serial = Some("SYNTHETIC-SERIAL".into());
+            device.reading.container = Some("SYNTHETIC-CONTAINER".into());
+        }
+        let mut matched = ConfigurationDevice::from_reading(&batteries[0].reading);
+        matched.name = "Configured name".into();
+        matched.capability =
+            PollingCapability::Unavailable("Synthetic unavailable collection".into());
+        let configured = vec![matched, keyboard("keyboard")];
+        for (batteries, configuration) in [
+            (&batteries[..], &[][..]),
+            (&[][..], &configured[..]),
+            (&batteries[..], &configured[..]),
+            (&[][..], &[][..]),
+        ] {
+            for selected in [
+                None,
+                Some("missing"),
+                Some("mouse"),
+                Some("second"),
+                Some("keyboard"),
+            ] {
+                let owned = current_device_row(batteries, configuration, selected);
+                let borrowed = current_device_state(batteries, configuration, selected);
+                assert_eq!(
+                    borrowed,
+                    owned.as_ref().map(|(device, battery)| (
+                        DeviceDescriptorRef::from(device),
+                        battery.as_ref().and_then(|b| b.reading.charging)
+                    )),
+                );
+            }
+        }
+        let (_, before) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                std::hint::black_box(current_device_row(&batteries, &configured, Some("mouse")));
+                std::hint::black_box(current_device_row(&batteries, &configured, Some("mouse")));
+            }
+        });
+        let (_, after) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                std::hint::black_box(current_device_state(&batteries, &configured, Some("mouse")));
+                std::hint::black_box(current_device_state(&batteries, &configured, Some("mouse")));
+            }
+        });
+        println!("1,000 snapshot selection comparisons: owned={before:?}, borrowed={after:?}");
+        assert!(before.calls > 0);
+        assert_eq!(after.calls, 0);
+        assert_eq!(after.bytes, 0);
+    }
+    #[test]
+    fn borrowed_device_descriptor_detects_each_configuration_field_change() {
+        let mut original = ConfigurationDevice::from_reading(&battery("mouse").reading);
+        original.serial = Some("SERIAL".into());
+        original.container = Some("CONTAINER".into());
+        for field in 0..9 {
+            let mut changed = original.clone();
+            match field {
+                0 => changed.key.push_str("-new"),
+                1 => changed.name.push_str(" renamed"),
+                2 => changed.kind.push_str("keyboard"),
+                3 => changed.source.push_str("-new"),
+                4 => changed.via.push_str("bluetooth"),
+                5 => changed.connection = Connection::Stale,
+                6 => changed.serial = None,
+                7 => changed.container = None,
+                8 => changed.capability = PollingCapability::Unavailable("Unavailable".into()),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                DeviceDescriptorRef::from(&original),
+                DeviceDescriptorRef::from(&changed)
+            );
+            assert_eq!(
+                DeviceDescriptorRef::from(&original)
+                    .same_identity(DeviceDescriptorRef::from(&changed)),
+                matches!(field, 1 | 5 | 8),
+                "Only name, availability and capability changes preserve physical identity"
+            );
+        }
+    }
+    #[test]
     fn direct_selection_and_row_indices_match_mixed_deduplicated_inventory() {
         let batteries = vec![battery("mouse"), battery("second")];
         let matched = ConfigurationDevice::from_reading(&batteries[0].reading);
@@ -8194,6 +8399,119 @@ mod dashboard_lifecycle_tests {
             exercise_native_dashboard(restore);
         }
     }
+    unsafe fn exercise_tray_selection(context: &UiContext) {
+        fn battery(key: &str, name: &str) -> DeviceView {
+            let mut reading = Reading::new(key, name, "simulation", 120);
+            reading.level = Some(50);
+            reading.charging = Some(false);
+            reading.kind = "mouse".into();
+            DeviceView {
+                reading,
+                name: name.into(),
+                icon: "mouse".into(),
+                low_alert_at: 20,
+                seconds_left: None,
+                text: format!("{name}: 50%"),
+                hidden: false,
+            }
+        }
+        for page in [1, 2, 6] {
+            let (second_icon, history_request, insights_sequence, name_control) = {
+                let mut state = context.state.borrow_mut();
+                state.settings.polling_controls = false;
+                state.snapshot.devices = vec![
+                    battery("synthetic:first", "First mouse"),
+                    battery("synthetic:second", "Second mouse"),
+                ];
+                state.selected = 0;
+                state.selected_device = Some("synthetic:first".into());
+                state.page = page;
+                state.build();
+                state.sync_trays(TrayUpdate::Changed);
+                if page == 1 {
+                    state.set_control_text(11, "Unsaved first mouse");
+                }
+                (
+                    state.trays["synthetic:second"].data.uID,
+                    state.request,
+                    state.insights.sequence,
+                    state.controls.get(&11).copied(),
+                )
+            };
+            for event in [
+                WM_MOUSEMOVE,
+                WM_LBUTTONDOWN,
+                WM_RBUTTONDOWN,
+                NIN_POPUPOPEN,
+                NIN_POPUPCLOSE,
+            ] {
+                unsafe {
+                    send(
+                        context.monitor.get(),
+                        TRAY,
+                        WPARAM(second_icon as usize),
+                        LPARAM(event as isize),
+                    );
+                }
+                let state = context.state.borrow();
+                assert_eq!(
+                    state.selected, 0,
+                    "Passive tray event changed selection on page {page}"
+                );
+                assert_eq!(state.selected_device.as_deref(), Some("synthetic:first"));
+                assert_eq!(state.request, history_request);
+                assert_eq!(state.insights.sequence, insights_sequence);
+                if page == 1 {
+                    assert_eq!(state.controls.get(&11).copied(), name_control);
+                    assert_eq!(state.text(11), "Unsaved first mouse");
+                }
+            }
+            let (_, hover_allocations) = crate::allocation_counter::measure(|| {
+                for _ in 0..1000 {
+                    unsafe {
+                        send(
+                            context.monitor.get(),
+                            TRAY,
+                            WPARAM(second_icon as usize),
+                            LPARAM(WM_MOUSEMOVE as isize),
+                        );
+                    }
+                }
+            });
+            assert_eq!(hover_allocations.calls, 0);
+            assert_eq!(hover_allocations.bytes, 0);
+            unsafe {
+                send(
+                    context.monitor.get(),
+                    TRAY,
+                    WPARAM(second_icon as usize),
+                    LPARAM(WM_LBUTTONUP as isize),
+                );
+            }
+            let state = context.state.borrow();
+            assert_eq!(state.selected, 1);
+            assert_eq!(state.selected_device.as_deref(), Some("synthetic:second"));
+            assert_eq!(
+                state.choice(10),
+                1,
+                "Clicked tray device must match the visible form"
+            );
+            match page {
+                1 => assert_eq!(state.text(11), "Second mouse"),
+                2 => assert_ne!(state.request, history_request),
+                6 => assert_eq!(state.insights.key.as_deref(), Some("synthetic:second")),
+                _ => unreachable!(),
+            }
+        }
+        let mut state = context.state.borrow_mut();
+        state.snapshot = Snapshot::default();
+        state.selected = 0;
+        state.selected_device = None;
+        state.page = 1;
+        state.insights.select(None);
+        state.sync_trays(TrayUpdate::Changed);
+        state.build();
+    }
     fn exercise_native_dashboard(restore: bool) {
         let mut settings = Settings {
             polling_controls: true,
@@ -8453,6 +8771,7 @@ mod dashboard_lifecycle_tests {
             send(monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
             let first = context.state.borrow().dashboard.unwrap();
             assert!(IsWindowVisible(first).as_bool());
+            exercise_tray_selection(&context);
             {
                 let mut state = context.state.borrow_mut();
                 state.command(2, 0);
@@ -8868,6 +9187,77 @@ mod dashboard_lifecycle_tests {
                 state.dpi.previous.as_mut().unwrap().0 = key;
                 state.dpi.previous.as_mut().unwrap().2.stage = Some(2);
                 assert!(state.restorable_dpi().is_none());
+                state.dpi.previous.as_mut().unwrap().2.stage = Some(1);
+                let saved_polling = std::mem::take(&mut state.polling);
+                state.polling.generation = generation;
+                let saved_tray_polling = std::mem::take(&mut state.tray_polling);
+                state.tray_polling.generation = generation;
+                let saved_tooltip_rates = std::mem::take(&mut state.tooltip_rates);
+                let saved_sleep = std::mem::take(&mut state.sleep);
+                for configuration_only in [false, true] {
+                    let before_snapshot = state.snapshot.clone();
+                    let before_configuration = state.configuration_devices.clone();
+                    let mut device =
+                        ConfigurationDevice::from_reading(&state.snapshot.devices[0].reading);
+                    let device_key = device.key.clone();
+                    if configuration_only {
+                        state.snapshot.devices.clear();
+                        state.configuration_devices = vec![device.clone()];
+                    }
+                    state.dpi.outcome.as_mut().unwrap().current = Some(original.clone());
+                    state.dpi.previous = Some((device.key.clone(), generation, original.clone()));
+                    state.sleep.outcome = Some(SleepOutcome {
+                        connection_stamp: ConnectionStamp::new(1),
+                        request: 88,
+                        key: device.key.clone(),
+                        generation,
+                        seconds: Some(300),
+                        may_have_changed: false,
+                        failure: None,
+                    });
+                    assert_eq!(state.restorable_dpi(), Some(original.value));
+                    device.serial = Some("SYNTHETIC-REPLACEMENT-UNIT".into());
+                    let (events, received) = crossbeam_channel::bounded(1);
+                    let real_events = std::mem::replace(&mut state.runtime.events, received);
+                    if configuration_only {
+                        events
+                            .send(Event::ConfigurationInventory {
+                                generation,
+                                devices: vec![device],
+                                failure: None,
+                            })
+                            .unwrap();
+                    } else {
+                        let mut replacement = state.snapshot.clone();
+                        replacement.devices[0].reading.serial = device.serial;
+                        events.send(Event::Snapshot(replacement)).unwrap();
+                    }
+                    state.drain();
+                    state.runtime.events = real_events;
+                    assert!(
+                        state.restorable_dpi().is_none(),
+                        "Replacement hardware inherited the old DPI restore value"
+                    );
+                    assert!(state.dpi.previous.is_none());
+                    assert!(state.sleep.outcome.is_none());
+                    state.snapshot = before_snapshot;
+                    state.configuration_devices = before_configuration;
+                    state.dpi.pending = None;
+                    state.dpi.outcome = Some(DpiOutcome {
+                        limits: None,
+                        request: 1,
+                        key: device_key,
+                        generation,
+                        current: Some(original.clone()),
+                        previous: None,
+                        may_have_changed: false,
+                        failure: None,
+                    });
+                }
+                state.polling = saved_polling;
+                state.tray_polling = saved_tray_polling;
+                state.tooltip_rates = saved_tooltip_rates;
+                state.sleep = saved_sleep;
                 state.snapshot.devices[0].reading = saved;
                 state.selected_device = Some("synthetic-mouse".into());
                 state.dpi = DpiUi::default();

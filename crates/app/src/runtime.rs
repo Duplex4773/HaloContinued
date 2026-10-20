@@ -455,15 +455,33 @@ impl Events {
         r
     }
 }
+fn remember_failed_notification(
+    engine: &Engine,
+    pending: &mut BTreeMap<(String, NotificationKind), (Instant, Notification)>,
+    notification: Notification,
+    now: Instant,
+) {
+    if !engine.notification_current(&notification) {
+        return;
+    }
+    let key = (notification.key.clone(), notification.kind);
+    if pending.len() < 512 || pending.contains_key(&key) {
+        pending.insert(key, (now + Duration::from_secs(30), notification));
+    }
+}
 fn update_diagnostics(
     diagnostics: &mut BTreeMap<String, Vec<String>>,
-    key: String,
+    key: &str,
     value: Vec<String>,
 ) -> bool {
-    if diagnostics.get(&key) == Some(&value) {
-        return false;
+    if let Some(previous) = diagnostics.get_mut(key) {
+        if *previous == value {
+            return false;
+        }
+        *previous = value;
+    } else {
+        diagnostics.insert(key.into(), value);
     }
-    diagnostics.insert(key, value);
     true
 }
 fn publish_diagnostics(
@@ -2534,7 +2552,7 @@ fn run(
             )
         };
         let boost_command = if startup_command.is_none()
-            && boost.needs_inventory(&engine.settings)
+            && boost.ready(&engine.settings, |id| engine.provider_readings(id))
             && !suspended
             && !stop
             && inflight == 0
@@ -2665,12 +2683,7 @@ fn run(
                 }
             }
             Work::Command(Ok(Command::NotificationFailed(n))) => {
-                if failed_delivery.len() < 512 {
-                    failed_delivery.insert(
-                        (n.key.clone(), n.kind),
-                        (Instant::now() + Duration::from_secs(30), n),
-                    );
-                }
+                remember_failed_notification(&engine, &mut failed_delivery, n, Instant::now());
             }
             Work::Command(Ok(Command::Refresh)) => {
                 hid.invalidate();
@@ -2754,7 +2767,7 @@ fn run(
                 );
                 snapshots.changed |= current && battery_affects_snapshot(&engine, id, &r.result);
                 diagnostics_dirty |=
-                    update_diagnostics(&mut diagnostics, id.to_string(), r.provider.diagnostics());
+                    update_diagnostics(&mut diagnostics, id, r.provider.diagnostics());
                 let observations = completed_observations(
                     engine.provider_readings(id),
                     &r.result,
@@ -3117,7 +3130,7 @@ fn run(
                 }
                 diagnostics_dirty |= update_diagnostics(
                     &mut diagnostics,
-                    "polling_controls".into(),
+                    "polling_controls",
                     vec![format!(
                         "request {}: {}",
                         outcome.request,
@@ -4052,6 +4065,48 @@ mod tests {
         assert_eq!(rate.hz(), 250);
     }
     #[test]
+    fn unchanged_empty_diagnostics_do_not_allocate_provider_keys() {
+        let mut diagnostics = BTreeMap::new();
+        update_diagnostics(&mut diagnostics, "razer", Vec::new());
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!update_diagnostics(&mut diagnostics, "razer", Vec::new()));
+            }
+        });
+        println!("1,000 unchanged diagnostic updates: {allocations:?}");
+        assert_eq!(allocations.calls, 0);
+        assert_eq!(allocations.bytes, 0);
+    }
+    #[test]
+    fn obsolete_delivery_failure_cannot_replace_current_retry_or_delay_it() {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut reading = Reading::new("synthetic:mouse", "Test mouse", "razer", 0);
+        reading.level = Some(10);
+        reading.charging = Some(false);
+        let old = engine
+            .apply("razer", Ok(vec![reading.clone()]), 0.0, false)
+            .pop()
+            .unwrap();
+        reading.timestamp = 60;
+        reading.level = Some(80);
+        engine.apply("razer", Ok(vec![reading.clone()]), 60.0, false);
+        reading.timestamp = 120;
+        reading.level = Some(10);
+        let current = engine
+            .apply("razer", Ok(vec![reading]), 120.0, false)
+            .pop()
+            .unwrap();
+        let now = Instant::now();
+        let mut pending = BTreeMap::new();
+        remember_failed_notification(&engine, &mut pending, current, now);
+        remember_failed_notification(&engine, &mut pending, old, now + Duration::from_secs(20));
+        assert_eq!(pending.len(), 1);
+        let (due, notification) = pending.into_values().next().unwrap();
+        assert_eq!(due, now + Duration::from_secs(30));
+        engine.notification_failed(notification);
+        assert_eq!(engine.flush_held().len(), 1);
+    }
+    #[test]
     fn diagnostics_publish_only_changes_and_retry_after_backpressure() {
         let (tx, rx) = bounded(1);
         let events = Events {
@@ -4059,17 +4114,17 @@ mod tests {
             window: Arc::new(AtomicUsize::new(0)),
         };
         let mut diagnostics = BTreeMap::new();
-        let mut dirty = update_diagnostics(&mut diagnostics, "test".into(), vec!["ready".into()]);
+        let mut dirty = update_diagnostics(&mut diagnostics, "test", vec!["ready".into()]);
         publish_diagnostics(&events, &diagnostics, &mut dirty);
         assert!(!dirty);
         assert!(!update_diagnostics(
             &mut diagnostics,
-            "test".into(),
+            "test",
             vec!["ready".into()]
         ));
         publish_diagnostics(&events, &diagnostics, &mut dirty);
         assert_eq!(rx.len(), 1);
-        dirty |= update_diagnostics(&mut diagnostics, "test".into(), vec!["changed".into()]);
+        dirty |= update_diagnostics(&mut diagnostics, "test", vec!["changed".into()]);
         publish_diagnostics(&events, &diagnostics, &mut dirty);
         assert!(dirty);
         let Event::Diagnostics(first) = rx.recv().unwrap() else {
