@@ -920,6 +920,48 @@ fn insight_estimate(hours: Option<f64>) -> String {
         })
         .unwrap_or_else(|| "Keep using the device to build an estimate".into())
 }
+fn insight_missing_rate_data(
+    data: Option<&BatteryInsights>,
+    prediction: &AdaptivePrediction,
+) -> bool {
+    data.is_some_and(|d| d.recent.total_seconds >= 1800)
+        && prediction.full_hours.is_none()
+        && prediction.coverage_percent < 80.0
+}
+fn insight_prediction_explanation(
+    data: Option<&BatteryInsights>,
+    prediction: &AdaptivePrediction,
+    controls_enabled: bool,
+) -> String {
+    match data {
+        None => "Keep using your device to build battery insights.".into(),
+        Some(d) if d.coverage.observation_count == 0 => {
+            "No battery history yet. Keep your device connected while using it.".into()
+        }
+        Some(_) if prediction.full_hours.is_some() && prediction.remaining_hours.is_none() => {
+            "Waiting for a fresh battery and rate reading to estimate time left.".into()
+        }
+        Some(_) if prediction.full_hours.is_some() => {
+            "Your estimate follows your recent mix of everyday, boosted and low-battery use.".into()
+        }
+        Some(_) if insight_missing_rate_data(data, prediction) => {
+            let recovery = if controls_enabled {
+                "Rate checks resume when your mouse wakes or its connection changes."
+            } else {
+                "Turn on Allow device settings changes in Settings to resume rate checks."
+            };
+            format!(
+                "Polling rate was confirmed for {:.0}% of recent use (80% needed). {recovery} Older unknown periods stay excluded.",
+                prediction.coverage_percent
+            )
+        }
+        Some(_) if !prediction.missing_rates.is_empty() => format!(
+            "Still learning at {}. See progress under Battery life by rate.",
+            prediction.missing_rates.iter().map(|r| format!("{r} Hz")).collect::<Vec<_>>().join(", ")
+        ),
+        Some(_) => "Estimates need at least 30 minutes of use with a confirmed polling rate. Keep using your device on battery.".into(),
+    }
+}
 fn rate_insight_text(rate: &RateInsight) -> String {
     let estimate = rate
         .projected_full_charge_hours
@@ -3455,10 +3497,27 @@ impl State {
             }
         }
         let session_y = if polling {
+            // Missing-rate guidance wraps to three lines. Keep the next
+            // section below it at every supported dashboard DPI.
+            let prediction = self
+                .insights
+                .data
+                .as_ref()
+                .map(|d| d.adaptive_prediction(None, None))
+                .unwrap_or_default();
+            let explanation_height =
+                if insight_missing_rate_data(self.insights.data.as_ref(), &prediction) {
+                    72
+                } else {
+                    46
+                };
+            position(self, 79, 20, 290, 760, explanation_height);
+            let habits_y = 388 + explanation_height - 46;
+            position(self, 73, 20, habits_y - 40, 760, 28);
             let habits_height = height(410, 370, 172).max(height(411, 374, 172));
-            position(self, 410, 20, 388, 370, habits_height);
-            position(self, 411, 406, 388, 374, habits_height);
-            let rate_y = 388 + habits_height + 26;
+            position(self, 410, 20, habits_y, 370, habits_height);
+            position(self, 411, 406, habits_y, 374, habits_height);
+            let rate_y = habits_y + habits_height + 26;
             position(self, 80, 20, rate_y, 760, 28);
             position(self, 70, 20, rate_y + 42, 760, 280);
             let rate_height = height(74, 760, 160);
@@ -3523,9 +3582,13 @@ impl State {
             .map(|d| d.adaptive_prediction(boost, None))
             .unwrap_or_default();
         let estimate = |hours: Option<f64>| {
-            hours
-                .map(|h| insight_estimate(Some(h)))
-                .unwrap_or_else(|| "Learning".into())
+            hours.map(|h| insight_estimate(Some(h))).unwrap_or_else(|| {
+                if insight_missing_rate_data(data, &prediction) {
+                    "Missing rate data".into()
+                } else {
+                    "Learning".into()
+                }
+            })
         };
         self.set_control_text(
             400,
@@ -3550,31 +3613,8 @@ impl State {
                     .unwrap_or_else(|| "—".into())
             ),
         );
-        let explanation = match data {
-            None => "Keep using your device to build battery insights.".into(),
-            Some(d) if d.coverage.observation_count == 0 => {
-                "No battery history yet. Keep your device connected while using it.".into()
-            }
-            Some(_) if prediction.full_hours.is_some() && prediction.remaining_hours.is_none() => {
-                "Waiting for a fresh battery and rate reading to estimate time left.".into()
-            }
-            Some(_) if prediction.full_hours.is_some() => {
-                "Your estimate follows your recent mix of everyday, boosted and low-battery use."
-                    .into()
-            }
-            Some(_) if !prediction.missing_rates.is_empty() => format!(
-                "Still learning at {}. See progress under Battery life by rate.",
-                prediction
-                    .missing_rates
-                    .iter()
-                    .map(|r| format!("{r} Hz"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Some(_) => {
-                "Keep using your device. Estimates need 30 minutes of use with the rate known for at least 80% of that time.".into()
-            }
-        };
+        let explanation =
+            insight_prediction_explanation(data, &prediction, self.settings.polling_controls);
         self.set_control_text(79, &explanation);
         let Some(data) = data else {
             self.set_control_text(
@@ -8098,6 +8138,56 @@ mod tooltip_polling_tests {
 mod insights_tests {
     use super::*;
     #[test]
+    fn adaptive_cards_explain_missing_rate_data_instead_of_restarting_learning() {
+        let mut data = BatteryInsights::default();
+        data.coverage.observation_count = 1000;
+        data.recent.total_seconds = 227418;
+        data.recent.rates = [0, 0, 0, 76541, 0, 28978, 0];
+        data.rates = [1000, 4000]
+            .into_iter()
+            .map(|hz| RateInsight {
+                hz,
+                projection_seconds: 7200,
+                projection_consumed_percent: 10,
+                projected_full_charge_hours: Some(60.0),
+                ..Default::default()
+            })
+            .collect();
+        let prediction = data.adaptive_prediction(PollingRate::try_from(4000).ok(), None);
+        assert!(prediction.missing_rates.is_empty());
+        assert!(prediction.full_hours.is_none());
+        assert!(insight_missing_rate_data(Some(&data), &prediction));
+        let text = insight_prediction_explanation(Some(&data), &prediction, true);
+        assert!(text.contains("46%") && text.contains("80% needed"));
+        assert!(text.contains("when your mouse wakes"));
+        assert!(text.contains("Older unknown periods stay excluded"));
+        assert!(!text.contains("Still learning"));
+        assert!(
+            insight_prediction_explanation(Some(&data), &prediction, false)
+                .contains("Turn on Allow device settings changes")
+        );
+        // Missing drain evidence is a separate reason when rate coverage is good.
+        data.recent.total_seconds = 105519;
+        data.rates.clear();
+        let prediction = data.adaptive_prediction(None, None);
+        assert!(!insight_missing_rate_data(Some(&data), &prediction));
+        let text = insight_prediction_explanation(Some(&data), &prediction, true);
+        assert!(text.contains("Still learning at 1000 Hz, 4000 Hz"));
+        data.recent.total_seconds = 1200;
+        data.recent.rates = [0, 0, 0, 1200, 0, 0, 0];
+        data.rates.push(RateInsight {
+            hz: 1000,
+            projection_seconds: 7200,
+            projection_consumed_percent: 10,
+            projected_full_charge_hours: Some(60.0),
+            ..Default::default()
+        });
+        let prediction = data.adaptive_prediction(None, None);
+        assert!(
+            insight_prediction_explanation(Some(&data), &prediction, true).contains("30 minutes")
+        );
+    }
+    #[test]
     fn alert_summary_distinguishes_default_override_and_disabled_delivery() {
         let mut settings = Settings {
             low: 20,
@@ -9058,6 +9148,42 @@ mod dashboard_lifecycle_tests {
                 state.insights.status = insight_coverage_text(&insights);
                 state.insights.data = Some(insights);
                 state.insights.key = Some("synthetic-mouse".into());
+            }
+            {
+                let mut state = context.state.borrow_mut();
+                let saved = state.insights.data.clone();
+                state.insights.data.as_mut().unwrap().recent.total_seconds = 15652;
+                state.page = 6;
+                state.build();
+                assert!(state.text(400).contains("Missing rate data"));
+                assert!(state.text(79).contains("46%"));
+                let label = state.controls[&79];
+                let mut bounds = RECT::default();
+                GetClientRect(label, &mut bounds).unwrap();
+                let available = bounds.bottom;
+                let dc = GetDC(Some(label));
+                let saved_dc = SaveDC(dc);
+                let font = HFONT(send(label, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as _);
+                SelectObject(dc, font.into());
+                let mut text = wide(&state.text(79));
+                DrawTextW(
+                    dc,
+                    &mut text,
+                    &mut bounds,
+                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                );
+                assert!(
+                    bounds.bottom <= available,
+                    "missing-rate guidance must fit without clipping"
+                );
+                let _ = RestoreDC(dc, saved_dc);
+                ReleaseDC(Some(label), dc);
+                let mut note = RECT::default();
+                let mut heading = RECT::default();
+                GetWindowRect(label, &mut note).unwrap();
+                GetWindowRect(state.controls[&73], &mut heading).unwrap();
+                assert!(note.bottom < heading.top);
+                state.insights.data = saved;
             }
             {
                 let mut state = context.state.borrow_mut();

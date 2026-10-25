@@ -28,27 +28,27 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Current release: **1.0.6** for Windows 11 x64, available as an unsigned per-user
+Current release: **1.0.7** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.0.6 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.6/HaloContinued-1.0.6-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.0.6 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.6/HaloContinued-1.0.6-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.0.7 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.7/HaloContinued-1.0.7-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.0.7 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.7/HaloContinued-1.0.7-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.6/HaloContinued-1.0.6-SHA256SUMS.txt)
-· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.6)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.7/HaloContinued-1.0.7-SHA256SUMS.txt)
+· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.7)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
-**New in 1.0.6:** Hovering over tray icons leaves your selected device and
-unfinished edits alone. Clicking another device keeps its form, History and
-Insights in sync. Automatic polling restoration survives an interrupted
-return to the desktop, and delayed alert failures cannot replace newer retries.
-DPI restore values and sleep readings are cleared when different hardware reuses
-an identifier. Snapshot comparisons and background checks avoid more temporary
-allocations, with no added background timers, workers or retained caches.
-[Read the changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.6).
+**New in 1.0.7:** Supported mice can recover a missing polling-rate reading
+after waking, Refresh or a connection change, even after days of uptime. Recovery
+uses bounded, read-only checks and yields to device actions and fullscreen boost.
+Insights distinguishes missing rate information from learning battery drain,
+shows the confirmed percentage and keeps its explanation clear and unclipped.
+Existing unknown history stays excluded; saved preferences are never treated as
+proof of the rate. There are no additional background timers or workers.
+[Read the changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.7).
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -232,8 +232,11 @@ With device settings enabled, launch also checks supported mice's current pollin
 rates in the background. Receivers have up to five minutes to become available;
 failed reads get up to three attempts, at least fifteen seconds apart. A confirmed
 read stops the checks. Saved-rate restoration remains one-shot: if it fails, the
-app can read the current rate without repeating the change. No continuous polling
-rate checks or additional background timer are used.
+app can read the current rate without repeating the change. After startup, a fresh
+on-battery reading can restart these bounded, read-only checks if waking, Refresh
+or a connection change left the rate unknown. Checks yield to device actions and
+fullscreen boost; sleeping or charging mice are not queried for Insights recovery.
+No continuous polling-rate checks or additional background timer are used.
 
 Low-battery mode is also opt-in. It only lowers a faster polling rate or shortens
 a longer sleep timer. Boost takes priority over its polling rate. Prior settings
@@ -255,7 +258,9 @@ Insights learns from reliable battery drops and the time spent at confirmed
 polling rates. It excludes sleeping, charging, missing readings and uncertain
 transitions where appropriate. “Time used” estimates device availability; it
 does not record keystrokes, mouse movements or gaming time. Estimates remain in learning
-until sufficient evidence is available.
+until sufficient evidence is available. If missing rate information blocks an
+estimate, Insights shows the confirmed percentage and explains how checks resume.
+Unknown periods in older history are not filled using saved rate preferences.
 
 ## Resource use
 
@@ -438,11 +443,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.0.6
+.\tools\package-rust.ps1 -Version 1.0.7
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.0.6-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.0.7-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -452,13 +457,13 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.0.6
+.\tools\package-installer.ps1 -Version 1.0.7
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.0.6-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.0.6-windows-x64.exe` and
-`dist/HaloContinued-1.0.6-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.0.7-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.0.7-windows-x64.exe` and
+`dist/HaloContinued-1.0.7-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with

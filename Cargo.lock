@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "halo-continued"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "crossbeam-channel",
  "embed-resource",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "hb-core"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "hb-providers"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "hb-core",
  "serde",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "hb-storage"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "hb-core",
  "rusqlite",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "hb-windows"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "hb-core",
  "hidapi",

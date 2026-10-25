@@ -6,7 +6,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-if (!$PackageZip) { $PackageZip = Join-Path $repo 'dist/HaloContinued-1.0.6-windows-x64.zip' }
+if (!$PackageZip) { $PackageZip = Join-Path $repo 'dist/HaloContinued-1.0.7-windows-x64.zip' }
 $PackageZip = (Resolve-Path -LiteralPath $PackageZip).Path
 if ($PreviousPackageZip) { $PreviousPackageZip = (Resolve-Path -LiteralPath $PreviousPackageZip).Path }
 $Iscc = (Resolve-Path -LiteralPath $Iscc).Path

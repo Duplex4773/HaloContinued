@@ -160,6 +160,11 @@ impl Engine {
     pub fn provider_readings(&self, provider: &str) -> &[Reading] {
         self.by_provider.get(provider).map_or(&[], Vec::as_slice)
     }
+    /// Borrowed preflight only. Commands must still resolve transport precedence
+    /// through `readings` and validate their exact native target before I/O.
+    pub fn raw_readings(&self) -> impl Iterator<Item = &Reading> {
+        self.by_provider.values().flatten()
+    }
     pub fn has_held_notifications(&self) -> bool {
         !self.held.is_empty()
     }
