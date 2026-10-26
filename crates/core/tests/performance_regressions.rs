@@ -319,3 +319,66 @@ fn held_flag_survives_unavailable_retry_and_clears_after_recovery() {
     engine.apply("test", Ok(vec![reading("invented", 4, 80)]), 4.0, false);
     assert!(!engine.has_held_notifications());
 }
+
+#[test]
+fn unavailable_held_notifications_retry_without_allocating_or_losing_the_alert() {
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    engine.apply("test", Ok(vec![reading("invented", 1, 10)]), 1.0, true);
+    engine.apply(
+        "test",
+        Err(ProviderError::new("temporarily unavailable")),
+        2.0,
+        false,
+    );
+    assert!(engine.has_held_notifications());
+    let (_, allocations) = measure(|| {
+        for _ in 0..1000 {
+            assert!(engine.flush_held().is_empty());
+            assert!(engine.has_held_notifications());
+        }
+    });
+    assert_eq!(
+        allocations.calls, 0,
+        "unavailable alert maintenance: {allocations:?}"
+    );
+    assert_eq!(allocations.bytes, 0);
+    assert_eq!(
+        engine
+            .apply("test", Ok(vec![reading("invented", 3, 10)]), 3.0, false)
+            .len(),
+        1
+    );
+    assert!(!engine.has_held_notifications());
+}
+
+#[test]
+fn unusable_first_observations_do_not_allocate_or_retain_empty_estimates() {
+    let mut estimator = Estimator::default();
+    let samples: Vec<_> = (0..1000)
+        .map(|index| {
+            let mut sample = reading(&format!("synthetic-{index}"), index, 80);
+            match index % 5 {
+                0 => sample.connection = Connection::Sleeping,
+                1 => sample.connection = Connection::Stale,
+                2 => sample.charging_inferred = true,
+                3 => sample.charging = None,
+                _ => sample.charging = Some(true),
+            }
+            sample
+        })
+        .collect();
+    let (_, allocations) = measure(|| {
+        for sample in &samples {
+            estimator.record(sample, 60.0);
+        }
+    });
+    assert!(
+        estimator.devices.is_empty(),
+        "No usable discharge evidence was received"
+    );
+    assert_eq!(
+        allocations.calls, 0,
+        "unused estimate state: {allocations:?}"
+    );
+    assert_eq!(allocations.bytes, 0);
+}

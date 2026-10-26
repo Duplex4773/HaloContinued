@@ -85,6 +85,8 @@ impl Estimator {
             return;
         };
         if r.precision != Precision::Exact
+            || !r.online()
+            || r.charging_inferred
             || !monotonic.is_finite()
             || monotonic < 0.0
             || r.timestamp < 0
@@ -96,7 +98,9 @@ impl Estimator {
         // of allocating a replacement identity on every battery observation.
         if let Some(d) = self.devices.get_mut(&r.key) {
             Self::record_sample(d, r, monotonic, level);
-        } else {
+        } else if r.charging == Some(false) {
+            // A new entry exists only to learn discharge. Sleeping, charging
+            // and unknown-power devices have no fit or baseline to retain.
             Self::record_sample(
                 self.devices.entry(r.key.clone()).or_default(),
                 r,

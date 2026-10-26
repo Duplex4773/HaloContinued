@@ -450,40 +450,43 @@ impl Engine {
         if self.suspended || self.held.is_empty() {
             return Vec::new();
         }
-        let readings = self.readings();
+        let readings = enabled_readings(&self.by_provider, &self.settings);
+        let settings = &self.settings;
+        let alerts = &self.alerts;
         let mut ready = Vec::new();
-        for mut n in std::mem::take(&mut self.held).into_values() {
-            if !self
-                .alerts
+        self.held.retain(|_, n| {
+            if !alerts
                 .get(&n.key)
                 .is_some_and(|alert| alert.generation == n.generation)
-                || !self.settings.notify
-                || (n.kind == NotificationKind::Full && !self.settings.full_alert)
-                || self.settings.device(&n.key).is_some_and(|d| d.hidden)
+                || !settings.notify
+                || (n.kind == NotificationKind::Full && !settings.full_alert)
+                || settings.device(&n.key).is_some_and(|d| d.hidden)
             {
-                continue;
+                return false;
             }
-            let Some(r) = readings.iter().find(|r| r.key == n.key) else {
-                continue;
+            let selected = readings
+                .clone()
+                .filter(|r| r.key == n.key && reading_eligible(r, readings.clone()))
+                .reduce(|old, r| if reading_replaces(old, r) { r } else { old });
+            let Some(r) = selected else {
+                return false;
             };
             if n.kind == NotificationKind::Low
-                && (self.settings.low_for(&r.key) == 0
+                && (settings.low_for(&r.key) == 0
                     || r.charging == Some(true)
-                    || r.level.is_some_and(|v| v > self.settings.low_for(&r.key)))
+                    || r.level.is_some_and(|v| v > settings.low_for(&r.key)))
             {
-                continue;
+                return false;
             }
             if n.kind == NotificationKind::Full && r.level.is_some_and(|level| level < 100) {
-                continue;
+                return false;
             }
             // An unavailable reading cannot confirm recovery or disconnect. Keep the
             // pending alert until fresh data permits delivery or invalidates it.
             if !r.online() || r.level.is_none() || r.source == "shield" && r.charging.is_none() {
-                self.held.insert((n.key.clone(), n.kind), n);
-                continue;
+                return true;
             }
-            let name = self
-                .settings
+            let name = settings
                 .device(&r.key)
                 .and_then(|d| d.name.as_deref())
                 .unwrap_or(&r.name);
@@ -494,8 +497,18 @@ impl Engine {
             } else {
                 format!("{name}: {}% left. Time to charge.", r.level.unwrap())
             };
-            ready.push(n);
-        }
+            // Deferred alerts stay in their existing nodes. Move owned strings
+            // out only when delivering; retries need neither snapshots nor
+            // queue reconstruction, even during long device outages.
+            ready.push(Notification {
+                key: std::mem::take(&mut n.key),
+                kind: n.kind,
+                title: std::mem::take(&mut n.title),
+                text: std::mem::take(&mut n.text),
+                generation: n.generation,
+            });
+            false
+        });
         ready
     }
     /// Identity precedence always retains at least one reading from a nonempty
@@ -506,45 +519,14 @@ impl Engine {
             .any(|(provider, readings)| self.settings.enabled(provider) && !readings.is_empty())
     }
     pub fn readings(&self) -> Vec<Reading> {
-        let all = self
-            .by_provider
-            .iter()
-            .filter(|(p, _)| self.settings.enabled(p))
-            .flat_map(|(_, r)| r.iter());
+        let all = enabled_readings(&self.by_provider, &self.settings);
         let mut kept: Vec<&Reading> = Vec::new();
         for r in all.clone() {
-            if r.source == "bluetooth"
-                && preferred_duplicate(
-                    r,
-                    all.clone().filter(|o| {
-                        o.source != "bluetooth"
-                            && o.source != "xinput"
-                            && o.online()
-                            && o.level.is_some()
-                    }),
-                )
-            {
-                continue;
-            }
-            if r.source == "xinput"
-                && r.via == "bluetooth"
-                && preferred_duplicate(
-                    r,
-                    all.clone().filter(|o| {
-                        o.source == "bluetooth"
-                            && o.kind == "gamepad"
-                            && o.online()
-                            && o.level.is_some()
-                    }),
-                )
-            {
+            if !reading_eligible(r, all.clone()) {
                 continue;
             }
             if let Some(i) = kept.iter().position(|o| o.key == r.key) {
-                if r.online()
-                    && (!kept[i].online()
-                        || (r.level.is_some() && (kept[i].level.is_none() || r.via == "usb")))
-                {
+                if reading_replaces(kept[i], r) {
                     kept[i] = r;
                 }
             } else {
@@ -628,6 +610,38 @@ impl Engine {
     }
 }
 
+fn enabled_readings<'a>(
+    providers: &'a BTreeMap<String, Vec<Reading>>,
+    settings: &'a Settings,
+) -> impl Iterator<Item = &'a Reading> + Clone {
+    providers
+        .iter()
+        .filter(move |(p, _)| settings.enabled(p))
+        .flat_map(|(_, r)| r.iter())
+}
+fn reading_eligible<'a>(r: &Reading, all: impl Iterator<Item = &'a Reading> + Clone) -> bool {
+    if r.source == "bluetooth" {
+        return !preferred_duplicate(
+            r,
+            all.filter(|o| {
+                o.source != "bluetooth" && o.source != "xinput" && o.online() && o.level.is_some()
+            }),
+        );
+    }
+    if r.source == "xinput" && r.via == "bluetooth" {
+        return !preferred_duplicate(
+            r,
+            all.filter(|o| {
+                o.source == "bluetooth" && o.kind == "gamepad" && o.online() && o.level.is_some()
+            }),
+        );
+    }
+    true
+}
+fn reading_replaces(old: &Reading, new: &Reading) -> bool {
+    new.online()
+        && (!old.online() || (new.level.is_some() && (old.level.is_none() || new.via == "usb")))
+}
 fn sound_identities(r: &Reading) -> [Option<String>; 3] {
     [
         Some(format!("key:{}", r.key)),

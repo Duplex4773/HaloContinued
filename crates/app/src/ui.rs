@@ -6816,6 +6816,20 @@ fn append_polling_menu(menu: HMENU, choices: &[TrayPollingChoice]) -> windows::c
         Ok(())
     }
 }
+/// Escape data captions directly into the required native text buffer. Device
+/// names are literal text; only the application's action labels use mnemonics.
+fn wide_menu_data(value: &str) -> Vec<u16> {
+    let escapes = value.bytes().filter(|byte| *byte == b'&').count();
+    let mut text = Vec::with_capacity(value.len() + escapes + 1);
+    for unit in value.encode_utf16() {
+        text.push(unit);
+        if unit == u16::from(b'&') {
+            text.push(unit);
+        }
+    }
+    text.push(0);
+    text
+}
 fn popup_menu(
     snapshot: &Snapshot,
     settings: &Settings,
@@ -6825,7 +6839,7 @@ fn popup_menu(
         let menu = Popup(CreatePopupMenu()?);
         if let Some(d) = key.and_then(|key| snapshot.devices.iter().find(|d| d.reading.key == key))
         {
-            let text = wide(&d.text);
+            let text = wide_menu_data(&d.text);
             let _ = AppendMenuW(menu.0, MF_STRING | MF_DISABLED, 0, PCWSTR(text.as_ptr()));
             let _ = AppendMenuW(menu.0, MF_STRING, 503, w!("Device &settings"));
             let _ = AppendMenuW(menu.0, MF_STRING, 504, w!("Battery &history"));
@@ -6842,7 +6856,7 @@ fn popup_menu(
                 .filter(|(_, d)| !d.hidden && Some(d.reading.key.as_str()) != key)
             {
                 others = true;
-                let text = wide(&d.text);
+                let text = wide_menu_data(&d.text);
                 let _ = AppendMenuW(menu.0, MF_STRING, 600 + i, PCWSTR(text.as_ptr()));
             }
             if others {
@@ -7093,6 +7107,47 @@ mod popup_tests {
         assert_eq!(menu_text(renamed.0, 0), "Renamed mouse: sleeping");
         assert!(!menu_text(renamed.0, 0).contains('\n'));
     }
+    #[test]
+    fn device_popup_keeps_literal_ampersands_and_does_not_create_device_mnemonics() {
+        let _guard = NATIVE_TEST_LOCK.lock().unwrap();
+        let settings = Settings {
+            fluent_menu: true,
+            ..Settings::default()
+        };
+        let snapshot = Snapshot {
+            devices: ["Headset & speakers 雪", "Mouse && keyboard"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| DeviceView {
+                    reading: Reading::new(format!("synthetic:{index}"), name, "test", 0),
+                    name: name.into(),
+                    icon: "mouse".into(),
+                    low_alert_at: 20,
+                    seconds_left: None,
+                    text: format!("{name}: 70%"),
+                    hidden: false,
+                })
+                .collect(),
+            ..Snapshot::default()
+        };
+        let menu = popup_menu(&snapshot, &settings, Some("synthetic:0")).unwrap();
+        for (id, text) in [
+            (0, "Headset && speakers 雪: 70%"),
+            (601, "Mouse &&&& keyboard: 70%"),
+        ] {
+            let index = (0..unsafe { GetMenuItemCount(Some(menu.0)) })
+                .find(|i| unsafe { GetMenuItemID(menu.0, *i) } == id)
+                .unwrap();
+            let label = menu_text(menu.0, index as u32);
+            assert_eq!(label, text);
+            assert_eq!(
+                menu_mnemonic(&label.encode_utf16().collect::<Vec<_>>()),
+                None
+            );
+        }
+        assert!(menu_text(menu.0, 1).contains("&settings"));
+    }
+
     #[test]
     fn placeholder_popup_has_no_device_controls_or_icon_picker() {
         let _guard = NATIVE_TEST_LOCK.lock().unwrap();
