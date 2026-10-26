@@ -36,6 +36,11 @@ use windows::{
 const TRAY: u32 = WM_APP + 1;
 const PAGE_TOP: i32 = 60;
 const PAGE_FOOTER: i32 = 62;
+#[path = "device_information.rs"]
+mod device_information;
+#[path = "device_overview.rs"]
+mod device_overview;
+use device_information::DeviceInfoUi;
 const ICON_CHOICES: &[&str] = &[
     "Automatic",
     "Mouse",
@@ -162,6 +167,7 @@ fn user_message(message: &str) -> &str {
         || message == "Device preferences reset"
         || message == "Automatic boost settings saved"
         || message == "Low-battery settings saved"
+        || message == "Device monitoring stopped. Restart Halo Continued."
     {
         return message;
     }
@@ -170,6 +176,12 @@ fn user_message(message: &str) -> &str {
     }
     if message.starts_with("History") {
         return "Couldn't load battery history. Select Refresh to try again.";
+    }
+    if message.starts_with("Automatic recovery data could not be read") {
+        return "Couldn't read saved recovery data. Device changes are paused; save a support report.";
+    }
+    if message.starts_with("An earlier manual device change was interrupted") {
+        return "An interrupted change needs checking. Open the device and read its current setting.";
     }
     if message.starts_with("Storage") {
         return "Couldn't save this change. Try again or save a support report.";
@@ -363,6 +375,23 @@ mod tray_theme_cache_tests {
         assert!(cache.read(now + Duration::from_secs(2), "black", false, sample));
         assert_eq!(calls.get(), 4);
     }
+    #[test]
+    fn repeated_theme_samples_reuse_the_cached_setting_string() {
+        let mut cache = TrayThemeCache::default();
+        let now = Instant::now();
+        cache.read(now, "auto", false, || false);
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for seconds in 1..=1000 {
+                cache.read(
+                    now + Duration::from_secs(seconds * 3),
+                    "auto",
+                    false,
+                    || false,
+                );
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+    }
 }
 impl TrayThemeCache {
     fn read(
@@ -380,7 +409,14 @@ impl TrayThemeCache {
             return *value;
         }
         let value = query();
-        self.value = Some((now, icon_theme.to_owned(), value));
+        if let Some((sampled, key, cached)) = &mut self.value
+            && key.as_str() == icon_theme
+        {
+            *sampled = now;
+            *cached = value;
+        } else {
+            self.value = Some((now, icon_theme.to_owned(), value));
+        }
         value
     }
 }
@@ -396,6 +432,7 @@ fn tray_message_update(message: u32, taskbar_created: u32) -> Option<TrayUpdate>
 #[derive(Default)]
 struct TrayRegistration {
     registered: bool,
+    pending_modify: bool,
 }
 impl TrayRegistration {
     fn update_with(
@@ -407,13 +444,19 @@ impl TrayRegistration {
     ) {
         if !self.registered {
             self.registered = notify(NIM_ADD, data);
-        } else if (changed || update != TrayUpdate::Changed)
-            && !notify(NIM_MODIFY, data)
-            && update == TrayUpdate::ExplorerRecovery
-        {
-            // Explorer may still own the GUID. Add only after it reports the
-            // icon missing; deleting an existing icon loses its pinned placement.
-            self.registered = notify(NIM_ADD, data);
+            self.pending_modify = false;
+        } else if changed || self.pending_modify || update != TrayUpdate::Changed {
+            if notify(NIM_MODIFY, data) {
+                self.pending_modify = false;
+            } else if update == TrayUpdate::ExplorerRecovery {
+                // Explorer may still own the GUID. Add only after it reports the
+                // icon missing; deleting an existing icon loses pinned placement.
+                self.registered = notify(NIM_ADD, data);
+                self.pending_modify = false;
+            } else {
+                // Keep the existing GUID and retry the latest update on heartbeat.
+                self.pending_modify = true;
+            }
         }
     }
     fn remove_with(
@@ -425,6 +468,7 @@ impl TrayRegistration {
             let _ = notify(NIM_DELETE, data);
             self.registered = false;
         }
+        self.pending_modify = false;
     }
 }
 fn shell_notify(command: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
@@ -461,6 +505,7 @@ struct PollingUi {
     pending: Option<PendingPolling>,
     observations: BTreeMap<String, PollingObservation>,
     previous: BTreeMap<String, PollingRate>,
+    previous_devices: BTreeMap<String, Box<ConfigurationDevice>>,
     status: BTreeMap<String, String>,
 }
 impl PollingUi {
@@ -481,9 +526,14 @@ impl PollingUi {
                 && let Some(previous) = outcome.previous
             {
                 self.previous.insert(outcome.key.clone(), previous);
+                self.previous_devices.insert(
+                    outcome.key.clone(),
+                    Box::new(observation.target.device.clone()),
+                );
             }
         } else {
             self.previous.remove(&outcome.key);
+            self.previous_devices.remove(&outcome.key);
         }
     }
     fn revoke_observation(&mut self, key: &str) {
@@ -501,6 +551,7 @@ impl PollingUi {
         self.generation = generation;
         self.observations.clear();
         self.previous.clear();
+        self.previous_devices.clear();
         self.status.clear();
         self.pending = None;
     }
@@ -527,7 +578,18 @@ impl PollingUi {
             keys.contains(key.as_str())
                 && inventory_contains_device(batteries, configuration, &observation.target.device)
         });
-        self.previous.retain(|key, _| keys.contains(key.as_str()));
+        self.previous.retain(|key, _| {
+            keys.contains(key.as_str())
+                && self.previous_devices.get(key).is_some_and(|device| {
+                    batteries.iter().any(|b| device.matches_reading(&b.reading))
+                        || configuration.iter().any(|d| {
+                            DeviceDescriptorRef::from(d)
+                                .same_identity(DeviceDescriptorRef::from(device.as_ref()))
+                        })
+                })
+        });
+        self.previous_devices
+            .retain(|key, _| self.previous.contains_key(key));
         self.status.retain(|key, _| keys.contains(key.as_str()));
         if self.pending.as_ref().is_some_and(|pending| {
             !inventory_contains_device(batteries, configuration, &pending.device)
@@ -555,6 +617,13 @@ impl PollingUi {
         intent: PollingIntent,
         tray: bool,
     ) -> Result<ControlRequest, &'static str> {
+        if self.previous_devices.get(&reading.key).is_some_and(|old| {
+            !DeviceDescriptorRef::from(old.as_ref())
+                .same_identity(DeviceDescriptorRef::from(&reading))
+        }) {
+            self.previous.remove(&reading.key);
+            self.previous_devices.remove(&reading.key);
+        }
         if self.pending.is_some() {
             return Err("A device request is already pending");
         }
@@ -661,6 +730,8 @@ impl PollingUi {
                 && (rate != previous || outcome.failure.is_some())
             {
                 self.previous.insert(outcome.key.clone(), previous);
+                self.previous_devices
+                    .insert(outcome.key.clone(), Box::new(pending.device.clone()));
             }
         }
         let observed = outcome.observation.as_ref().and_then(|o| o.rate);
@@ -1260,11 +1331,15 @@ struct State {
     configuration_generation: u64,
     configuration_failure: Option<String>,
     chart: Option<Chart>,
+    chart_retry: Option<Instant>,
     theme: Option<Rc<DashboardTheme>>,
     series: HistorySeries,
     history: HistorySelection,
     history_resize: HistoryResize,
     request: u64,
+    history_pending: Option<u64>,
+    history_cache_active: bool,
+    history_queued: Option<Box<Command>>,
     taskbar: u32,
     notify: Option<HDEVNOTIFY>,
     animating: bool,
@@ -1272,17 +1347,23 @@ struct State {
     error: String,
     font: HFONT,
     heading_font: HFONT,
+    small_font: HFONT,
+    section_font: HFONT,
     font_dpi: u32,
     page_host: Option<HWND>,
     page_scroll: i32,
     wheel_remainder: i32,
     page_height: i32,
     more_options: bool,
+    device_section: u16,
+    control_details: bool,
+    overview_keys: Vec<String>,
     polling: PollingUi,
     tray_polling: PollingUi,
     insights: InsightsUi,
     sleep: SleepUi,
     dpi: DpiUi,
+    information: DeviceInfoUi,
     polling_intents: BTreeMap<String, (u64, PollingRate)>,
     tooltip_rates: BTreeMap<String, PollingObservation>,
 }
@@ -1305,6 +1386,8 @@ struct FormDraft {
 #[derive(Default)]
 struct SleepUi {
     saver_key: Option<String>,
+    details: bool,
+    saver_details: bool,
     next: u64,
     shown_key: Option<String>,
     pending: Option<(u64, String)>,
@@ -1460,11 +1543,15 @@ pub fn run(
                 configuration_generation: 0,
                 configuration_failure: None,
                 chart: None,
+                chart_retry: None,
                 theme: None,
                 series: HistorySeries::default(),
                 history: HistorySelection::default(),
                 history_resize: HistoryResize::default(),
                 request: 0,
+                history_pending: None,
+                history_cache_active: false,
+                history_queued: None,
                 taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
                 notify: None,
                 animating: false,
@@ -1472,17 +1559,23 @@ pub fn run(
                 error: initial_error.unwrap_or_default(),
                 font: HFONT::default(),
                 heading_font: HFONT::default(),
+                small_font: HFONT::default(),
+                section_font: HFONT::default(),
                 font_dpi: 0,
                 page_host: None,
                 page_scroll: 0,
                 wheel_remainder: 0,
                 page_height: 0,
                 more_options: false,
+                device_section: 0,
+                control_details: false,
+                overview_keys: Vec::new(),
                 polling: PollingUi::default(),
                 tray_polling: PollingUi::default(),
                 insights: InsightsUi::default(),
                 sleep: SleepUi::default(),
                 dpi: DpiUi::default(),
+                information: DeviceInfoUi::default(),
                 polling_intents: BTreeMap::new(),
                 tooltip_rates: BTreeMap::new(),
             }),
@@ -1560,6 +1653,8 @@ pub fn run(
         let _ = DestroyWindow(state.monitor);
         let _ = DeleteObject(state.font.into());
         let _ = DeleteObject(state.heading_font.into());
+        let _ = DeleteObject(state.small_font.into());
+        let _ = DeleteObject(state.section_font.into());
         state.runtime.stop();
         let _ = UnregisterClassW(class, Some(instance.into()));
         Ok(())
@@ -1740,31 +1835,16 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     .iter()
                     .find(|(_, t)| t.data.uID == wp.0 as u32)
                     .map(|(key, _)| key.clone());
-                let mut selection_changed = false;
-                if let Some(key) = &key
-                    && let Some(i) = s
-                        .snapshot
-                        .devices
-                        .iter()
-                        .position(|d| &d.reading.key == key)
-                {
-                    selection_changed =
-                        s.selected != i || s.selected_device.as_deref() != Some(key.as_str());
-                    s.selected_device = Some(key.clone());
-                    s.selected = i;
-                    if selection_changed {
-                        s.polling.abandon();
-                        s.insights.abandon();
-                        if s.dashboard.is_some() && matches!(s.page, 1 | 2 | 6) {
-                            s.page_scroll = 0;
-                            s.build();
-                            s.query_insights();
-                        }
-                    }
-                }
                 if opens_menu {
-                    s.menu(key.clone())
+                    // Merely opening or dismissing the menu must not replace
+                    // a dashboard selection or its unsaved form.
+                    s.menu(key)
                 } else if opens_dashboard {
+                    let selection_changed =
+                        key.as_deref().is_some_and(|key| s.select_tray_device(key));
+                    if selection_changed {
+                        s.refresh_tray_selection();
+                    }
                     let was_open = s.dashboard.is_some();
                     s.open();
                     if selection_changed && was_open {
@@ -1829,6 +1909,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 if Some(hwnd) == s.dashboard && wp.0 as u32 != SIZE_MINIMIZED {
                     s.layout_page();
+                    if s.page == 1 && s.device_section == 4 {
+                        s.read_device_information(false);
+                    }
                 }
                 if Some(hwnd) == s.dashboard && s.page == 2 && wp.0 as u32 != SIZE_MINIMIZED {
                     if s.history_resize.changed() {
@@ -1885,8 +1968,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 if Some(hwnd) == s.dashboard && s.page == 2 {
                     let mut r = RECT::default();
                     let _ = GetClientRect(hwnd, &mut r);
-                    if s.chart.is_none() {
-                        s.chart = Chart::new(hwnd, r.right as u32, r.bottom as u32).ok()
+                    if s.chart.is_none()
+                        && s.chart_retry
+                            .is_none_or(|deadline| Instant::now() >= deadline)
+                    {
+                        s.chart = Chart::new(hwnd, r.right as u32, r.bottom as u32).ok();
+                        s.chart_retry = s
+                            .chart
+                            .is_none()
+                            .then(|| Instant::now() + Duration::from_secs(5));
                     }
                     if let Some(c) = &s.chart
                         && s.theme.as_ref().is_some_and(|theme| {
@@ -1900,6 +1990,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         })
                     {
                         s.chart = None;
+                        s.chart_retry = Some(Instant::now() + Duration::from_secs(5));
                     }
                 }
                 let _ = EndPaint(hwnd, &ps);
@@ -1968,7 +2059,8 @@ unsafe fn dashboard_paint_message(
         unsafe {
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
-            FillRect(HDC(wp.0 as *mut _), &rect, theme.background_brush());
+            let dc = HDC(wp.0 as *mut _);
+            FillRect(dc, &rect, theme.background_brush());
         }
         return Some(LRESULT(i32::from(msg == WM_ERASEBKGND) as isize));
     }
@@ -1982,7 +2074,7 @@ struct DashboardRedraw {
     paused: bool,
 }
 fn is_fixed_control(id: u16) -> bool {
-    matches!(id, 1..=7 | 78 | 95 | 97 | 210)
+    matches!(id, 1..=8 | 78 | 95 | 97 | 210)
 }
 // One ordinary child window clips scrolling controls below the navigation.
 // It exists only with a dashboard; it owns no images, fonts or timers.
@@ -2027,6 +2119,32 @@ unsafe extern "system" fn page_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
                 FillRect(dc, &rect, theme.background_brush());
+                // Paint panel backgrounds before native children, including WM_PRINT.
+                // Hidden layout anchors retain their geometry while scrolling; no
+                // child surface can cover labels created by a hardware refresh.
+                for id in 460..=463 {
+                    if let Ok(panel) = GetDlgItem(Some(hwnd), id)
+                        && GetWindowLongPtrW(panel, GWLP_USERDATA) == 1
+                    {
+                        let mut bounds = RECT::default();
+                        let _ = GetClientRect(panel, &mut bounds);
+                        let points = std::slice::from_raw_parts_mut(
+                            &mut bounds as *mut RECT as *mut POINT,
+                            2,
+                        );
+                        MapWindowPoints(Some(panel), Some(hwnd), points);
+                        bounds.right -= 1;
+                        bounds.bottom -= 1;
+                        let diameter = 20 * GetDpiForWindow(hwnd).max(96) as i32 / 96;
+                        crate::dashboard_theme::rounded_surface(
+                            dc,
+                            &bounds,
+                            theme.palette.surface,
+                            theme.palette.border,
+                            diameter,
+                        );
+                    }
+                }
                 if msg == WM_PAINT {
                     let _ = EndPaint(hwnd, &paint);
                 }
@@ -2209,6 +2327,10 @@ impl State {
             let _ = GetClientRect(hwnd, &mut rect);
         }
         let height = rect.bottom * 96 / dpi;
+        let width = rect.right * 96 / dpi;
+        self.position_control(4, (width - 160).max(660), 12, 120, 34);
+        self.position_control(8, 0, 58, width, 1);
+        self.arrange_overview();
         if let Some(host) = self.page_host {
             unsafe {
                 let _ = SetWindowPos(
@@ -2232,8 +2354,8 @@ impl State {
         }
         match self.page {
             1 => {
-                self.position_control(5, 20, height - 46, 205, 30);
-                self.position_control(95, 245, height - 49, 535, 46);
+                self.position_control(5, 24, height - 45, 155, 34);
+                self.position_control(95, 200, height - 45, (width - 240).max(1), 38);
             }
             3 => {
                 self.position_control(210, 20, height - 46, 160, 30);
@@ -2409,6 +2531,7 @@ impl State {
             return;
         }
         self.dashboard = None;
+        self.information.clear();
         self.page_host = None;
         self.page_scroll = 0;
         self.wheel_remainder = 0;
@@ -2416,6 +2539,7 @@ impl State {
         self.history_resize = HistoryResize::default();
         self.configuration_visibility();
         self.chart = None;
+        self.chart_retry = None;
         self.release_history();
         self.theme = None;
         unsafe {
@@ -2435,13 +2559,18 @@ impl State {
         self.insights.key = None;
         self.insights.status = String::new();
         self.controls.clear();
+        self.overview_keys = Vec::new();
         self.device_form_key = None;
         unsafe {
             let _ = DeleteObject(self.font.into());
             let _ = DeleteObject(self.heading_font.into());
+            let _ = DeleteObject(self.small_font.into());
+            let _ = DeleteObject(self.section_font.into());
         }
         self.font = HFONT::default();
         self.heading_font = HFONT::default();
+        self.small_font = HFONT::default();
+        self.section_font = HFONT::default();
         self.font_dpi = 0;
     }
     fn close_dashboard(&mut self, hwnd: HWND) {
@@ -2694,6 +2823,9 @@ impl State {
                     let _ = ShowWindow(h, SW_RESTORE);
                     self.configuration_visibility();
                     let _ = SetForegroundWindow(h);
+                    if self.page == 1 && self.device_section == 4 {
+                        self.read_device_information(false);
+                    }
                     return;
                 }
                 self.dashboard_destroyed(h);
@@ -2713,7 +2845,7 @@ impl State {
                 x,
                 y,
                 840 * dpi / 96,
-                780 * dpi / 96,
+                880 * dpi / 96,
                 None,
                 None,
                 None,
@@ -2758,6 +2890,9 @@ impl State {
                     self.configuration_visibility();
                     self.read_polling();
                     self.query_insights();
+                    if self.page == 1 && self.device_section == 4 {
+                        self.read_device_information(false);
+                    }
                     let _ = SetForegroundWindow(h);
                 }
                 Err(e) => self.error = e.to_string(),
@@ -2796,6 +2931,7 @@ impl State {
         self.device_form_key = current_key;
         let _redraw = DashboardRedraw::new(hwnd);
         self.chart = None;
+        self.chart_retry = None;
         if self.page != 2 {
             self.release_history();
         }
@@ -2813,6 +2949,8 @@ impl State {
             if self.font_dpi != dpi || self.font.is_invalid() {
                 let _ = DeleteObject(self.font.into());
                 let _ = DeleteObject(self.heading_font.into());
+                let _ = DeleteObject(self.small_font.into());
+                let _ = DeleteObject(self.section_font.into());
                 let make_font = |height: i32, weight| {
                     CreateFontW(
                         -height * dpi as i32 / 96,
@@ -2831,8 +2969,10 @@ impl State {
                         w!("Segoe UI"),
                     )
                 };
-                self.font = make_font(15, 400);
-                self.heading_font = make_font(20, 600);
+                self.font = make_font(14, 400);
+                self.heading_font = make_font(22, 600);
+                self.small_font = make_font(12, 400);
+                self.section_font = make_font(16, 600);
                 self.font_dpi = dpi;
             }
         }
@@ -2856,9 +2996,9 @@ impl State {
                     } else {
                         WINDOW_STYLE::default()
                     },
-                20 + i as i32 * 116,
-                16,
-                108,
+                16 + i as i32 * 78,
+                12,
+                76,
                 32,
             );
             unsafe {
@@ -2871,6 +3011,7 @@ impl State {
             }
         }
         self.button(4, "&Refresh", 660, 16, 120);
+        self.widget(8, "", 0, 58, 840, 1);
         self.prepare_page();
         let names: Vec<_> = self
             .snapshot
@@ -3215,8 +3356,9 @@ impl State {
             6 => self.build_insights(&names),
             _ => {}
         }
-        self.layout_page();
+        self.build_overview();
         self.restore_form(draft);
+        self.layout_page();
         drop(_redraw);
         if let Some(h) = focused.and_then(|id| self.controls.get(&id))
             && unsafe { IsWindowVisible(*h).as_bool() }
@@ -3675,7 +3817,7 @@ impl State {
             ),
             _ => "Fixed-rate comparison is still learning".into(),
         };
-        self.set_control_text(411,&format!("Automatic boost · last 7 days\nBoosts · {}    Restores · {}\n{} during confirmed boosts\nManual choices · {}\n{}\n{}\nRecorded use is not gaming time",recent.boost_sessions,recent.restores,insight_hours(recent.boost_seconds),recent.manual_changes,
+        self.set_control_text(411,&format!("Automatic boost · last 7 days\nBoosts · {}    Restores · {}\n{} during confirmed boosts\nManual choices · {}\nBattery saver · {} changes / {} restores\n{} with battery saver\n{}\n{}\nRecorded use is not gaming time",recent.boost_sessions,recent.restores,insight_hours(recent.boost_seconds),recent.manual_changes,recent.saver_changes,recent.saver_restores,insight_hours(recent.saver_seconds),
             boost.map(|r|format!("Boost setting · {} Hz",r.hz())).unwrap_or_else(||"Current setting · Off".into()),comparison));
     }
     fn save(&mut self) {
@@ -3684,7 +3826,51 @@ impl State {
     }
     fn command(&mut self, id: u16, notification: u16) {
         match id {
+            1000..=32767 if self.page == 1 => self.overview_select((id - 1000) as usize),
+            17..=19 | 22 | 24 if self.page == 1 => {
+                let section = match id {
+                    22 => 3,
+                    24 => 4,
+                    _ => id - 17,
+                };
+                if section != self.device_section {
+                    self.information.clear();
+                }
+                self.device_section = section;
+                if section == 2
+                    && self.current_device().is_some_and(|(d, _)| {
+                        self.dpi.attempted.as_ref() != Some(&(d.key, self.polling.generation))
+                    })
+                    && self.dpi.pending.is_none()
+                {
+                    self.queue_dpi(None);
+                    self.polling_controls();
+                }
+                self.page_scroll = 0;
+                let _redraw = self.dashboard.map(DashboardRedraw::new);
+                self.layout_page();
+                if self.device_section == 4 {
+                    self.read_device_information(false);
+                }
+            }
+            23 if self.page == 1 => {
+                if self.device_section == 1 {
+                    self.sleep.details = !self.sleep.details;
+                } else {
+                    self.control_details = !self.control_details;
+                }
+                let _redraw = self.dashboard.map(DashboardRedraw::new);
+                self.layout_page();
+            }
+            473 if self.page == 1 && self.device_section == 1 => {
+                self.sleep.saver_details = !self.sleep.saver_details;
+                let _redraw = self.dashboard.map(DashboardRedraw::new);
+                self.layout_page();
+            }
+            49 if notification == BN_CLICKED as u16 => self.command(51, 0),
+            50 if notification == CBN_SELCHANGE as u16 => self.command(51, 0),
             1..=3 | 6 => {
+                self.information.clear();
                 self.error.clear();
                 self.polling.abandon();
                 self.insights.abandon();
@@ -3693,9 +3879,17 @@ impl State {
                 self.configuration_visibility();
                 self.build();
                 self.read_polling();
-                self.query_insights()
+                self.query_insights();
+                if self.page == 1 && self.device_section == 4 {
+                    self.read_device_information(false);
+                }
             }
+            484 if self.page == 1 && self.device_section == 4 => self.read_device_information(true),
             4 => {
+                if self.page == 1 && self.device_section == 4 {
+                    self.read_device_information(true);
+                    return;
+                }
                 if self.page == 6 {
                     self.query_insights();
                     return;
@@ -3717,7 +3911,7 @@ impl State {
                     .collect();
                 let value = serde_json::json!({"data_folder":self.dir,"snapshot":self.snapshot,"providers":self.diagnostics,"settings":self.settings,"application_error":self.error,
                     "polling_messages":self.polling.status,"tray_polling_messages":self.tray_polling.status,
-                    "polling_readings":readings,"dpi_debug":format!("{:?}",self.dpi.outcome),"sleep_debug":format!("{:?}",self.sleep.outcome),"insights_debug":format!("{:?}",self.insights.data)});
+                    "polling_readings":readings,"dpi_debug":format!("{:?}",self.dpi.outcome),"sleep_debug":format!("{:?}",self.sleep.outcome),"insights_debug":format!("{:?}",self.insights.data),"device_information":self.information.diagnostics()});
                 self.error = match hb_storage::atomic_write(
                     &path,
                     &serde_json::to_vec_pretty(&value).unwrap(),
@@ -3771,7 +3965,38 @@ impl State {
                     self.polling_controls();
                 }
             }
-            446 => self.save_battery_saver(),
+            440 if self.page == 1 && notification == BN_CLICKED as u16 => {
+                // Enabling a new saver needs an explicit choice of rate/sleep.
+                // Never invent hardware settings to make a compact toggle work.
+                let configured = self.current_device().is_some_and(|(d, _)| {
+                    self.settings
+                        .device(&d.key)
+                        .is_some_and(|p| p.low_battery_mode.is_some())
+                });
+                if !self.checked(440) || configured {
+                    self.save_battery_saver();
+                } else {
+                    self.sleep.saver_details = true;
+                    self.set_control_text(
+                        95,
+                        "Choose a lower rate or shorter sleep time, then save Battery saver.",
+                    );
+                }
+                let _redraw = self.dashboard.map(DashboardRedraw::new);
+                self.layout_page();
+            }
+            469 if self.page == 1 && notification == CBN_SELCHANGE as u16 => {
+                self.save_overview_alert()
+            }
+            470 if self.page == 1 && notification == BN_CLICKED as u16 => {
+                self.settings.low_sound = self.checked(470);
+                self.save();
+            }
+            446 => {
+                self.save_battery_saver();
+                let _redraw = self.dashboard.map(DashboardRedraw::new);
+                self.layout_page();
+            }
             51 => {
                 if let Some(device) = self.visible_polling_device() {
                     let rate = if self.checked(49) {
@@ -3786,9 +4011,29 @@ impl State {
                         None
                     };
                     if self.checked(49) && rate.is_none() {
+                        let enabled = self
+                            .settings
+                            .device(&device.key)
+                            .is_some_and(|p| p.fullscreen_boost_rate.is_some());
+                        if let Some(control) = self.controls.get(&49) {
+                            unsafe {
+                                send(
+                                    *control,
+                                    BM_SETCHECK,
+                                    WPARAM(usize::from(enabled)),
+                                    LPARAM(0),
+                                );
+                            }
+                        }
+                        self.set_control_text(49, if enabled { "On" } else { "Off" });
+                        self.set_control_text(
+                            95,
+                            "Check the current polling rate before turning on game boost.",
+                        );
                         return;
                     }
                     self.settings.device_mut(&device.key).fullscreen_boost_rate = rate;
+                    self.set_control_text(49, if rate.is_some() { "On" } else { "Off" });
                     self.save();
                     self.error = "Automatic boost settings saved".into();
                     self.set_control_text(95, user_message(&self.error));
@@ -3988,7 +4233,28 @@ impl State {
                 self.keep_focus_visible();
             }
             503 => {
+                let was_open = self.dashboard.is_some();
                 self.page = 1;
+                self.device_section = 0;
+                self.page_scroll = 0;
+                self.configuration_visibility();
+                self.open();
+                self.build();
+                if was_open && self.polling.pending.is_none() {
+                    self.read_polling();
+                }
+            }
+            508 | 507 => {
+                self.page = 1;
+                self.device_section = if id == 508 { 1 } else { 3 };
+                self.page_scroll = 0;
+                self.configuration_visibility();
+                self.open();
+                self.build();
+            }
+            509 => {
+                self.page = 3;
+                self.page_scroll = 0;
                 self.configuration_visibility();
                 self.open();
                 self.build();
@@ -4014,16 +4280,23 @@ impl State {
                 }
             }
             600..=999 => {
-                self.selected = (id - 600) as usize;
-                self.selected_device = self
+                let key = self
                     .snapshot
                     .devices
-                    .get(self.selected)
+                    .get((id - 600) as usize)
                     .map(|d| d.reading.key.clone());
+                let Some(key) = key else {
+                    return;
+                };
+                self.select_tray_device(&key);
+                let was_open = self.dashboard.is_some();
                 self.page = 1;
                 self.configuration_visibility();
                 self.open();
                 self.build();
+                if was_open && self.polling.pending.is_none() {
+                    self.read_polling();
+                }
             }
             500 => self.open(),
             501 => self.runtime.send(Command::Refresh),
@@ -4088,12 +4361,16 @@ impl State {
             }
         }
     }
-    fn configuration_visibility(&self) {
+    fn configuration_visibility(&mut self) {
+        if !self.dashboard_visible() || self.page != 1 || self.device_section != 4 {
+            self.information.clear();
+        }
         self.runtime.send(Command::ConfigurationVisible(
             self.dashboard_visible() && self.page == 1,
         ));
     }
     fn invalidate_mouse_readbacks(&mut self) {
+        self.information.clear();
         // Keep request counters monotonic so late results cannot match a new
         // device's request. Preserve DPI backups on disk for the original unit.
         self.dpi = DpiUi {
@@ -4432,11 +4709,11 @@ impl State {
                 .unwrap_or(0);
             self.combo(50, &labels, selected, 20, 792, 230);
             self.button(51, "Save boost settings", 270, 792, 210);
-            self.enable_control(49, !pending);
+            self.enable_control(49, !pending && (!rates.is_empty() || saved.is_some()));
             self.enable_control(50, !pending && !rates.is_empty());
             self.enable_control(51, !pending && (!rates.is_empty() || saved.is_some()));
             self.control(52, w!("STATIC"),
-                "Uses Windows fullscreen gaming detection; some borderless games are missed.\r\nBoosts after 10 seconds; restores after 15 seconds back on the desktop.\r\nKeep this app running for restoration. Anti-cheat compatibility is not guaranteed.",
+                "Uses Windows fullscreen gaming detection; some borderless games are missed.\r\nBoosts after 10 seconds; restores after 15 seconds back on the desktop.\r\nRestores after restart when possible. Anti-cheat compatibility isn't guaranteed.",
                 WINDOW_STYLE::default(), 20, 838, 750, 62);
         }
     }
@@ -4525,7 +4802,8 @@ impl State {
         if device.kind != "mouse" || !hb_providers::dpi::candidate(&device) {
             return;
         }
-        if self.dpi.attempted.as_ref() != Some(&(device.key.clone(), self.polling.generation))
+        if self.device_section == 2
+            && self.dpi.attempted.as_ref() != Some(&(device.key.clone(), self.polling.generation))
             && self.dpi.pending.is_none()
         {
             self.queue_dpi(None);
@@ -4651,8 +4929,10 @@ impl State {
                 let m = seconds / 60;
                 if m == 0 {
                     "Never".into()
+                } else if m == 1 {
+                    "1 minute".into()
                 } else {
-                    format!("{m} min")
+                    format!("{m} minutes")
                 }
             })
             .collect();
@@ -4701,11 +4981,11 @@ impl State {
                 device_control_error(error, o.may_have_changed, "sleep time", model.readable())
             } else if let Some(seconds) = o.seconds {
                 if seconds == 0 {
-                    "Current sleep time: Never.".into()
+                    "Last checked sleep time: Never.".into()
                 } else if seconds % 60 == 0 {
-                    format!("Current sleep time: {} min.", seconds / 60)
+                    format!("Last checked sleep time: {} min.", seconds / 60)
                 } else {
-                    format!("Current sleep time: {seconds} seconds.")
+                    format!("Last checked sleep time: {seconds} seconds.")
                 }
             } else {
                 "Sleep time sent. This mouse cannot confirm the value; check its sleep behaviour."
@@ -4842,7 +5122,7 @@ impl State {
             220,
         );
         self.button(446, "Save low-battery settings", 20, y + 180, 280);
-        self.control(447, w!("STATIC"), "Gaming boost takes priority. On the desktop, only lower rates and shorter sleep times are applied.\r\nPrevious settings return when charging or 5% above your threshold. Keep Halo running to restore them.\r\nManual changes take priority. Enable device changes in Settings to use this mode.", WINDOW_STYLE::default(), 20, y + 230, 750, 78);
+        self.control(447, w!("STATIC"), "Gaming boost takes priority. Only lower rates and shorter sleep times are applied.\r\nPrevious settings return when possible after charging or 5% above the threshold.\r\nHalo can recover settings after a restart. Reconnect wirelessly if needed.", WINDOW_STYLE::default(), 20, y + 230, 750, 78);
         for id in [440, 442, 444, 445, 446] {
             self.enable_control(id, self.settings.polling_controls);
         }
@@ -4937,6 +5217,9 @@ impl State {
         self.polling_controls();
     }
     fn read_polling(&mut self) {
+        if self.page == 1 && self.device_section == 4 {
+            return;
+        }
         if self.dashboard_visible()
             && let Some(reading) = self.visible_polling_device()
             && reading.online()
@@ -5061,6 +5344,10 @@ impl State {
                     self.tray_polling
                         .previous
                         .insert(outcome.key.clone(), previous);
+                    self.tray_polling.previous_devices.insert(
+                        outcome.key.clone(),
+                        Box::new(observation.target.device.clone()),
+                    );
                 }
             } else if let Some(failure) = &outcome.failure {
                 self.tray_polling.status.insert(
@@ -5125,13 +5412,30 @@ impl State {
         }
     }
     fn release_history(&mut self) {
+        self.history_queued = None;
+        self.try_release_history_cache();
         self.request = self.request.wrapping_add(1);
         self.series = HistorySeries {
             axis: self.history.axis,
             ..Default::default()
         };
     }
+    fn try_release_history_cache(&mut self) {
+        if self.history_cache_active && self.runtime.release_history_cache() {
+            self.history_cache_active = false;
+        }
+    }
     fn history_outcome(&mut self, id: u64, result: Result<HistorySeries, ProviderError>) {
+        if self.history_pending == Some(id) {
+            self.history_pending = None;
+            if let Some(command) = self.history_queued.take()
+                && self.dashboard.is_some()
+                && self.page == 2
+            {
+                self.submit_history(*command);
+                return;
+            }
+        }
         if self.dashboard.is_none() || self.page != 2 || id != self.request {
             return;
         }
@@ -5164,6 +5468,7 @@ impl State {
             ..Default::default()
         };
         let Some(d) = self.snapshot.devices.get(self.selected) else {
+            self.history_queued = None;
             self.set_control_text(97, "Connect a battery-powered device to see its history.");
             return;
         };
@@ -5176,17 +5481,35 @@ impl State {
                 let _ = InvalidateRect(Some(h), None, false);
             }
         }
-        let result = self.runtime.request_history(self.history.command(
+        let command = self.history.command(
             d.reading.key.clone(),
             until,
             (r.right - 80).max(20) as usize,
             self.request,
-        ));
-        if let Err(error) = result {
-            self.history_outcome(self.request, Err(error));
+        );
+        if self.history_pending.is_some() {
+            self.history_queued = Some(Box::new(command));
+        } else {
+            self.submit_history(command);
+        }
+    }
+    fn submit_history(&mut self, command: Command) {
+        let request = match &command {
+            Command::History { request, .. } | Command::UsageHistory { request, .. } => *request,
+            _ => return,
+        };
+        match self.runtime.request_history(command) {
+            Ok(()) => {
+                self.history_pending = Some(request);
+                self.history_cache_active = true;
+            }
+            Err(error) => self.history_outcome(request, Err(error)),
         }
     }
     fn drain(&mut self) {
+        // A full command queue may have deferred the resume acknowledgement.
+        // Existing events provide retry opportunities without another timer.
+        self.runtime.retry_pending_resume();
         let mut latest = None;
         let mut heartbeat = None;
         let mut polling_outcomes = Vec::new();
@@ -5232,6 +5555,7 @@ impl State {
                         self.polling_controls();
                     }
                 }
+                Event::DeviceInfo(outcome) => self.device_information_outcome(outcome),
                 Event::Dpi(outcome) => {
                     if self
                         .dpi
@@ -5259,6 +5583,8 @@ impl State {
                 }
                 Event::Polling(outcome) => polling_outcomes.push(*outcome),
                 Event::PollingInvalidated(generation) => {
+                    self.information.clear();
+                    self.render_device_information();
                     // Epoch changes revoke actionable evidence, not the labelled
                     // last-confirmed tooltip for a still-matching physical device.
                     // Snapshots remove missing/stale/replaced identities separately.
@@ -5301,7 +5627,7 @@ impl State {
         if let Some(timestamp) = heartbeat {
             self.snapshot.timestamp = timestamp;
             self.refresh_device_details();
-            self.sync_trays(TrayUpdate::Changed);
+            self.refresh_trays_on_heartbeat();
         }
         if let Some(s) = latest {
             for view in &s.devices {
@@ -5456,8 +5782,32 @@ impl State {
             self.polling_controls();
             self.read_polling();
         }
+        if self.page == 2
+            && self.chart.is_none()
+            && self
+                .chart_retry
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            && self.dashboard_visible()
+            && let Some(hwnd) = self.dashboard
+        {
+            // A lost Direct2D target retries on an existing app event. The
+            // deadline prevents repeated paints from spinning on failure.
+            self.chart_retry = None;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+        // Retry only after a busy queue rejected the release. The existing
+        // heartbeat wakes this path, so no additional timer is needed.
+        if self.dashboard.is_none() || self.page != 2 {
+            self.try_release_history_cache();
+        }
     }
     fn refresh_device_details(&self) {
+        if self.dashboard_visible() {
+            self.refresh_overview_cards();
+            self.render_device_information();
+        }
         if self.dashboard_visible()
             && self.page == 1
             && self.controls.contains_key(&91)
@@ -5465,6 +5815,45 @@ impl State {
         {
             self.set_control_text(91, &device_detail(&d));
             self.set_control_text(88, &battery_summary(&d));
+        }
+    }
+    fn refresh_trays_on_heartbeat(&mut self) {
+        let dark = self
+            .tray_theme
+            .read(Instant::now(), &self.settings.icon_theme, false, || {
+                tray_dark(&self.settings, false)
+            });
+        let mut visible = 0usize;
+        let mut needs_refresh = false;
+        for device in &self.snapshot.devices {
+            if device.hidden
+                || self
+                    .settings
+                    .device(&device.reading.key)
+                    .is_some_and(|p| p.hidden)
+            {
+                continue;
+            }
+            visible += 1;
+            needs_refresh |= self.trays.get(&device.reading.key).is_none_or(|tray| {
+                !tray.registration.registered
+                    || tray.registration.pending_modify
+                    || !tray.signature.matches(device, &self.settings, dark)
+            });
+        }
+        if visible == 0 {
+            needs_refresh = self.trays.len() != 1
+                || self.trays.get("application").is_none_or(|tray| {
+                    !tray.registration.registered
+                        || tray.registration.pending_modify
+                        || tray.signature.dark != dark
+                        || tray.signature.icon_theme != self.settings.icon_theme
+                });
+        } else {
+            needs_refresh |= self.trays.len() != visible;
+        }
+        if needs_refresh {
+            self.sync_trays(TrayUpdate::Changed);
         }
     }
     fn sync_trays(&mut self, update: TrayUpdate) {
@@ -5545,7 +5934,9 @@ impl State {
                 );
             }
         }
-        let animate = self.trays.values().any(|t| t.frames.len() > 1);
+        let animate = self.trays.values().any(|t| {
+            t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
+        });
         if animate != self.animating {
             unsafe {
                 if animate {
@@ -5558,14 +5949,50 @@ impl State {
         }
     }
     fn animate(&mut self) {
-        for t in self.trays.values_mut().filter(|t| t.frames.len() > 1) {
+        for t in self.trays.values_mut().filter(|t| {
+            t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
+        }) {
             t.frame = (t.frame + 1) % t.frames.len();
             let mut data = t.data;
             data.uFlags = NIF_GUID | NIF_ICON;
             data.hIcon = t.frames[t.frame].0;
-            unsafe {
-                let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+            if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+                t.registration.pending_modify = true;
             }
+        }
+        if !self.trays.values().any(|t| {
+            t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
+        }) {
+            unsafe {
+                let _ = KillTimer(Some(self.monitor), 2);
+            }
+            self.animating = false;
+        }
+    }
+    fn select_tray_device(&mut self, key: &str) -> bool {
+        let Some(index) = self
+            .snapshot
+            .devices
+            .iter()
+            .position(|device| device.reading.key == key)
+        else {
+            return false;
+        };
+        if self.selected == index && self.selected_device.as_deref() == Some(key) {
+            return false;
+        }
+        self.selected = index;
+        self.selected_device = Some(key.to_owned());
+        self.polling.abandon();
+        self.insights.abandon();
+        self.information.clear();
+        true
+    }
+    fn refresh_tray_selection(&mut self) {
+        if self.dashboard.is_some() && matches!(self.page, 1 | 2 | 6) {
+            self.page_scroll = 0;
+            self.build();
+            self.query_insights();
         }
     }
     fn menu(&mut self, key: Option<String>) {
@@ -5589,6 +6016,8 @@ impl State {
             if !choices.is_empty() && append_polling_menu(menu.0, &choices).is_err() {
                 return;
             }
+            let boost_choices = self.prepare_overview_menu(menu.0, key.as_deref());
+            let configuration_choices = self.append_configuration_menu(menu.0, key.as_deref());
             let palette = Palette::new(
                 hb_windows::system::dashboard_dark_theme(),
                 hb_windows::system::high_contrast(),
@@ -5621,8 +6050,64 @@ impl State {
                 if let Some(key) = key.as_deref() {
                     self.tray_polling_command(key, choice.action);
                 }
+            } else if let Some((_, rate)) =
+                boost_choices.iter().find(|(id, _)| *id == chosen.0 as u16)
+            {
+                if let Some(key) = key.as_deref() {
+                    self.settings.device_mut(key).fullscreen_boost_rate = *rate;
+                    self.save();
+                    self.polling_controls();
+                }
+            } else if let Some((_, selected)) = configuration_choices
+                .iter()
+                .find(|(id, _)| *id == chosen.0 as u16)
+            {
+                if self.selected_device.as_deref() != Some(selected.as_str()) {
+                    self.polling.abandon();
+                    self.insights.abandon();
+                    self.information.clear();
+                }
+                let was_open = self.dashboard.is_some();
+                self.selected_device = Some(selected.clone());
+                self.device_section = 0;
+                self.page = 1;
+                self.page_scroll = 0;
+                self.configuration_visibility();
+                self.open();
+                self.build();
+                if was_open && self.polling.pending.is_none() {
+                    self.read_polling();
+                }
+            } else if chosen.0 == 505 {
+                // Hiding the clicked icon does not require changing the open
+                // dashboard's selected device.
+                if let Some(key) = key.as_deref()
+                    && self.snapshot.devices.iter().any(|d| d.reading.key == key)
+                {
+                    self.settings.device_mut(key).hidden = true;
+                    self.save();
+                }
             } else if chosen.0 != 0 {
-                self.command(chosen.0 as u16, 0)
+                let was_open = self.dashboard.is_some();
+                let mut selection_changed = false;
+                if matches!(chosen.0, 500 | 503 | 504 | 506 | 507 | 508)
+                    && let Some(key) = key.as_deref()
+                {
+                    selection_changed = self.select_tray_device(key);
+                    if selection_changed && chosen.0 == 500 {
+                        // Open dashboard keeps the current page. The other
+                        // device actions build their own destination pages.
+                        self.refresh_tray_selection();
+                    }
+                }
+                self.command(chosen.0 as u16, 0);
+                if was_open
+                    && selection_changed
+                    && chosen.0 == 500
+                    && self.polling.pending.is_none()
+                {
+                    self.read_polling();
+                }
             }
             let _ = PostMessageW(Some(self.monitor), WM_APP + 7, WPARAM(0), LPARAM(0));
         }
@@ -5755,6 +6240,11 @@ fn icon_signature(d: &DeviceView, settings: &Settings, dark: bool) -> IconSignat
 }
 
 fn tray_dark(settings: &Settings, force: bool) -> bool {
+    match settings.icon_theme.as_str() {
+        "white" => return true,
+        "black" => return false,
+        _ => {}
+    }
     let fallback = hb_windows::system::dark_theme();
     if !["auto", "topbar"].contains(&settings.icon_theme.as_str())
         || !hb_windows::system::mydockfinder_running(force)
@@ -6264,6 +6754,12 @@ mod behaviour_tests {
         assert!(polling_message("Access denied by HID driver").contains("Wake the device"));
         assert!(polling_message("Cannot change rate during game").contains("Close the game"));
         assert!(user_message("Storage: SQLITE_CORRUPT").contains("Couldn't save"));
+        assert!(
+            user_message("Automatic recovery data could not be read: details").contains("paused")
+        );
+        assert!(
+            user_message("An earlier manual device change was interrupted.").contains("checking")
+        );
         assert!(user_message("History: SQLITE_BUSY").contains("Refresh"));
         assert!(!user_message("Exported private data-folder path").contains("private"));
         assert_eq!(
@@ -6321,6 +6817,8 @@ struct PopupItem {
     text: Vec<u16>,
     separator: bool,
     enabled: bool,
+    command: u32,
+    header: bool,
 }
 struct PopupAppearance {
     menu: HMENU,
@@ -6328,6 +6826,7 @@ struct PopupAppearance {
     palette: Palette,
     items: Vec<PopupItem>,
     font: HFONT,
+    heading_font: HFONT,
     background: HBRUSH,
     width: u32,
     row_height: u32,
@@ -6337,6 +6836,7 @@ impl Drop for PopupAppearance {
     fn drop(&mut self) {
         unsafe {
             let _ = DeleteObject(self.font.into());
+            let _ = DeleteObject(self.heading_font.into());
             let _ = DeleteObject(self.background.into());
         }
     }
@@ -6365,7 +6865,7 @@ impl PopupAppearance {
             let dpi = GetDpiForWindow(owner).max(96);
             let padding = (18 * dpi / 96) as i32;
             let font = CreateFontW(
-                -((16 * dpi / 96) as i32),
+                -((14 * dpi / 96) as i32),
                 0,
                 0,
                 0,
@@ -6386,12 +6886,31 @@ impl PopupAppearance {
                 palette,
                 items: Vec::new(),
                 font,
+                heading_font: CreateFontW(
+                    -((14 * dpi / 96) as i32),
+                    0,
+                    0,
+                    0,
+                    600,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    DEFAULT_PITCH.0 as u32,
+                    w!("Segoe UI"),
+                ),
                 background: CreateSolidBrush(palette.surface),
                 width: 0,
-                row_height: 34 * dpi / 96,
+                row_height: 40 * dpi / 96,
                 padding,
             };
-            if appearance.font.is_invalid() || appearance.background.is_invalid() {
+            if appearance.font.is_invalid()
+                || appearance.heading_font.is_invalid()
+                || appearance.background.is_invalid()
+            {
                 return None;
             }
             let hdc = GetDC(Some(owner));
@@ -6423,7 +6942,7 @@ impl PopupAppearance {
                 for index in 0..GetMenuItemCount(Some(menu)).max(0) as u32 {
                     let mut info = MENUITEMINFOW {
                         cbSize: size_of::<MENUITEMINFOW>() as u32,
-                        fMask: MIIM_FTYPE | MIIM_STATE | MIIM_SUBMENU | MIIM_DATA,
+                        fMask: MIIM_FTYPE | MIIM_STATE | MIIM_SUBMENU | MIIM_DATA | MIIM_ID,
                         ..Default::default()
                     };
                     if GetMenuItemInfoW(menu, index, true, &mut info).is_err() {
@@ -6452,6 +6971,11 @@ impl PopupAppearance {
                         text,
                         separator: info.fType.0 & MFT_SEPARATOR.0 != 0,
                         enabled: info.fState.0 & (MFS_DISABLED.0 | MFS_GRAYED.0) == 0,
+                        command: info.wID,
+                        header: menu == appearance.menu
+                            && index == 0
+                            && info.wID == 0
+                            && info.fType.0 & MFT_SEPARATOR.0 == 0,
                     });
                     if !info.hSubMenu.is_invalid() && !pending_menus.contains(&info.hSubMenu) {
                         pending_menus.push(info.hSubMenu);
@@ -6460,6 +6984,7 @@ impl PopupAppearance {
             }
             let _ = RestoreDC(hdc, saved);
             ReleaseDC(Some(owner), hdc);
+            appearance.width = appearance.width.clamp(260 * dpi / 96, 340 * dpi / 96);
             // Strings remain MIIM_STRING data for accessibility and inspection.
             for (index, item) in appearance.items.iter().enumerate() {
                 let info = MENUITEMINFOW {
@@ -6575,6 +7100,8 @@ impl PopupAppearance {
                 item.itemWidth = self.width;
                 item.itemHeight = if entry.separator {
                     (self.row_height / 3).max(1)
+                } else if entry.header {
+                    self.row_height * 2
                 } else {
                     self.row_height
                 };
@@ -6632,11 +7159,75 @@ impl PopupAppearance {
                     },
                 );
                 let mut text = entry.text.clone();
-                let mut flags = DT_SINGLELINE | DT_VCENTER;
+                let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
                 if item.itemState.0 & ODS_NOACCEL.0 != 0 {
                     flags |= DT_HIDEPREFIX;
                 }
-                if !text.is_empty() {
+                if entry.header {
+                    SelectObject(item.hDC, self.heading_font.into());
+                    let split = text.iter().position(|unit| *unit == 10);
+                    let title_end = split.unwrap_or(text.len());
+                    let mut title_rect = rect;
+                    title_rect.bottom = rect.top + self.row_height as i32;
+                    SetTextColor(item.hDC, self.palette.text);
+                    DrawTextW(item.hDC, &mut text[..title_end], &mut title_rect, flags);
+                    if let Some(split) = split {
+                        SelectObject(item.hDC, self.font.into());
+                        let mut detail_rect = rect;
+                        detail_rect.top = title_rect.bottom - self.row_height as i32 / 6;
+                        detail_rect.bottom -= self.row_height as i32 / 6;
+                        SetTextColor(item.hDC, self.palette.disabled);
+                        DrawTextW(item.hDC, &mut text[split + 1..], &mut detail_rect, flags);
+                    }
+                } else if !text.is_empty() {
+                    if entry.menu == self.menu {
+                        let kind = match entry.command {
+                            502 => "power",
+                            504 => "history",
+                            508 => "battery",
+                            500 => "dashboard",
+                            509 => "settings",
+                            503 => "sliders",
+                            _ => {
+                                let label = String::from_utf16_lossy(&text);
+                                if label.contains("Polling") {
+                                    "polling"
+                                } else if label.contains("Game boost") {
+                                    "boost"
+                                } else if label.contains("Battery") {
+                                    "battery"
+                                } else if label.contains("Other") {
+                                    "devices"
+                                } else {
+                                    "settings"
+                                }
+                            }
+                        };
+                        let size = self.row_height as i32 / 2;
+                        let icon = RECT {
+                            left: rect.left,
+                            top: (rect.top + rect.bottom - size) / 2,
+                            right: rect.left + size,
+                            bottom: (rect.top + rect.bottom + size) / 2,
+                        };
+                        crate::dashboard_widgets::draw_symbol(
+                            item.hDC,
+                            icon,
+                            kind,
+                            if selected {
+                                self.palette.accent
+                            } else {
+                                self.palette.text
+                            },
+                        );
+                        rect.left += size + self.padding / 2;
+                    }
+                    if let Some(tab) = text.iter().position(|unit| *unit == 9) {
+                        let mut right = rect;
+                        DrawTextW(item.hDC, &mut text[tab + 1..], &mut right, flags | DT_RIGHT);
+                        text.truncate(tab);
+                        rect.right -= self.padding * 5;
+                    }
                     DrawTextW(item.hDC, &mut text, &mut rect, flags);
                 }
                 if item.itemState.0 & ODS_CHECKED.0 != 0 {
@@ -6806,7 +7397,7 @@ fn append_polling_menu(menu: HMENU, choices: &[TrayPollingChoice]) -> windows::c
         }
         InsertMenuW(
             menu,
-            4,
+            2,
             MF_BYPOSITION | MF_POPUP,
             submenu.0.0 as usize,
             w!("&Polling rate"),
@@ -6837,35 +7428,58 @@ fn popup_menu(
 ) -> windows::core::Result<Popup> {
     unsafe {
         let menu = Popup(CreatePopupMenu()?);
-        if let Some(d) = key.and_then(|key| snapshot.devices.iter().find(|d| d.reading.key == key))
-        {
+        let selected = key.and_then(|key| snapshot.devices.iter().find(|d| d.reading.key == key));
+        if let Some(d) = selected {
             let text = wide_menu_data(&d.text);
             let _ = AppendMenuW(menu.0, MF_STRING | MF_DISABLED, 0, PCWSTR(text.as_ptr()));
             let _ = AppendMenuW(menu.0, MF_STRING, 503, w!("Device &settings"));
-            let _ = AppendMenuW(menu.0, MF_STRING, 504, w!("Battery &history"));
-            let _ = AppendMenuW(menu.0, MF_STRING, 505, w!("&Hide tray icon"));
-            let _ = AppendMenuW(menu.0, MF_STRING, 506, w!("Battery &insights"));
-            let _ = AppendMenuW(menu.0, MF_SEPARATOR, 0, None);
+            let options = Popup(CreatePopupMenu()?);
+            AppendMenuW(options.0, MF_STRING, 508, w!("Battery and &sleep settings"))?;
+            AppendMenuW(options.0, MF_STRING, 506, w!("Battery &insights"))?;
+            AppendMenuW(
+                options.0,
+                MF_STRING,
+                507,
+                w!("Name, alerts and tray &icon…"),
+            )?;
+            AppendMenuW(options.0, MF_STRING, 505, w!("&Hide tray icon"))?;
+            AppendMenuW(options.0, MF_STRING, 501, w!("&Refresh devices"))?;
+            AppendMenuW(
+                menu.0,
+                MF_POPUP,
+                options.0.0 as usize,
+                w!("Battery &and sleep"),
+            )?;
+            std::mem::forget(options);
         }
         if settings.fluent_menu {
-            let mut others = false;
+            let others = Popup(CreatePopupMenu()?);
             for (i, d) in snapshot
                 .devices
                 .iter()
                 .enumerate()
+                // 600..999 are battery-menu IDs; 1000 starts dashboard cards.
+                .take(400)
                 .filter(|(_, d)| !d.hidden && Some(d.reading.key.as_str()) != key)
             {
-                others = true;
                 let text = wide_menu_data(&d.text);
-                let _ = AppendMenuW(menu.0, MF_STRING, 600 + i, PCWSTR(text.as_ptr()));
+                let _ = AppendMenuW(others.0, MF_STRING, 600 + i, PCWSTR(text.as_ptr()));
             }
-            if others {
-                let _ = AppendMenuW(menu.0, MF_SEPARATOR, 0, None);
+            if GetMenuItemCount(Some(others.0)) > 0 {
+                AppendMenuW(menu.0, MF_POPUP, others.0.0 as usize, w!("Other &devices"))?;
+                std::mem::forget(others);
             }
         }
+        if selected.is_some() {
+            AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
+            AppendMenuW(menu.0, MF_STRING, 504, w!("Battery &history"))?;
+        }
         let _ = AppendMenuW(menu.0, MF_STRING, 500, w!("Open &dashboard"));
-        let _ = AppendMenuW(menu.0, MF_STRING, 501, w!("&Refresh"));
+        if selected.is_none() {
+            let _ = AppendMenuW(menu.0, MF_STRING, 501, w!("&Refresh"));
+        }
         let _ = AppendMenuW(menu.0, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu.0, MF_STRING, 509, w!("&Settings"));
         let _ = AppendMenuW(menu.0, MF_STRING, 502, w!("E&xit Halo Continued"));
 
         Ok(menu)
@@ -7062,7 +7676,7 @@ mod popup_tests {
         ];
         append_polling_menu(menu.0, &choices).unwrap();
         unsafe {
-            let child = GetSubMenu(menu.0, GetMenuItemCount(Some(menu.0)) - 1);
+            let child = GetSubMenu(menu.0, 2);
             assert!(!child.is_invalid());
             assert_eq!(GetMenuItemCount(Some(child)), 3);
             assert_ne!(GetMenuState(child, 0, MF_BYPOSITION) & MF_GRAYED.0, 0);
@@ -7098,8 +7712,11 @@ mod popup_tests {
             assert_ne!(GetMenuState(menu.0, 0, MF_BYPOSITION) & MF_DISABLED.0, 0);
             assert_eq!(GetMenuItemID(menu.0, 1), 503);
             assert!(menu_text(menu.0, 1).contains('&'));
-            assert_eq!(GetMenuItemID(menu.0, 2), 504);
-            assert_eq!(GetMenuItemID(menu.0, 3), 505);
+            let options = GetSubMenu(menu.0, 2);
+            assert!(!options.is_invalid());
+            assert_eq!(GetMenuItemID(options, 0), 508);
+            assert_eq!(GetMenuItemID(options, 3), 505);
+            assert_ne!(GetMenuState(menu.0, 504, MF_BYCOMMAND), u32::MAX);
         }
         drop(menu);
         snapshot.devices[0].text = "Renamed mouse: sleeping".into();
@@ -7135,10 +7752,25 @@ mod popup_tests {
             (0, "Headset && speakers 雪: 70%"),
             (601, "Mouse &&&& keyboard: 70%"),
         ] {
-            let index = (0..unsafe { GetMenuItemCount(Some(menu.0)) })
-                .find(|i| unsafe { GetMenuItemID(menu.0, *i) } == id)
-                .unwrap();
-            let label = menu_text(menu.0, index as u32);
+            let mut menus = vec![menu.0];
+            let mut found = None;
+            while let Some(menu) = menus.pop() {
+                for i in 0..unsafe { GetMenuItemCount(Some(menu)) } {
+                    if unsafe { GetMenuItemID(menu, i) } == id {
+                        found = Some((menu, i));
+                        break;
+                    }
+                    let child = unsafe { GetSubMenu(menu, i) };
+                    if !child.is_invalid() {
+                        menus.push(child);
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            let (menu, index) = found.unwrap();
+            let label = menu_text(menu, index as u32);
             assert_eq!(label, text);
             assert_eq!(
                 menu_mnemonic(&label.encode_utf16().collect::<Vec<_>>()),
@@ -8115,7 +8747,7 @@ mod tray_registration_tests {
         );
     }
     #[test]
-    fn ordinary_modify_failure_preserves_registration_and_failed_add_can_retry() {
+    fn ordinary_modify_failure_preserves_registration_and_retries_without_readding() {
         let mut registration = TrayRegistration::default();
         let data = data();
         let mut shell = Recorder {
@@ -8138,8 +8770,17 @@ mod tray_registration_tests {
         registration.update_with(&data, TrayUpdate::Changed, false, &mut |m, d| {
             shell.notify(m, d)
         });
-        assert_eq!(shell.commands(), [NIM_ADD, NIM_ADD, NIM_MODIFY]);
+        assert!(registration.pending_modify);
+        shell.fail_modify = false;
+        registration.update_with(&data, TrayUpdate::Changed, false, &mut |m, d| {
+            shell.notify(m, d)
+        });
+        assert_eq!(
+            shell.commands(),
+            [NIM_ADD, NIM_ADD, NIM_MODIFY, NIM_MODIFY, NIM_MODIFY]
+        );
         assert!(registration.registered);
+        assert!(!registration.pending_modify);
         assert_eq!(tray_message_update(WM_NULL, 0), None);
     }
 }
@@ -8519,6 +9160,14 @@ mod insights_tests {
 mod dashboard_lifecycle_tests {
     use super::*;
 
+    fn capture_directory() -> PathBuf {
+        std::env::var_os("HALO_UI_CAPTURE_DIRECTORY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../validation-local/dashboard")
+            })
+    }
+
     // Opt-in resource measurement of the optimized native test fixture. Never touches real hardware.
     fn sample_closed_dashboard(context: &UiContext, phase: &str) {
         let Some(requested) = std::env::var_os("HALO_MEASURE_UI_RESOURCES") else {
@@ -8555,6 +9204,11 @@ mod dashboard_lifecycle_tests {
                 .runtime
                 .attach_window(monitor.0 as usize);
             context.state.borrow_mut().drain();
+            {
+                let mut state = context.state.borrow_mut();
+                state.settings.animation = false;
+                state.sync_trays(TrayUpdate::Changed);
+            }
             let start = Instant::now();
             let start_cpu = cpu();
             let (mut total, mut count, mut peak, mut last) = (0u64, 0u64, 0usize, 0usize);
@@ -8592,8 +9246,14 @@ mod dashboard_lifecycle_tests {
                 "private_mean_mib": total as f64 / count as f64 / 1048576.,
                 "private_peak_mib": peak as f64 / 1048576., "private_end_mib": last as f64 / 1048576.,
                 "workload": "Optimized native test fixture, simulated mouse, dashboard closed, no charging animation"});
-            let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../validation-local/ui-modern-resources");
+            // An isolated destination keeps benchmark runs from replacing
+            // earlier measurements. This path exists only in test builds.
+            let output = std::env::var_os("HALO_UI_RESOURCE_DIRECTORY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../validation-local/ui-modern-resources")
+                });
             std::fs::create_dir_all(&output).unwrap();
             std::fs::write(
                 output.join(format!("{phase}.json")),
@@ -8628,6 +9288,228 @@ mod dashboard_lifecycle_tests {
         let _guard = NATIVE_TEST_LOCK.lock().unwrap();
         for restore in [false, true] {
             exercise_native_dashboard(restore);
+        }
+    }
+    unsafe fn exercise_overview_audit(context: &UiContext) {
+        unsafe {
+            let mut state = context.state.borrow_mut();
+            let snapshot = state.snapshot.clone();
+            let configuration = state.configuration_devices.clone();
+            let settings = state.settings.clone();
+            let selected = state.selected_device.clone();
+            let section = state.device_section;
+            let observations = state.polling.observations.clone();
+            state.page = 1;
+            state.snapshot.devices.clear();
+            state.configuration_devices.clear();
+            state.selected_device = None;
+            state.build();
+            assert!(state.text(464).starts_with("0 connected"));
+            assert!(
+                IsWindowVisible(state.controls[&5]).as_bool(),
+                "Support report must remain reachable"
+            );
+
+            let mut reading = Reading::new(
+                "razer:00bf:UI-AUDIT",
+                "Mouse without battery monitoring",
+                "razer",
+                0,
+            );
+            reading.kind = "mouse".into();
+            reading.via = "usb".into();
+            let mut device = ConfigurationDevice::from_reading(&reading);
+            device.capability = PollingCapability::Unavailable("No polling controls".into());
+            state.configuration_devices = vec![device];
+            state.selected_device = Some(reading.key.clone());
+            state.device_section = 1;
+            let sequence = state.polling.sequence;
+            state.build();
+            assert!(
+                windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(state.controls[&18])
+                    .as_bool()
+            );
+            assert_eq!(state.text(18), "Sleep");
+            assert!(IsWindowVisible(state.controls[&431]).as_bool());
+            assert!(
+                !state.controls.contains_key(&469),
+                "Batteryless devices must not gain battery alerts"
+            );
+            assert_eq!(
+                state.polling.sequence, sequence,
+                "Layout must perform no hardware query"
+            );
+
+            reading.level = Some(50);
+            reading.charging = Some(false);
+            state.configuration_devices.clear();
+            state.snapshot.devices = vec![DeviceView {
+                reading: reading.clone(),
+                name: reading.name.clone(),
+                icon: "mouse".into(),
+                low_alert_at: 20,
+                seconds_left: None,
+                text: "Mouse: 50%".into(),
+                hidden: false,
+            }];
+            state.settings.polling_controls = true;
+            state.page = 2;
+            state.build();
+            let pending = state
+                .history_pending
+                .expect("History queued its first query");
+            for _ in 0..100 {
+                state.query();
+                assert_eq!(state.history_pending, Some(pending));
+            }
+            let newest = state.request;
+            assert!(
+                matches!(state.history_queued.as_deref(),Some(Command::UsageHistory {request,..}) if *request==newest)
+            );
+            let devices = std::mem::take(&mut state.snapshot.devices);
+            state.query();
+            assert!(
+                state.history_queued.is_none(),
+                "A removed device must not leave a stale queued query"
+            );
+            state.snapshot.devices = devices;
+            state.query();
+            let newest = state.request;
+            state.history_outcome(pending, Ok(HistorySeries::default()));
+            assert_eq!(state.history_pending, Some(newest));
+            assert!(state.history_queued.is_none());
+            state.command(1, 0);
+            assert!(state.history_queued.is_none());
+            state.history_outcome(newest, Ok(HistorySeries::default()));
+            assert!(state.history_pending.is_none());
+            state.build();
+            state.set_control_text(442, "27");
+            send(state.controls[&440], BM_SETCHECK, WPARAM(1), LPARAM(0));
+            state.build();
+            assert!(state.checked(440));
+            assert_eq!(
+                state.text(440),
+                "On",
+                "A rebuild must label the restored draft"
+            );
+            assert!(state.text(466).contains("Choose settings"));
+            assert!(
+                state
+                    .settings
+                    .device(&reading.key)
+                    .is_none_or(|d| d.low_battery_mode.is_none()),
+                "Rebuilding must not save an unfinished draft"
+            );
+            state.device_section = 0;
+            state.control_details = false;
+            state.layout_page();
+            assert!(IsWindowVisible(state.controls[&23]).as_bool());
+            assert!(!IsWindowVisible(state.controls[&42]).as_bool());
+            state.command(23, BN_CLICKED as u16);
+            assert!(IsWindowVisible(state.controls[&42]).as_bool());
+            state.sleep.details = false;
+            state.command(18, BN_CLICKED as u16);
+            assert!(
+                !state.sleep.details,
+                "Performance details must not expand sleep details"
+            );
+            assert_eq!(state.text(23), "More details");
+            state.command(23, BN_CLICKED as u16);
+            assert!(state.sleep.details);
+            state.command(17, BN_CLICKED as u16);
+            assert!(
+                state.control_details,
+                "Sleep details must not close performance details"
+            );
+            let mut panel = RECT::default();
+            let mut button = RECT::default();
+            GetWindowRect(state.controls[&460], &mut panel).unwrap();
+            GetWindowRect(state.controls[&42], &mut button).unwrap();
+            assert!(
+                button.bottom <= panel.bottom - 8,
+                "Restore button extends outside polling panel"
+            );
+            let descriptor = ConfigurationDevice::from_reading(&reading);
+            let observation = PollingObservation {
+                target: ControlTarget {
+                    device: descriptor,
+                    generation: state.polling.generation,
+                    connection_stamp: None,
+                },
+                supported: vec![PollingRate::try_from(1000).unwrap()],
+                rate: PollingRate::try_from(1000).ok(),
+                timestamp: 0,
+                evidence: String::new(),
+            };
+            state
+                .polling
+                .observations
+                .insert(reading.key.clone(), observation);
+            state
+                .settings
+                .device_mut(&reading.key)
+                .fullscreen_boost_rate = PollingRate::try_from(4000).ok();
+            state.settings.polling_controls = false;
+            let menu = popup_menu(&state.snapshot, &state.settings, Some(&reading.key)).unwrap();
+            let choices = state.prepare_overview_menu(menu.0, Some(&reading.key));
+            assert_eq!(
+                choices,
+                [(549, None)],
+                "A 1000 Hz connection may only disable its saved boost"
+            );
+            let boost_menu = GetSubMenu(menu.0, 3);
+            assert_eq!(
+                GetMenuState(boost_menu, 549, MF_BYCOMMAND) & (MF_GRAYED.0 | MF_DISABLED.0),
+                0
+            );
+            drop(menu);
+
+            state.snapshot = snapshot;
+            state.configuration_devices = configuration;
+            state.settings = settings;
+            state.selected_device = selected;
+            state.device_section = section;
+            state.control_details = false;
+            state.polling.observations = observations;
+            state.build();
+            let window = state.dashboard.unwrap();
+            let dpi = GetDpiForWindow(window).max(96) as i32;
+            let mut original = RECT::default();
+            GetWindowRect(window, &mut original).unwrap();
+            for width in [1200, 840] {
+                SetWindowPos(
+                    window,
+                    None,
+                    0,
+                    0,
+                    width * dpi / 96,
+                    original.bottom - original.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+                state.layout_page();
+                let mut refresh = RECT::default();
+                let mut client = RECT::default();
+                GetWindowRect(state.controls[&4], &mut refresh).unwrap();
+                GetClientRect(window, &mut client).unwrap();
+                let mut origin = POINT::default();
+                ClientToScreen(window, &mut origin).unwrap();
+                assert!(
+                    (origin.x + client.right - refresh.right - 40 * dpi / 96).abs() <= 2,
+                    "Refresh must follow the right window margin"
+                );
+            }
+            SetWindowPos(
+                window,
+                None,
+                0,
+                0,
+                original.right - original.left,
+                original.bottom - original.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            state.layout_page();
         }
     }
     unsafe fn exercise_tray_selection(context: &UiContext) {
@@ -8743,6 +9625,144 @@ mod dashboard_lifecycle_tests {
         state.sync_trays(TrayUpdate::Changed);
         state.build();
     }
+    unsafe fn exercise_overview_popup(state: &State, dark: bool) {
+        unsafe {
+            let key = state.selected_device.as_deref();
+            let sequence = state.polling.sequence;
+            let menu = popup_menu(&state.snapshot, &state.settings, key).unwrap();
+            if let Some(device) = key.and_then(|key| state.tray_polling_device(key)) {
+                append_polling_menu(
+                    menu.0,
+                    &tray_polling_choices(&device, &state.settings, &state.tray_polling, false),
+                )
+                .unwrap();
+            }
+            let boosts = state.prepare_overview_menu(menu.0, key);
+            let configurations = state.append_configuration_menu(menu.0, key);
+            assert_eq!(
+                state.polling.sequence, sequence,
+                "menus must use cached metadata only"
+            );
+            if !boosts.is_empty() {
+                assert_eq!(boosts[0], (549, None));
+            }
+            for (id, key) in configurations {
+                assert!(state.configuration_devices.iter().any(|d| d.key == key));
+                assert!(id >= 33000);
+            }
+            let palette = Palette::new(dark, false);
+            let appearance = PopupAppearance::new(menu.0, state.monitor, palette).unwrap();
+            let entries = appearance
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.menu == menu.0)
+                .collect::<Vec<_>>();
+            let mut heights = Vec::new();
+            for (i, _) in &entries {
+                let mut measured = MEASUREITEMSTRUCT {
+                    CtlType: ODT_MENU,
+                    itemData: i + 1,
+                    ..Default::default()
+                };
+                appearance
+                    .message(
+                        WM_MEASUREITEM,
+                        WPARAM(0),
+                        LPARAM(&mut measured as *mut _ as isize),
+                    )
+                    .unwrap();
+                heights.push(measured.itemHeight as i32);
+            }
+            assert!(heights[0] > heights[1], "device heading needs two lines");
+            let width = appearance.width as i32;
+            let height = heights.iter().sum::<i32>();
+            let source = GetDC(Some(state.monitor));
+            let dc = CreateCompatibleDC(Some(source));
+            let bitmap = CreateCompatibleBitmap(source, width, height);
+            let old = SelectObject(dc, bitmap.into());
+            let mut top = 0;
+            for ((i, entry), h) in entries.iter().zip(&heights) {
+                let item = DRAWITEMSTRUCT {
+                    CtlType: ODT_MENU,
+                    hwndItem: HWND(menu.0.0),
+                    hDC: dc,
+                    itemData: i + 1,
+                    rcItem: RECT {
+                        left: 0,
+                        top,
+                        right: width,
+                        bottom: top + h,
+                    },
+                    itemState: if entry.enabled {
+                        Default::default()
+                    } else {
+                        ODS_DISABLED
+                    },
+                    ..Default::default()
+                };
+                appearance
+                    .message(WM_DRAWITEM, WPARAM(0), LPARAM(&item as *const _ as isize))
+                    .unwrap();
+                top += h;
+            }
+            SelectObject(dc, old);
+            if std::env::var_os("HALO_CAPTURE_DASHBOARD_TEST").is_some() {
+                let mut info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut pixels = vec![0u8; (width * height * 4) as usize];
+                assert_eq!(
+                    GetDIBits(
+                        dc,
+                        bitmap,
+                        0,
+                        height as u32,
+                        Some(pixels.as_mut_ptr().cast()),
+                        &mut info,
+                        DIB_RGB_COLORS
+                    ),
+                    height
+                );
+                let mut file = Vec::with_capacity(54 + pixels.len());
+                file.extend_from_slice(b"BM");
+                file.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+                file.extend_from_slice(&[0; 4]);
+                file.extend_from_slice(&54u32.to_le_bytes());
+                file.extend_from_slice(&40u32.to_le_bytes());
+                file.extend_from_slice(&width.to_le_bytes());
+                file.extend_from_slice(&(-height).to_le_bytes());
+                file.extend_from_slice(&1u16.to_le_bytes());
+                file.extend_from_slice(&32u16.to_le_bytes());
+                file.extend_from_slice(&[0; 24]);
+                file.extend_from_slice(&pixels);
+                let output = capture_directory();
+                std::fs::create_dir_all(&output).unwrap();
+                std::fs::write(
+                    output.join(format!(
+                        "overview-menu-{}.bmp",
+                        if dark { "dark" } else { "light" }
+                    )),
+                    file,
+                )
+                .unwrap();
+            }
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(Some(state.monitor), source);
+            drop(menu);
+            drop(appearance);
+        }
+    }
     fn exercise_native_dashboard(restore: bool) {
         let mut settings = Settings {
             polling_controls: true,
@@ -8787,11 +9807,15 @@ mod dashboard_lifecycle_tests {
                     configuration_generation: 0,
                     configuration_failure: None,
                     chart: None,
+                    chart_retry: None,
                     theme: None,
                     series: HistorySeries::default(),
                     history: HistorySelection::default(),
                     history_resize: HistoryResize::default(),
                     request: 0,
+                    history_pending: None,
+                    history_cache_active: false,
+                    history_queued: None,
                     taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
                     notify: None,
                     animating: false,
@@ -8799,17 +9823,23 @@ mod dashboard_lifecycle_tests {
                     error: String::new(),
                     font: HFONT::default(),
                     heading_font: HFONT::default(),
+                    small_font: HFONT::default(),
+                    section_font: HFONT::default(),
                     font_dpi: 0,
                     page_host: None,
                     page_scroll: 0,
                     wheel_remainder: 0,
                     page_height: 0,
                     more_options: false,
+                    device_section: 0,
+                    control_details: false,
+                    overview_keys: Vec::new(),
                     polling: PollingUi::default(),
                     tray_polling: PollingUi::default(),
                     insights: InsightsUi::default(),
                     sleep: SleepUi::default(),
                     dpi: DpiUi::default(),
+                    information: DeviceInfoUi::default(),
                     polling_intents: BTreeMap::new(),
                     tooltip_rates: BTreeMap::new(),
                 }),
@@ -9008,8 +10038,74 @@ mod dashboard_lifecycle_tests {
                 assert!(state.series.samples.is_empty());
             }
             send(monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
+            // Opening a new dashboard on Device info and restoring it from
+            // the taskbar must query once, without granting settings permission.
+            let (saved_snapshot, saved_selection, saved_settings, info_window) = {
+                let mut state = context.state.borrow_mut();
+                let saved = (
+                    state.snapshot.clone(),
+                    state.selected_device.clone(),
+                    state.settings.clone(),
+                );
+                let mut r = Reading::new("razer:00bf:REOPEN-TEST", "Mouse", "razer", 100);
+                r.kind = "mouse".into();
+                r.via = "usb".into();
+                r.level = Some(50);
+                state.snapshot.devices = vec![DeviceView {
+                    reading: r.clone(),
+                    name: r.name.clone(),
+                    icon: "mouse".into(),
+                    low_alert_at: 20,
+                    seconds_left: None,
+                    text: "Mouse: 50%".into(),
+                    hidden: false,
+                }];
+                state.selected_device = Some(r.key.clone());
+                state.settings.polling_controls = false;
+                state.device_section = 4;
+                let h = state.dashboard.unwrap();
+                state.close_dashboard(h);
+                state.open();
+                assert!(
+                    state.information.pending_sequence().is_some(),
+                    "Reopening Device info must query firmware"
+                );
+                let sequence = state.information.pending_sequence();
+                state.open();
+                assert_eq!(state.information.pending_sequence(), sequence);
+                (saved.0, saved.1, saved.2, state.dashboard.unwrap())
+            };
+            let _ = ShowWindow(info_window, SW_MINIMIZE);
+            assert!(
+                context
+                    .state
+                    .borrow()
+                    .information
+                    .pending_sequence()
+                    .is_none()
+            );
+            let _ = ShowWindow(info_window, SW_RESTORE);
+            assert!(
+                context
+                    .state
+                    .borrow()
+                    .information
+                    .pending_sequence()
+                    .is_some(),
+                "Taskbar restore must requery information"
+            );
+            {
+                let mut state = context.state.borrow_mut();
+                state.snapshot = saved_snapshot;
+                state.selected_device = saved_selection;
+                state.settings = saved_settings;
+            }
+            context.state.borrow_mut().device_section = 0;
+            context.state.borrow_mut().build();
             let first = context.state.borrow().dashboard.unwrap();
             assert!(IsWindowVisible(first).as_bool());
+            exercise_overview_audit(&context);
+            device_information::exercise_native_information(&mut context.state.borrow_mut());
             exercise_tray_selection(&context);
             {
                 let mut state = context.state.borrow_mut();
@@ -9080,6 +10176,14 @@ mod dashboard_lifecycle_tests {
                 state.selected_device = Some("keyboard-only".into());
                 state.build();
                 assert_eq!(state.device_rows().len(), 1);
+                assert_eq!(state.overview_keys, ["keyboard-only"]);
+                assert!(state.text(1000).contains("No battery"));
+                assert!(
+                    !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.controls[&18]
+                    )
+                    .as_bool()
+                );
                 assert!(state.controls.contains_key(&11));
                 assert!(!state.controls.contains_key(&12));
                 assert!(!state.controls.contains_key(&13));
@@ -9408,6 +10512,7 @@ mod dashboard_lifecycle_tests {
                     failure: None,
                 });
                 state.dpi.previous = Some((key.clone(), generation, original.clone()));
+                state.device_section = 2;
                 state.build();
                 assert_eq!(state.text(451), "800");
                 assert_eq!(state.text(458), "Supported DPI: 100–45,000 (model range)");
@@ -9415,6 +10520,20 @@ mod dashboard_lifecycle_tests {
                 assert_eq!(state.restorable_dpi(), Some(original.value));
                 state.set_control_text(451, "1600");
                 state.polling_controls();
+                let dpi_request = state.dpi.next;
+                let rate_request = state.polling.sequence;
+                let edit = state.controls[&451];
+                state.command(17, 0);
+                assert!(!IsWindowVisible(edit).as_bool());
+                assert!(IsWindowVisible(state.controls[&43]).as_bool());
+                state.command(19, 0);
+                assert!(IsWindowVisible(edit).as_bool());
+                assert_eq!(state.controls[&451], edit, "tabs retain native drafts");
+                assert_eq!(state.dpi.next, dpi_request, "tabs must not query hardware");
+                assert_eq!(
+                    state.polling.sequence, rate_request,
+                    "tabs must not query hardware"
+                );
                 assert_eq!(
                     state.text(451),
                     "1600",
@@ -9602,8 +10721,32 @@ mod dashboard_lifecycle_tests {
                     {
                         let mut state = context.state.borrow_mut();
                         state.page = page;
+                        state.device_section = 0;
                         state.error.clear();
                         state.more_options = advanced;
+                        if page == 1
+                            && std::env::var("HALO_CAPTURE_DASHBOARD_TEST").is_ok_and(|v| {
+                                matches!(
+                                    v.as_str(),
+                                    "overview" | "overview-battery" | "overview-information"
+                                )
+                            })
+                        {
+                            let view = &mut state.snapshot.devices[0];
+                            view.name = "Razer DeathAdder V4 Pro".into();
+                            view.reading.level = Some(62);
+                            let mut keyboard = ConfigurationDevice::from_reading(&Reading::new(
+                                "corsair:1bb3:SYNTHETIC",
+                                "Corsair K70 RGB Pro",
+                                "corsair",
+                                0,
+                            ));
+                            keyboard.kind = "keyboard".into();
+                            keyboard.capability = PollingCapability::Unavailable(
+                                "Maintained software session".into(),
+                            );
+                            state.configuration_devices = vec![keyboard];
+                        }
                         if page == 2 {
                             state.history.usage_index = 0;
                         }
@@ -9730,7 +10873,7 @@ mod dashboard_lifecycle_tests {
                             state.scroll_page(708 - PAGE_TOP);
                             let mut pane = RECT::default();
                             GetWindowRect(state.page_host.unwrap(), &mut pane).unwrap();
-                            for id in [49, 50, 51, 52] {
+                            for id in [49, 50, 465, 52] {
                                 let mut bounds = RECT::default();
                                 GetWindowRect(state.controls[&id], &mut bounds).unwrap();
                                 assert!(
@@ -9741,7 +10884,7 @@ mod dashboard_lifecycle_tests {
                             // A hardware reply rebuilds this group at the current
                             // scroll position; it must retain the full range.
                             state.polling_controls();
-                            assert!(state.page_height >= 920 - PAGE_TOP);
+                            assert!(state.page_height >= 600 - PAGE_TOP);
                             state.scroll_page(0);
                             assert!(!state.checked(49));
                             send(state.controls[&49], BM_SETCHECK, WPARAM(1), LPARAM(0));
@@ -9799,7 +10942,7 @@ mod dashboard_lifecycle_tests {
                             // real controls, not a direct call to the helper.
                             let palette = state.theme.as_ref().unwrap().palette;
                             for (id, background) in [
-                                (10, palette.surface),
+                                (10, palette.background),
                                 (91, palette.background),
                                 (11, palette.surface),
                             ] {
@@ -9860,13 +11003,39 @@ mod dashboard_lifecycle_tests {
                             ReleaseDC(Some(reopened), source);
                         }
                     }
+                    if page == 1 {
+                        let state = context.state.borrow();
+                        exercise_overview_popup(&state, dark);
+                        if std::env::var("HALO_CAPTURE_DASHBOARD_TEST").is_ok_and(|v| {
+                            matches!(
+                                v.as_str(),
+                                "overview" | "overview-battery" | "overview-information"
+                            )
+                        }) {
+                            let h = state.controls[&43];
+                            let index = send(
+                                h,
+                                CB_FINDSTRINGEXACT,
+                                WPARAM(usize::MAX),
+                                LPARAM(w!("1000 Hz").as_ptr() as isize),
+                            )
+                            .0;
+                            if index >= 0 {
+                                send(h, CB_SETCURSEL, WPARAM(index as usize), LPARAM(0));
+                            }
+                        }
+                    }
                     let sleep_capture = if page == 1
-                        && std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
-                            .is_ok_and(|mode| mode == "sleep" || mode == "saver")
-                    {
+                        && std::env::var("HALO_CAPTURE_DASHBOARD_TEST").is_ok_and(|mode| {
+                            matches!(
+                                mode.as_str(),
+                                "sleep" | "saver" | "overview-battery" | "overview-information"
+                            )
+                        }) {
                         let mut state = context.state.borrow_mut();
                         let saved = state.snapshot.devices[0].reading.clone();
                         state.snapshot.devices[0].reading.key = "razer:00bf:SYNTHETIC-SLEEP".into();
+                        state.snapshot.devices[0].reading.source = "razer".into();
                         state.snapshot.devices[0].reading.via = "usb".into();
                         let device =
                             ConfigurationDevice::from_reading(&state.snapshot.devices[0].reading);
@@ -9879,9 +11048,47 @@ mod dashboard_lifecycle_tests {
                                 .observations
                                 .insert(device.key.clone(), observation);
                         }
-                        state.selected_device = Some(device.key);
+                        state.selected_device = Some(device.key.clone());
+                        let compact = std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
+                            .is_ok_and(|s| s == "overview-battery");
+                        state.device_section = 1;
+                        state.sleep.details = !compact;
+                        state.sleep.saver_details = !compact;
+                        if compact {
+                            state.settings.device_mut(&device.key).low = Some(20);
+                            state.settings.device_mut(&device.key).low_battery_mode =
+                                Some(hb_core::settings::LowBatteryMode {
+                                    threshold: 20,
+                                    polling_rate: Some(PollingRate::try_from(125).unwrap()),
+                                    sleep_seconds: Some(60),
+                                });
+                            state.settings.low_sound = true;
+                        }
                         state.build();
-                        state.scroll_page(i32::MAX);
+                        if std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
+                            .is_ok_and(|s| s == "overview-information")
+                        {
+                            device_information::show_fixture_information(&mut state);
+                            state.error.clear();
+                            state.set_control_text(95, "");
+                            for id in [480, 481, 483, 484, 485, 486, 487, 488] {
+                                assert!(IsWindowVisible(state.controls[&id]).as_bool());
+                            }
+                        } else if compact {
+                            for id in [430, 431, 432, 433, 439, 440, 467, 469, 470, 473] {
+                                assert!(
+                                    IsWindowVisible(state.controls[&id]).as_bool(),
+                                    "Compact Battery control {id} missing"
+                                );
+                            }
+                            assert!(
+                                !IsWindowVisible(state.controls[&7]).as_bool(),
+                                "Compact Battery should fit without scrolling"
+                            );
+                            state.scroll_page(0);
+                        } else {
+                            state.scroll_page(i32::MAX);
+                        }
                         Some(saved)
                     } else {
                         None
@@ -10015,8 +11222,7 @@ mod dashboard_lifecycle_tests {
                         file.extend_from_slice(&32u16.to_le_bytes());
                         file.extend_from_slice(&[0; 24]);
                         file.extend_from_slice(&pixels);
-                        let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join("../../validation-local/dashboard");
+                        let output = capture_directory();
                         std::fs::create_dir_all(&output).unwrap();
                         std::fs::write(
                             output.join(format!(
@@ -10335,7 +11541,7 @@ mod dashboard_lifecycle_tests {
                 bottom - 32,
                 "upper arrow must not snap to focused control"
             );
-            // Devices has the longest page: reproduce scrolling from sleep/saver
+            // The Battery tab scrolls independently: reproduce scrolling from sleep/saver
             // controls while a polling update rebuilds the lower sections.
             {
                 let mut state = context.state.borrow_mut();
@@ -10345,6 +11551,8 @@ mod dashboard_lifecycle_tests {
                 state.selected_device = Some("razer:00bf:SCROLL-TEST".into());
                 state.settings.polling_controls = true;
                 state.page = 1;
+                state.device_section = 1;
+                state.sleep.saver_details = true;
                 state.build();
                 state.scroll_page(i32::MAX);
                 SetFocus(Some(state.controls[&445])).unwrap();
@@ -10392,7 +11600,18 @@ mod dashboard_lifecycle_tests {
                     GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
                 };
                 let process = GetCurrentProcess();
+                // Resource sampling pumps real simulated updates. Preserve the
+                // manually seeded inventory for the deterministic control checks.
+                let (snapshot, configuration) = {
+                    let state = context.state.borrow();
+                    (state.snapshot.clone(), state.configuration_devices.clone())
+                };
                 sample_closed_dashboard(&context, "before-40-cycles");
+                {
+                    let mut state = context.state.borrow_mut();
+                    state.snapshot = snapshot;
+                    state.configuration_devices = configuration;
+                }
                 let mut baseline = None;
                 for cycle in 0..40 {
                     let mut state = context.state.borrow_mut();
@@ -10411,8 +11630,143 @@ mod dashboard_lifecycle_tests {
                     state.selected_device = Some("razer:00bf:SYNTHETIC-SLEEP".into());
                     state.settings.polling_controls = true;
                     state.page = 1;
+                    state.device_section = 1;
+                    state.sleep.saver_details = true;
                     state.build();
                     state.apply_theme(DashboardTheme::new(cycle % 2 == 0, false));
+                    if cycle == 0 {
+                        state.sleep.saver_details = false;
+                        state.sleep.details = false;
+                        state.layout_page();
+                        assert!(IsWindowVisible(state.controls[&469]).as_bool());
+                        assert!(!IsWindowVisible(state.controls[&442]).as_bool());
+                        assert!(IsWindowVisible(state.controls[&440]).as_bool());
+                        assert!(IsWindowVisible(state.controls[&473]).as_bool());
+                        assert!(IsWindowVisible(state.controls[&432]).as_bool());
+                        assert_eq!(state.text(432), "Check current");
+                        state.sleep.outcome = Some(SleepOutcome {
+                            request: 1,
+                            key: "razer:00bf:SYNTHETIC-SLEEP".into(),
+                            generation: state.polling.generation,
+                            connection_stamp: None,
+                            seconds: Some(300),
+                            may_have_changed: false,
+                            failure: None,
+                        });
+                        state.polling_controls();
+                        assert_eq!(state.text(434), "Last checked sleep time: 5 min.");
+                        state.sleep.outcome = None;
+                        state.polling_controls();
+                        let saved = hb_core::settings::LowBatteryMode {
+                            threshold: 20,
+                            polling_rate: Some(PollingRate::try_from(125).unwrap()),
+                            sleep_seconds: Some(60),
+                        };
+                        state
+                            .settings
+                            .device_mut("razer:00bf:SYNTHETIC-SLEEP")
+                            .low_battery_mode = Some(saved);
+                        send(state.controls[&440], BM_SETCHECK, WPARAM(1), LPARAM(0));
+                        let polling_sequence = state.polling.sequence;
+                        let sleep_sequence = state.sleep.next;
+                        state.command(473, BN_CLICKED as u16);
+                        assert!(IsWindowVisible(state.controls[&442]).as_bool());
+                        assert_eq!(state.text(473), "Hide settings");
+                        assert!(state.checked(440));
+                        assert_eq!(
+                            state
+                                .settings
+                                .device("razer:00bf:SYNTHETIC-SLEEP")
+                                .unwrap()
+                                .low_battery_mode,
+                            Some(saved),
+                            "Opening settings must not disable or change Battery saver"
+                        );
+                        assert_eq!(state.polling.sequence, polling_sequence);
+                        assert_eq!(state.sleep.next, sleep_sequence);
+                        state.set_control_text(442, "25");
+                        state.command(473, BN_CLICKED as u16);
+                        assert!(!IsWindowVisible(state.controls[&442]).as_bool());
+                        assert!(state.checked(440));
+                        assert_eq!(state.text(473), "Edit settings");
+                        assert!(
+                            state.text(466).contains("20%"),
+                            "Summary must describe the saved threshold"
+                        );
+                        state.command(23, BN_CLICKED as u16);
+                        assert!(state.sleep.details);
+                        assert!(
+                            !state.sleep.saver_details,
+                            "Sleep details must not open Battery saver"
+                        );
+                        state.command(473, BN_CLICKED as u16);
+                        assert_eq!(
+                            state.text(442),
+                            "25",
+                            "Closing settings must preserve an unsaved draft"
+                        );
+                        state.command(473, BN_CLICKED as u16);
+                        state.command(23, BN_CLICKED as u16);
+                        state.set_control_text(11, "Unsaved name");
+                        let index = send(
+                            state.controls[&469],
+                            CB_FINDSTRINGEXACT,
+                            WPARAM(usize::MAX),
+                            LPARAM(w!("20%").as_ptr() as isize),
+                        )
+                        .0;
+                        assert!(index >= 0);
+                        send(
+                            state.controls[&469],
+                            CB_SETCURSEL,
+                            WPARAM(index as usize),
+                            LPARAM(0),
+                        );
+                        state.command(469, CBN_SELCHANGE as u16);
+                        let preferences =
+                            state.settings.device("razer:00bf:SYNTHETIC-SLEEP").unwrap();
+                        assert_eq!(preferences.low, Some(20));
+                        assert_ne!(preferences.name.as_deref(), Some("Unsaved name"));
+                        assert_eq!(state.text(11), "Unsaved name");
+                        assert_eq!(state.text(13), "20");
+                        send(state.controls[&470], BM_SETCHECK, WPARAM(1), LPARAM(0));
+                        state.command(470, BN_CLICKED as u16);
+                        assert!(state.settings.low_sound);
+                        assert!(state.sleep.pending.is_none());
+                        // A new saver opens configuration instead of inventing hardware changes.
+                        state
+                            .settings
+                            .device_mut("razer:00bf:SYNTHETIC-SLEEP")
+                            .low_battery_mode = None;
+                        send(state.controls[&440], BM_SETCHECK, WPARAM(0), LPARAM(0));
+                        state.command(473, BN_CLICKED as u16);
+                        assert!(state.text(466).contains("Turn on Battery saver"));
+                        assert!(
+                            !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                                state.controls[&446]
+                            )
+                            .as_bool()
+                        );
+                        state.command(473, BN_CLICKED as u16);
+                        send(state.controls[&440], BM_SETCHECK, WPARAM(1), LPARAM(0));
+                        state.command(440, BN_CLICKED as u16);
+                        assert!(state.sleep.saver_details);
+                        assert!(
+                            windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                                state.controls[&446]
+                            )
+                            .as_bool()
+                        );
+                        assert!(
+                            state
+                                .settings
+                                .device("razer:00bf:SYNTHETIC-SLEEP")
+                                .unwrap()
+                                .low_battery_mode
+                                .is_none()
+                        );
+                        assert!(IsWindowVisible(state.controls[&442]).as_bool());
+                    }
                     assert!(state.controls.contains_key(&433));
                     assert_eq!(
                         GetWindowLongW(state.controls[&433], GWL_STYLE) as u32 & WS_DISABLED.0,
@@ -10489,7 +11843,12 @@ mod dashboard_lifecycle_tests {
                     assert!(
                         state.controls.is_empty() && state.chart.is_none() && state.theme.is_none()
                     );
-                    assert!(state.font.is_invalid() && state.heading_font.is_invalid());
+                    assert!(
+                        state.font.is_invalid()
+                            && state.heading_font.is_invalid()
+                            && state.small_font.is_invalid()
+                            && state.section_font.is_invalid()
+                    );
                     let handles = (
                         GetGuiResources(process, GR_GDIOBJECTS),
                         GetGuiResources(process, GR_USEROBJECTS),
@@ -10519,5 +11878,70 @@ mod dashboard_lifecycle_tests {
             UnregisterClassW(class, Some(instance.into())).unwrap();
         }
         drop(test_directory);
+    }
+}
+
+#[cfg(test)]
+mod audit_restore_regressions {
+    use super::*;
+    #[test]
+    fn previous_rate_is_revoked_when_identity_changes_even_without_a_device_event() {
+        let mut r = Reading::new("razer:00bf:SHARED-SERIAL", "Mouse", "razer", 100);
+        r.kind = "mouse".into();
+        r.via = "usb".into();
+        r.serial = Some("SHARED-SERIAL".into());
+        r.container = Some("first-unit".into());
+        let device = ConfigurationDevice::from_reading(&r);
+        for revoke in [false, true] {
+            let mut ui = PollingUi {
+                generation: 4,
+                ..Default::default()
+            };
+            let previous = PollingRate::try_from(125).unwrap();
+            ui.previous.insert(device.key.clone(), previous);
+            ui.previous_devices
+                .insert(device.key.clone(), Box::new(device.clone()));
+            ui.observations.insert(
+                device.key.clone(),
+                PollingObservation {
+                    target: ControlTarget {
+                        device: device.clone(),
+                        generation: 4,
+                        connection_stamp: None,
+                    },
+                    rate: PollingRate::try_from(1000).ok(),
+                    supported: vec![previous, PollingRate::try_from(1000).unwrap()],
+                    timestamp: 100,
+                    evidence: String::new(),
+                },
+            );
+            if revoke {
+                ui.revoke_observation(&device.key);
+            }
+            let mut replacement = device.clone();
+            replacement.container = Some("second-unit".into());
+            ui.retain_inventory(&[], std::slice::from_ref(&replacement));
+            assert!(!ui.previous.contains_key(&device.key));
+            assert!(ui.previous_devices.is_empty());
+            let request = ui.begin(replacement.clone(), PollingIntent::Read).unwrap();
+            let mut target = request.target;
+            target.generation = 4;
+            let o = ControlOutcome {
+                request: request.request,
+                key: replacement.key.clone(),
+                previous: None,
+                may_have_changed: false,
+                failure: None,
+                observation: Some(PollingObservation {
+                    target,
+                    rate: PollingRate::try_from(1000).ok(),
+                    supported: vec![previous, PollingRate::try_from(1000).unwrap()],
+                    timestamp: 200,
+                    evidence: String::new(),
+                }),
+            };
+            assert!(ui.accept(&o, Some(&replacement.key)));
+            assert!(ui.previous.is_empty());
+        }
     }
 }

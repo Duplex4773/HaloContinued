@@ -1,4 +1,6 @@
 //! Bounded, batched history storage; configuration never shares upstream's folder.
+mod schema;
+mod usage_index;
 #[cfg(test)]
 #[path = "../tests/support/usage_reference.rs"]
 mod usage_reference;
@@ -371,37 +373,32 @@ pub struct Store {
     last: BTreeMap<String, UsageObservation>,
     has_usage_metadata: bool,
     has_polling_events: bool,
+    sequenced: bool,
+    usage_index: std::cell::RefCell<Option<usage_index::UsageIndex>>,
+    #[cfg(test)]
+    usage_rows: std::cell::Cell<usize>,
 }
 const INSIGHTS_WITH_ACTIVITY: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,(SELECT CASE WHEN e.rate=m.polling_rate THEN e.kind END FROM polling_events e WHERE e.device=r.device AND e.session=m.session AND e.ts<=r.ts ORDER BY e.ts DESC,e.rowid DESC LIMIT 1) FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts";
+const INSIGHTS_WITH_ACTIVITY_SEQUENCED: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,(SELECT CASE WHEN e.rate=m.polling_rate THEN e.kind END FROM polling_events e WHERE e.device=r.device AND e.session=m.session AND e.ts<=r.ts ORDER BY e.ts DESC,e.rowid DESC LIMIT 1) FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts AND m.sequence=r.sequence WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts,r.sequence";
 impl Store {
     pub fn open(path: &Path) -> Result<Self, ProviderError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let db = Connection::open(path).map_err(sql_error)?;
+        let mut db = Connection::open(path).map_err(sql_error)?;
         db.busy_timeout(std::time::Duration::from_secs(2))
             .map_err(sql_error)?;
-        // The activity lookup orders by timestamp, then insertion order. The
-        // primary key ends in kind, so SQLite otherwise prefers the broader
-        // device/time index and repeatedly scans events from unrelated sessions.
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-512;
-            BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS readings(device TEXT NOT NULL, ts INTEGER NOT NULL, level INTEGER, payload TEXT NOT NULL, PRIMARY KEY(device,ts));
-            CREATE INDEX IF NOT EXISTS readings_time ON readings(ts);
-            CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS usage_metadata(device TEXT NOT NULL, ts INTEGER NOT NULL, polling_rate INTEGER, session TEXT, PRIMARY KEY(device,ts));
-            CREATE INDEX IF NOT EXISTS usage_metadata_time ON usage_metadata(ts);
-            CREATE TABLE IF NOT EXISTS polling_events(device TEXT NOT NULL, session TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, rate INTEGER NOT NULL, previous_rate INTEGER, PRIMARY KEY(device,session,ts,kind));
-            CREATE INDEX IF NOT EXISTS polling_events_time ON polling_events(ts);
-            CREATE INDEX IF NOT EXISTS polling_events_device_time ON polling_events(device,ts);
-            CREATE INDEX IF NOT EXISTS polling_events_device_session_time ON polling_events(device,session,ts);
-            PRAGMA user_version=3; COMMIT;").map_err(sql_error)?;
+        schema::migrate(&mut db)?;
         Ok(Self {
             db,
             pending: Vec::with_capacity(64),
             last: BTreeMap::new(),
             has_usage_metadata: true,
             has_polling_events: true,
+            sequenced: true,
+            usage_index: Default::default(),
+            #[cfg(test)]
+            usage_rows: Default::default(),
         })
     }
     pub fn read_only(path: &Path) -> Result<Self, ProviderError> {
@@ -414,12 +411,17 @@ impl Store {
             [], |row| row.get(0),
         ).map_err(sql_error)?;
         let has_polling_events = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='polling_events')", [], |row| row.get(0)).map_err(sql_error)?;
+        let sequenced = schema::sequenced(&db, "readings").map_err(sql_error)?;
         Ok(Self {
             db,
             pending: Vec::new(),
             last: BTreeMap::new(),
             has_usage_metadata,
             has_polling_events,
+            sequenced,
+            usage_index: Default::default(),
+            #[cfg(test)]
+            usage_rows: Default::default(),
         })
     }
     pub fn prune(&mut self, now: i64) -> Result<(), ProviderError> {
@@ -434,6 +436,7 @@ impl Store {
         // Flush first so pending old observations cannot reappear after pruning.
         self.flush()?;
         let cutoff = now.saturating_sub(30 * 86400);
+        let changes = self.db.total_changes();
         let transaction = self.db.transaction().map_err(sql_error)?;
         transaction
             .execute("DELETE FROM readings WHERE ts < ?1", [cutoff])
@@ -442,7 +445,7 @@ impl Store {
         // performing one readings lookup per retained metadata row. Subtract
         // only retained readings so expired keys and arbitrary orphans both go.
         if repair {
-            transaction.execute("DELETE FROM usage_metadata WHERE (device,ts) IN (SELECT device,ts FROM usage_metadata EXCEPT SELECT device,ts FROM readings WHERE ts >= ?1 ORDER BY device,ts)", [cutoff]).map_err(sql_error)?;
+            transaction.execute("DELETE FROM usage_metadata WHERE (device,ts,sequence) IN (SELECT device,ts,sequence FROM usage_metadata EXCEPT SELECT device,ts,sequence FROM readings WHERE ts >= ?1 ORDER BY device,ts,sequence)", [cutoff]).map_err(sql_error)?;
         } else {
             transaction
                 .execute("DELETE FROM usage_metadata WHERE ts < ?1", [cutoff])
@@ -454,15 +457,28 @@ impl Store {
         transaction.commit().map_err(sql_error)?;
         self.last
             .retain(|_, observation| observation.reading.timestamp >= cutoff);
+        if self.db.total_changes() != changes {
+            self.usage_index.get_mut().take();
+        }
         Ok(())
     }
     /// Retained raw observations, streamed independently of chart sampling.
     /// As with history queries, flush pending observations before querying.
     pub fn query_insights(&self, key: &str, until: i64) -> Result<BatteryInsights, ProviderError> {
         let sql = if self.has_usage_metadata && self.has_polling_events {
-            INSIGHTS_WITH_ACTIVITY
+            if self.sequenced {
+                INSIGHTS_WITH_ACTIVITY_SEQUENCED
+            } else {
+                INSIGHTS_WITH_ACTIVITY
+            }
         } else if self.has_usage_metadata {
-            "SELECT r.ts,r.payload,m.polling_rate,m.session,NULL FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts"
+            if self.sequenced {
+                "SELECT r.ts,r.payload,m.polling_rate,m.session,NULL FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts AND m.sequence=r.sequence WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts,r.sequence"
+            } else {
+                "SELECT r.ts,r.payload,m.polling_rate,m.session,NULL FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts"
+            }
+        } else if self.sequenced {
+            "SELECT ts,payload,NULL,NULL,NULL FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence"
         } else {
             "SELECT ts,payload,NULL,NULL,NULL FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts"
         };
@@ -519,6 +535,8 @@ impl Store {
                 Some("boost") => Some(PollingActivityKind::Boost),
                 Some("restore") => Some(PollingActivityKind::Restore),
                 Some("manual") => Some(PollingActivityKind::Manual),
+                Some("saver") => Some(PollingActivityKind::Saver),
+                Some("saver_restore") => Some(PollingActivityKind::SaverRestore),
                 _ => None,
             };
             builder.push_with_activity(
@@ -579,6 +597,8 @@ impl Store {
                     }
                     "restore" => result.recent.restores += 1,
                     "manual" => result.recent.manual_changes += 1,
+                    "saver" => result.recent.saver_changes += 1,
+                    "saver_restore" => result.recent.saver_restores += 1,
                     _ => {}
                 }
             }
@@ -645,9 +665,12 @@ impl Store {
     ) -> Result<Vec<Reading>, ProviderError> {
         let limit = max_points.clamp(2, 4096);
         let retained_since = until.saturating_sub(30 * 86400);
-        let mut query = self.db.prepare(
-            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC",
-        ).map_err(sql_error)?;
+        let sql = if self.sequenced {
+            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC,sequence DESC"
+        } else {
+            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC"
+        };
+        let mut query = self.db.prepare(sql).map_err(sql_error)?;
         let mut baseline = None;
         let mut rows = query
             .query(params![key, retained_since, since.min(until)])
@@ -686,45 +709,90 @@ impl Store {
         use hb_core::{HistoryAxis, HistorySeries};
         use usage_sampler::Sample;
         let limit = max_points.clamp(2, 4096);
-        let total = self.stream_usage(key, until, |_, _, _| {})?;
+        let bounds_sql = if self.sequenced {
+            "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1)"
+        } else {
+            "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1)"
+        };
+        let bounds: Option<(i64, i64, i64, i64)> = self
+            .db
+            .query_row(
+                bounds_sql,
+                params![key, until.saturating_sub(30 * 86400), until],
+                |r| match r.get::<_, Option<i64>>(0)? {
+                    Some(first) => Ok(Some((first, r.get(1)?, r.get(2)?, r.get(3)?))),
+                    None => Ok(None),
+                },
+            )
+            .map_err(sql_error)?;
+        let revision = (
+            self.db.total_changes(),
+            self.db
+                .pragma_query_value(None, "data_version", |r| r.get(0))
+                .map_err(sql_error)?,
+        );
+        let mut index = self.usage_index.borrow_mut();
+        if !index
+            .as_ref()
+            .is_some_and(|i| i.key == key && i.bounds == bounds && i.revision == revision)
+        {
+            let mut fresh = usage_index::UsageIndex::new(key, bounds, revision);
+            fresh.total = self.stream_usage(key, until, None, |_, r, position, row| {
+                if r.level.is_some_and(|level| level <= 100) {
+                    fresh.push(usage_index::Checkpoint {
+                        timestamp: r.timestamp,
+                        row,
+                        position,
+                    });
+                }
+            })?;
+            *index = Some(fresh);
+        }
+        let total = index.as_ref().map_or(0, |i| i.total);
         let since = total.saturating_sub(seconds.max(1)).max(0);
         let buckets = limit.saturating_sub(2) / 2;
         let mut extremes: Vec<Option<(Sample, Sample)>> = vec![None; buckets];
         let mut baseline: Option<Sample> = None;
         let mut first = None;
         let mut last: Option<Sample> = None;
-        self.stream_usage(key, until, |payload, reading, position| {
-            if !reading.level.is_some_and(|level| level <= 100) {
-                return;
-            }
-            if position < since {
-                baseline
-                    .get_or_insert_with(Sample::default)
-                    .replace(payload, reading, position);
-                return;
-            }
-            let sample = last.get_or_insert_with(Sample::default);
-            sample.replace(payload, reading, position);
-            if first.is_none() {
-                first = Some(baseline.take().unwrap_or_else(|| sample.clone()));
-            }
-            if buckets > 0 {
-                let span = total.saturating_sub(since).max(1);
-                let bucket = ((position.saturating_sub(since) as i128 * buckets as i128)
-                    / span as i128)
-                    .min(buckets as i128 - 1) as usize;
-                if let Some((low, high)) = &mut extremes[bucket] {
-                    if sample.level < low.level {
-                        low.replace(payload, reading, position);
-                    }
-                    if sample.level > high.level {
-                        high.replace(payload, reading, position);
-                    }
-                } else {
-                    extremes[bucket] = Some((sample.clone(), sample.clone()));
+        let checkpoint = index.as_ref().and_then(|i| i.before(since));
+        self.stream_usage(
+            key,
+            until,
+            checkpoint,
+            |payload, reading, position, ordinal| {
+                if !reading.level.is_some_and(|level| level <= 100) {
+                    return;
                 }
-            }
-        })?;
+                if position < since {
+                    baseline
+                        .get_or_insert_with(Sample::default)
+                        .replace(payload, reading, position, ordinal);
+                    return;
+                }
+                let sample = last.get_or_insert_with(Sample::default);
+                sample.replace(payload, reading, position, ordinal);
+                if first.is_none() {
+                    first = Some(baseline.take().unwrap_or_else(|| sample.clone()));
+                }
+                if buckets > 0 {
+                    let span = total.saturating_sub(since).max(1);
+                    let bucket = ((position.saturating_sub(since) as i128 * buckets as i128)
+                        / span as i128)
+                        .min(buckets as i128 - 1) as usize;
+                    if let Some((low, high)) = &mut extremes[bucket] {
+                        if sample.level < low.level {
+                            low.replace(payload, reading, position, ordinal);
+                        }
+                        if sample.level > high.level {
+                            high.replace(payload, reading, position, ordinal);
+                        }
+                    } else {
+                        extremes[bucket] = Some((sample.clone(), sample.clone()));
+                    }
+                }
+            },
+        )?;
         let mut samples = Vec::with_capacity(limit);
         if let Some(sample) = first {
             samples.push(sample);
@@ -735,8 +803,10 @@ impl Store {
         if let Some(sample) = last {
             samples.push(sample);
         }
-        samples.sort_by_key(|sample| sample.timestamp);
-        samples.dedup_by_key(|sample| sample.timestamp);
+        // A timestamp alone does not identify an observation. Keep ordered
+        // same-second changes so the newest charge/rate transition stays visible.
+        samples.sort_by_key(|sample| (sample.timestamp, sample.ordinal));
+        samples.dedup_by_key(|sample| (sample.timestamp, sample.ordinal));
         Ok(HistorySeries {
             samples: samples
                 .into_iter()
@@ -751,23 +821,38 @@ impl Store {
         &self,
         key: &str,
         until: i64,
-        mut visit: impl FnMut(&str, &usage_sampler::TimingReading<'_>, i64),
+        checkpoint: Option<usage_index::Checkpoint>,
+        mut visit: impl FnMut(&str, &usage_sampler::TimingReading<'_>, i64, i64),
     ) -> Result<i64, ProviderError> {
         let sql = if self.has_usage_metadata {
-            "SELECT r.ts,r.payload,m.session FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts"
+            if self.sequenced {
+                "SELECT r.ts,r.payload,m.session,r.sequence FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts AND m.sequence=r.sequence WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 AND (r.ts>?4 OR r.ts=?4 AND r.sequence>=?5) ORDER BY r.ts,r.sequence"
+            } else {
+                "SELECT r.ts,r.payload,m.session,r.rowid FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 AND (r.ts>?4 OR r.ts=?4 AND r.rowid>=?5) ORDER BY r.ts"
+            }
+        } else if self.sequenced {
+            "SELECT ts,payload,NULL,sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?4 OR ts=?4 AND sequence>=?5) ORDER BY ts,sequence"
         } else {
-            "SELECT ts,payload,NULL FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts"
+            "SELECT ts,payload,NULL,rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?4 OR ts=?4 AND rowid>=?5) ORDER BY ts"
         };
         let mut query = self.db.prepare(sql).map_err(sql_error)?;
         let mut rows = query
-            .query(params![key, until.saturating_sub(30 * 86400), until])
+            .query(params![
+                key,
+                checkpoint.map_or(until.saturating_sub(30 * 86400), |c| c.timestamp),
+                until,
+                checkpoint.map_or(until.saturating_sub(30 * 86400), |c| c.timestamp),
+                checkpoint.map_or(i64::MIN, |c| c.row)
+            ])
             .map_err(sql_error)?;
         // Keep time, awake state and one bounded identity; never copy every
         // full reading during either chart pass.
         let mut previous: Option<(i64, bool, Option<u64>)> = None;
         let mut identity: Option<usage_sampler::TimingIdentity> = None;
-        let mut total = 0i64;
+        let mut total = checkpoint.map_or(0, |c| c.position);
         while let Some(row) = rows.next().map_err(sql_error)? {
+            #[cfg(test)]
+            self.usage_rows.set(self.usage_rows.get() + 1);
             let (Ok(timestamp), Ok(payload)) = (row.get::<_, i64>(0), row_text(row, 1)) else {
                 previous = None;
                 continue;
@@ -791,7 +876,7 @@ impl Store {
                     Some(session) => Some(session),
                     None => {
                         previous = None;
-                        visit(payload, &reading, total);
+                        visit(payload, &reading, total, row.get(3).map_err(sql_error)?);
                         continue;
                     }
                 },
@@ -813,9 +898,12 @@ impl Store {
                 identity = Some(usage_sampler::TimingIdentity::from(&reading));
             }
             previous = Some((reading.timestamp, reading_awake, session));
-            visit(payload, &reading, total);
+            visit(payload, &reading, total, row.get(3).map_err(sql_error)?);
         }
         Ok(total)
+    }
+    pub fn release_history_cache(&self) {
+        self.usage_index.borrow_mut().take();
     }
     pub fn load_estimator(&self) -> Estimator {
         // A damaged checkpoint must not allocate an arbitrarily large JSON
@@ -883,12 +971,12 @@ impl HistoryStore for Store {
         if count > limit as i64 && limit < 5 {
             let mut query = self
                 .db
-                .prepare("SELECT ts,payload FROM readings WHERE device=?1 AND ts=?2")
+                .prepare("SELECT ts,payload FROM readings WHERE device=?1 AND rowid=?2")
                 .map_err(sql_error)?;
             let bounds = self
                 .db
                 .query_row(
-                    "SELECT min(ts),max(ts) FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3",
+                    "SELECT (SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1)",
                     params![key, since, until],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )
@@ -897,8 +985,8 @@ impl HistoryStore for Store {
             // between the endpoints over an extra known-level representative.
             let gap: Option<i64> = if limit >= 3 {
                 self.db.query_row(
-                    "SELECT min(ts) FROM readings WHERE device=?1 AND ts>?2 AND ts<?3 AND level IS NULL",
-                    params![key, bounds.0, bounds.1], |r| r.get(0),
+                    "SELECT (SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND level IS NULL AND rowid NOT IN (?4,?5) ORDER BY ts,rowid LIMIT 1)",
+                    params![key, since, until, bounds.0, bounds.1], |r| r.get(0),
                 ).map_err(sql_error)?
             } else {
                 None
@@ -912,7 +1000,7 @@ impl HistoryStore for Store {
                 }
             }
         } else if count <= limit as i64 {
-            let mut query=self.db.prepare("SELECT ts,payload FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts").map_err(sql_error)?;
+            let mut query=self.db.prepare("SELECT ts,payload FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid").map_err(sql_error)?;
             for row in query
                 .query_map(params![key, since, until], |r| history_reading(r, key))
                 .map_err(sql_error)?
@@ -930,7 +1018,7 @@ impl HistoryStore for Store {
             let span = (i128::from(until) - i128::from(since)).max(0) + 1;
             let width = ((span + i128::from(buckets) - 1) / i128::from(buckets))
                 .clamp(1, i128::from(i64::MAX)) as i64;
-            let mut query=self.db.prepare("WITH selected AS (SELECT ts,level,min((ts-?2)/?4,(?5-2)/3-1) AS bucket FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3), extremes AS (SELECT bucket,min(level) AS lo,max(level) AS hi FROM selected GROUP BY bucket), representatives AS (SELECT min(s.ts) AS ts FROM selected s JOIN extremes e ON s.bucket=e.bucket WHERE s.level=e.lo OR s.level=e.hi OR s.level IS NULL GROUP BY s.bucket,s.level), timestamps AS (SELECT ts FROM representatives UNION SELECT min(ts) FROM selected UNION SELECT max(ts) FROM selected) SELECT ts,payload FROM readings WHERE device=?1 AND ts IN (SELECT ts FROM timestamps) ORDER BY ts LIMIT ?5").map_err(sql_error)?;
+            let mut query=self.db.prepare("WITH selected AS (SELECT rowid AS id,ts,level,min((ts-?2)/?4,(?5-2)/3-1) AS bucket FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3), extremes AS (SELECT bucket,min(level) AS lo,max(level) AS hi FROM selected GROUP BY bucket), representatives AS (SELECT s.bucket,s.level,min(s.ts) AS ts FROM selected s JOIN extremes e ON s.bucket=e.bucket WHERE s.level=e.lo OR s.level=e.hi OR s.level IS NULL GROUP BY s.bucket,s.level), ids AS (SELECT min(s.id) AS id FROM selected s JOIN representatives p ON s.bucket=p.bucket AND s.level IS p.level AND s.ts=p.ts GROUP BY s.bucket,s.level UNION SELECT id FROM (SELECT id FROM selected ORDER BY ts,id LIMIT 1) UNION SELECT id FROM (SELECT id FROM selected ORDER BY ts DESC,id DESC LIMIT 1)) SELECT ts,payload FROM readings WHERE device=?1 AND rowid IN (SELECT id FROM ids) ORDER BY ts,rowid LIMIT ?5").map_err(sql_error)?;
             for row in query
                 .query_map(params![key, since, until, width, limit as i64], |r| {
                     history_reading(r, key)
@@ -952,10 +1040,10 @@ impl HistoryStore for Store {
         {
             let mut readings = transaction
                 .prepare(
-                    "INSERT OR REPLACE INTO readings(device,ts,level,payload) VALUES(?1,?2,?3,?4)",
+                    "INSERT INTO readings(device,ts,level,payload,sequence) SELECT ?1,?2,?3,?4,coalesce(max(sequence)+1,0) FROM readings WHERE device=?1 AND ts=?2 RETURNING sequence",
                 )
                 .map_err(sql_error)?;
-            let mut metadata = transaction.prepare("INSERT OR REPLACE INTO usage_metadata(device,ts,polling_rate,session) VALUES(?1,?2,?3,?4)").map_err(sql_error)?;
+            let mut metadata = transaction.prepare("INSERT INTO usage_metadata(device,ts,polling_rate,session,sequence) VALUES(?1,?2,?3,?4,?5)").map_err(sql_error)?;
             // Reuse serialization storage for the whole batch, rather than
             // allocating a new JSON string and session string for every row.
             let mut payload = Vec::with_capacity(512);
@@ -972,20 +1060,22 @@ impl HistoryStore for Store {
                     use std::fmt::Write;
                     write!(&mut session, "{value}").expect("writing to a String");
                 }
-                readings
-                    .execute(params![r.key, r.timestamp, r.level, text])
+                let sequence: i64 = readings
+                    .query_row(params![r.key, r.timestamp, r.level, text], |r| r.get(0))
                     .map_err(sql_error)?;
                 metadata
                     .execute(params![
                         r.key,
                         r.timestamp,
                         observation.polling_rate.map(PollingRate::hz),
-                        observation.session.map(|_| session.as_str())
+                        observation.session.map(|_| session.as_str()),
+                        sequence
                     ])
                     .map_err(sql_error)?;
             }
         }
         transaction.commit().map_err(sql_error)?;
+        self.usage_index.get_mut().take();
         self.pending.clear();
         // Large recovery bursts are exceptional. Do not retain their empty
         // backing allocation throughout subsequent quiet monitoring.
@@ -1213,7 +1303,7 @@ mod tests {
             store
                 .db
                 .execute(
-                    "INSERT OR REPLACE INTO readings VALUES('test',?1,80,?2)",
+                    "INSERT OR REPLACE INTO readings(device,ts,level,payload) VALUES('test',?1,80,?2)",
                     params![ts, serde_json::to_string(&reading).unwrap()],
                 )
                 .unwrap();
@@ -1542,7 +1632,10 @@ mod tests {
         seed(&mut store, "b", 99, Some(95));
         store
             .db
-            .execute("INSERT INTO readings VALUES('a',95,50,'broken')", [])
+            .execute(
+                "INSERT INTO readings(device,ts,level,payload) VALUES('a',95,50,'broken')",
+                [],
+            )
             .unwrap();
         let result = store.query_with_baseline("a", 100, 200, 2).unwrap();
         assert_eq!(result.len(), 1);
@@ -1719,7 +1812,10 @@ mod tests {
         }
         store
             .db
-            .execute("INSERT INTO readings VALUES('usage',300,50,'broken')", [])
+            .execute(
+                "INSERT INTO readings(device,ts,level,payload) VALUES('usage',300,50,'broken')",
+                [],
+            )
             .unwrap();
         let series = store.query_usage("usage", 420, 3600, 20).unwrap();
         assert_eq!(series.until, 60);
@@ -1753,7 +1849,7 @@ mod tests {
             store
                 .db
                 .execute(
-                    "INSERT INTO usage_metadata VALUES('orphan',?1,1000,'1')",
+                    "INSERT INTO usage_metadata(device,ts,polling_rate,session) VALUES('orphan',?1,1000,'1')",
                     [timestamp],
                 )
                 .unwrap();
@@ -1808,10 +1904,10 @@ mod tests {
         let transaction = store.db.transaction().unwrap();
         {
             let mut reading = transaction
-                .prepare("INSERT INTO readings VALUES(?1,?2,50,'{}')")
+                .prepare("INSERT INTO readings(device,ts,level,payload) VALUES(?1,?2,50,'{}')")
                 .unwrap();
             let mut metadata = transaction
-                .prepare("INSERT INTO usage_metadata VALUES(?1,?2,1000,'123456789')")
+                .prepare("INSERT INTO usage_metadata(device,ts,polling_rate,session) VALUES(?1,?2,1000,'123456789')")
                 .unwrap();
             for device in 0..10 {
                 for sample in 0..43200i64 {
@@ -1865,7 +1961,7 @@ mod tests {
         let transaction = store.db.transaction().unwrap();
         {
             let mut insert = transaction
-                .prepare("INSERT INTO readings VALUES(?1,?2,?3,?4)")
+                .prepare("INSERT INTO readings(device,ts,level,payload) VALUES(?1,?2,?3,?4)")
                 .unwrap();
             for i in 0..43200i64 {
                 let mut r = Reading::new("usage", "Mouse", "test", i * 60);
@@ -1920,5 +2016,66 @@ mod tests {
             "43,200-row usage query, shared connection: previous median {:.3} ms, sampled median {:.3} ms; before {before:?}; after {after:?}",
             before[4], after[4]
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_index_tests {
+    use super::*;
+    #[test]
+    fn short_usage_queries_reuse_a_bounded_index_and_release_it_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let mut store = Store::open(&path).unwrap();
+        for minute in 0..4000 {
+            let mut r = Reading::new("mouse", "Mouse", "simulation", minute * 60);
+            r.charging = Some(false);
+            r.level = Some((100 - minute % 100) as u8);
+            store.record(&r).unwrap();
+        }
+        store.flush().unwrap();
+        let until = 3999 * 60;
+        let first = store.query_usage("mouse", until, 600, 80).unwrap();
+        assert_eq!(first.until, until);
+        store.usage_rows.set(0);
+        let second = store.query_usage("mouse", until + 1, 600, 160).unwrap();
+        assert_eq!(second.until, first.until);
+        assert!(store.usage_rows.get() < 512);
+        store.prune_expired(until).unwrap();
+        store.usage_rows.set(0);
+        store.query_usage("mouse", until + 1, 600, 160).unwrap();
+        assert!(
+            store.usage_rows.get() < 512,
+            "short query examined {} rows",
+            store.usage_rows.get()
+        );
+        assert!(
+            store
+                .usage_index
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .points_len_for_test()
+                <= 512
+        );
+        let other = Connection::open(&path).unwrap();
+        let mut r = Reading::new("mouse", "Mouse", "simulation", until);
+        r.level = Some(1);
+        r.charging = Some(false);
+        r.connection = hb_core::Connection::Sleeping;
+        other
+            .execute(
+                "UPDATE readings SET payload=?1 WHERE ts=?2",
+                params![serde_json::to_string(&r).unwrap(), until],
+            )
+            .unwrap();
+        store.usage_rows.set(0);
+        assert_eq!(
+            store.query_usage("mouse", until, 600, 80).unwrap().until,
+            until - 60
+        );
+        assert!(store.usage_rows.get() >= 4000);
+        store.release_history_cache();
+        assert!(store.usage_index.borrow().is_none());
     }
 }

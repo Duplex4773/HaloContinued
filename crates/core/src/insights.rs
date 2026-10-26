@@ -215,8 +215,9 @@ impl InsightsBuilder {
     }
 
     /// Feed chronological raw observations for one device. All memory is bounded.
-    /// Equal/backwards timestamps start a partial period; a different physical
-    /// unit starts fresh learning even when it reuses the same storage key.
+    /// Backwards timestamps start a partial period; equal timestamps contribute
+    /// no elapsed time. A different physical unit starts fresh learning even
+    /// when it reuses the same storage key.
     /// Session/rate changes and pauses exclude their boundary interval only.
     pub fn push(&mut self, observation: UsageObservation) {
         self.push_with_activity(observation, None);
@@ -266,7 +267,7 @@ impl InsightsBuilder {
         }
         let discontinuity = self.previous.as_ref().is_some_and(|previous| {
             let old = &previous.reading;
-            reading.timestamp <= old.timestamp
+            reading.timestamp < old.timestamp
         });
         if discontinuity {
             self.reset_continuity();
@@ -339,6 +340,12 @@ impl InsightsBuilder {
                         .unwrap();
                     self.recent.rates[index] =
                         self.recent.rates[index].saturating_add(recent_seconds);
+                    if activity == Some(crate::PollingActivityKind::Saver)
+                        && activity == self.previous_activity
+                    {
+                        self.recent.saver_seconds =
+                            self.recent.saver_seconds.saturating_add(recent_seconds);
+                    }
                     if activity == Some(crate::PollingActivityKind::Boost)
                         && activity == self.previous_activity
                     {

@@ -28,7 +28,19 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Current release: **1.0.10** for Windows 11 x64, available as an unsigned per-user
+Local build: **1.1.0**, with a native device overview, device cards, focused
+control tabs and a refreshed tray menu. The redesign adds no background timers
+or device queries. Device info reads firmware only when opened or refreshed.
+This build also preserves rapid history transitions, combines repeated graph
+requests, avoids connection checks for Bluetooth devices with no battery data,
+and records battery-saver changes separately in Insights. Short Time used graphs
+reuse a bounded timing index, released when History closes. Existing history is
+upgraded automatically without changing its recorded timestamps. This build has
+not been published yet. Rapid readings remain ordered on the graph, same-second
+rate changes retain their battery session, and selected device cards respect
+Windows high-contrast colours.
+
+Latest published release: **1.0.10** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
@@ -74,6 +86,7 @@ vendor suite. Hardware changes are optional and disabled by default.
 | Hardware sleep timers | Set how long a supported mouse waits before sleeping; the device handles the timer itself. |
 | Low-battery mode | Optionally reduce polling rate and shorten sleep time below your chosen threshold. Fullscreen boost takes priority for competitive play. |
 | History and Insights | Thirty days of history, estimated battery life, battery sessions and estimates that follow your mix of normal, boosted and low-battery polling rates. |
+| Device information | View the connection, supported controls and verification status. Firmware is read on demand for reviewed modern Razer mice, with no background firmware polling. |
 | Personalisation | Rename devices, hide icons, choose icon styles and colours, set per-device alert thresholds and choose which providers to enable. |
 | Native dashboard | Devices, History, Insights and Settings with light/dark appearance following Windows, plus matching tray menus. |
 | Portable use | A self-contained executable, optional local settings and optional startup with Windows. Closing the dashboard keeps monitoring active. |
@@ -255,13 +268,18 @@ recovery when their collection inventory changes.
 Fullscreen boost is off by default and enabled per mouse. Windows is checked
 every five seconds when needed; boosting requires ten seconds of stable
 fullscreen gaming, and restoration waits fifteen seconds on the desktop. Some
-borderless games are missed. Keep the app running for restoration.
+borderless games are missed.
 
 Refresh and changes to other devices preserve verified original polling rates
-and sleep timers. Before restoring, the app checks the target's Windows connection
-stamp, exact identity and current setting. A reconnect, missing connection proof
-after a refresh, or an uncertain write cancels that setting's automatic recovery.
-These checks run with configuration transactions; they add no background scan or timer.
+and sleep timers. The app records originals before automatic changes, so it can
+also restore them after an app restart or an interrupted session. It checks the
+device identity and current setting before restoring. If Windows gives a device
+a new connection identifier, recovery also requires a matching hardware serial
+and Windows container, plus a fresh reading. Ambiguous devices, unavailable
+proof and settings changed elsewhere are left untouched. An interrupted manual
+change takes priority and may need to be checked by the user. Recovery uses
+normal device events and the existing storage worker; it adds no background scan
+or timer. Changes made by older builds have no saved recovery record.
 
 With device settings enabled, launch also checks supported mice's current polling
 rates in the background. Receivers have up to five minutes to become available;
@@ -277,7 +295,17 @@ Low-battery mode is also opt-in. It only lowers a faster polling rate or shorten
 a longer sleep timer. Boost takes priority over its polling rate. Prior settings
 return when charging or when battery recovers five percentage points above the
 threshold. The mode stays saved but inactive on a recognized wired connection.
-Manual changes take priority; uncertain writes are not automatically retried.
+Manual changes take priority; uncertain writes are not automatically repeated.
+
+On Devices, select **Device info** to read the reported firmware version. The
+read-only query also works when device-setting changes are disabled. Use
+**Refresh information** after a firmware update or connection change. Other brands
+and unsupported Razer connections show that firmware reading is unavailable.
+The standard query does not distinguish separate mouse and receiver versions;
+the page labels the reported version and this limitation rather than inventing
+a second version. Verification labels describe tested controls and connections;
+a successful firmware response does not certify every feature. Reads are
+cancelled on leaving the view, closing it, reconnecting or suspending Windows.
 
 DPI changes first save recovery data under `dpi-backups` in the app's data folder.
 Restore previous requires the same verified connection/profile during the current
@@ -478,11 +506,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.0.10
+.\tools\package-rust.ps1 -Version 1.1.0
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.0.10-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.1.0-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -492,13 +520,13 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.0.10
+.\tools\package-installer.ps1 -Version 1.1.0
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.0.10-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.0.10-windows-x64.exe` and
-`dist/HaloContinued-1.0.10-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.1.0-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.1.0-windows-x64.exe` and
+`dist/HaloContinued-1.1.0-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with

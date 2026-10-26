@@ -74,3 +74,27 @@ lines.append('];\n')
 catalog.write_text(old[:start].replace('upstream 1.14.0', 'upstream 1.15.0').replace('tools/port_catalog.py', 'tools/sync-upstream-catalog.py') + '\n'.join(lines) + old[end:], encoding='utf-8')
 (ROOT / 'crates/providers/tests/catalog-fixtures.json').write_text(json.dumps(ordered, indent=2) + '\n', encoding='utf-8')
 print(f'{len(ordered)} reviewed battery identities; device-control allowlists untouched.')
+
+# Keep the display-only parent verification list aligned with the reviewed IDs.
+# This metadata never expands a device-control allowlist.
+verified = {
+    'razer:0528:', 'steam:1304:', 'steam:1305:', 'nzxt:2101:', 'nzxt:2129:',
+    'mchose:f013:', 'hyperx_cloud3:0995:', 'hyperx_cloud3:0795:',
+    'pulsar:5406:', 'pulsar:3414:', 'steelseries:2317:', 'corsair:1b7f:', 'corsair:0a40:',
+}
+for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text()):
+    provider, _, pid, _, variant, _ = entry['device']
+    protocol = variant.removeprefix('pr:')
+    family = {'nearlink':0x108c, 'ajazz':0x5c2f, 'aula-mouse':0x22a0, 'turbo':0x6008}.get(protocol, pid)
+    if protocol == 'rapoo':
+        family = 0x1413 if pid in (0x1413,0x4613) else 0x1924
+    if protocol == 'turtle':
+        family = 0x229b if pid in (0x229b,0x229e) else 0x2251
+    if provider not in ('shield','xinput'):
+        verified.add(f'{provider}:{family:04x}:')
+metadata = ROOT / 'crates/providers/src/device_metadata.rs'
+text = metadata.read_text(encoding='utf-8')
+start = text.index('const PARENT_PREFIXES:')
+end = text.index('];', start) + 2
+text = text[:start] + 'const PARENT_PREFIXES: &[&str] = &[\n' + ''.join(f'    "{p}",\n' for p in sorted(verified)) + '];' + text[end:]
+metadata.write_text(text, encoding='utf-8')

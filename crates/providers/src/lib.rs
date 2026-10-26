@@ -2,6 +2,8 @@ pub mod catalog;
 pub mod community;
 pub mod configuration;
 pub mod controls;
+pub mod device_info;
+pub mod device_metadata;
 pub mod dpi;
 mod dpi_logitech;
 mod logitech_adapter;

@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
     sync::{
-        Mutex,
+        Mutex, MutexGuard, TryLockError,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -35,7 +35,20 @@ pub fn property(dev: u32, key: &DEVPROPKEY) -> Option<Vec<u8>> {
     let result = unsafe {
         CM_Get_DevNode_PropertyW(dev, key, &mut kind, Some(bytes.as_mut_ptr()), &mut size, 0)
     };
-    (result == CR_SUCCESS).then_some(bytes)
+    if result != CR_SUCCESS {
+        return None;
+    }
+    completed_property(bytes, size)
+}
+fn completed_property(mut bytes: Vec<u8>, size: u32) -> Option<Vec<u8>> {
+    let size = size as usize;
+    if size > bytes.len() {
+        return None;
+    }
+    // The property can change between the size and data queries. Never treat
+    // unused bytes from the original buffer as part of the returned value.
+    bytes.truncate(size);
+    Some(bytes)
 }
 pub fn container(dev: u32) -> Option<String> {
     property(dev, &DEVPKEY_Device_ContainerId)
@@ -71,6 +84,27 @@ const SHORT_RETRY: Duration = Duration::from_secs(30);
 // deliberately much shorter than metadata caching: a new vendor poll or short
 // collection retry must still recover when Windows misses a connection event.
 const CENSUS_TTL: Duration = Duration::from_secs(1);
+const SHARED_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+fn shared_lock<T>(lock: &Mutex<T>, timeout: Duration) -> Result<MutexGuard<'_, T>, ProviderError> {
+    let mut deadline = None;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let until = *deadline.get_or_insert_with(|| Instant::now() + timeout);
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderError::new(
+                "Device access is busy. Try again shortly.",
+            ));
+        }
+        // Sleep only when another native operation owns the shared resource.
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
 struct InterfaceCensus {
     counts: BTreeMap<u16, usize>,
     complete: bool,
@@ -177,7 +211,7 @@ impl EnumerationCache {
     }
 }
 pub struct WindowsHid {
-    api: Mutex<HidApi>,
+    api: Mutex<Option<HidApi>>,
     cache: Mutex<EnumerationCache>,
     census: Mutex<CensusCache>,
     generation: AtomicU64,
@@ -185,11 +219,11 @@ pub struct WindowsHid {
 }
 impl WindowsHid {
     pub fn new() -> Result<Self, ProviderError> {
+        // Creating HidApi also enumerates devices in the current backend.
+        // Defer that native work to a provider worker that actually needs it.
+        HidApi::disable_device_discovery();
         Ok(Self {
-            api: Mutex::new({
-                HidApi::disable_device_discovery();
-                HidApi::new().map_err(error)?
-            }),
+            api: Mutex::new(None),
             cache: Mutex::new(EnumerationCache::default()),
             census: Mutex::new(CensusCache::default()),
             generation: AtomicU64::new(0),
@@ -199,6 +233,12 @@ impl WindowsHid {
     pub fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
+}
+fn initialized_api(slot: &mut Option<HidApi>) -> Result<&mut HidApi, ProviderError> {
+    if slot.is_none() {
+        *slot = Some(HidApi::new().map_err(error)?);
+    }
+    Ok(slot.as_mut().expect("HID API was initialized"))
 }
 struct DeviceSet(HDEVINFO);
 impl Drop for DeviceSet {
@@ -422,10 +462,10 @@ impl HidTransport for WindowsHid {
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
         let generation = self.generation.load(Ordering::Relaxed);
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cache = shared_lock(&self.cache, SHARED_LOCK_WAIT)?;
         cache.enumerate(vendor, generation, self.epoch.elapsed(), || {
             let (present, absent) = {
-                let mut census = self.census.lock().unwrap_or_else(|p| p.into_inner());
+                let mut census = shared_lock(&self.census, SHARED_LOCK_WAIT)?;
                 let present =
                     census.count(vendor, generation, self.epoch.elapsed(), present_counts)?;
                 (present, census.proves_absent(vendor))
@@ -436,7 +476,8 @@ impl HidTransport for WindowsHid {
                 return Ok((Vec::new(), 0));
             }
             // add_devices targets a vendor; never enumerate unrelated vendor collections.
-            let mut api = self.api.lock().unwrap_or_else(|p| p.into_inner());
+            let mut api = shared_lock(&self.api, SHARED_LOCK_WAIT)?;
+            let api = initialized_api(&mut api)?;
             api.reset_devices().map_err(error)?;
             api.add_devices(vendor, 0).map_err(error)?;
             let devices = api
@@ -466,18 +507,12 @@ impl HidTransport for WindowsHid {
         let result = {
             // Enumeration locks cache before API. Release API before taking
             // cache here, so failed opens cannot invert that lock order.
-            self.api
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_path(&path)
-                .map_err(error)
+            let mut api = shared_lock(&self.api, SHARED_LOCK_WAIT)?;
+            initialized_api(&mut api)?.open_path(&path).map_err(error)
         };
         let handle = match result {
             Ok(handle) => handle,
-            Err(error) => self
-                .cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+            Err(error) => shared_lock(&self.cache, SHARED_LOCK_WAIT)?
                 .after_open(info.vendor_id, Err(error))?,
         };
         Ok(Box::new(Session(handle, info.output_length)))
@@ -565,6 +600,31 @@ impl HidSession for Session {
 }
 #[cfg(test)]
 mod cache_tests {
+    #[test]
+    fn changed_native_property_size_never_includes_unused_buffer_bytes() {
+        assert_eq!(
+            super::completed_property(vec![1, 2, 0, 0], 2),
+            Some(vec![1, 2])
+        );
+        assert_eq!(super::completed_property(vec![1, 2], 0), Some(vec![]));
+        assert_eq!(super::completed_property(vec![1, 2], 3), None);
+    }
+    #[test]
+    fn hid_context_is_not_created_until_access_is_needed() {
+        let transport = super::WindowsHid::new().unwrap();
+        assert!(transport.api.lock().unwrap().is_none());
+    }
+    #[test]
+    fn shared_hid_lock_returns_a_recoverable_error_when_busy() {
+        let lock = std::sync::Mutex::new(5);
+        let held = lock.lock().unwrap();
+        assert!(super::shared_lock(&lock, std::time::Duration::ZERO).is_err());
+        drop(held);
+        assert_eq!(
+            *super::shared_lock(&lock, std::time::Duration::ZERO).unwrap(),
+            5
+        );
+    }
     #[test]
     fn windows_padding_is_accepted_but_incomplete_native_reports_are_rejected() {
         for (requested, cap, reported) in [

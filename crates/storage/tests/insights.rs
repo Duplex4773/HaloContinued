@@ -294,7 +294,7 @@ fn pending_metadata_survives_drop_restart_and_rate_session_boundaries() {
 }
 
 #[test]
-fn same_second_metadata_replacement_and_legacy_record_clear_evidence_atomically() {
+fn same_second_metadata_preserves_each_observation_and_legacy_record_clears_only_latest_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("history.db");
     let mut store = Store::open(&path).unwrap();
@@ -308,7 +308,7 @@ fn same_second_metadata_replacement_and_legacy_record_clear_evidence_atomically(
     let db = Connection::open(&path).unwrap();
     let metadata: (i64, String) = db
         .query_row(
-            "SELECT polling_rate,session FROM usage_metadata",
+            "SELECT polling_rate,session FROM usage_metadata ORDER BY ts DESC,sequence DESC LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -320,13 +320,13 @@ fn same_second_metadata_replacement_and_legacy_record_clear_evidence_atomically(
     store.flush().unwrap();
     let metadata: (Option<i64>, Option<String>) = db
         .query_row(
-            "SELECT polling_rate,session FROM usage_metadata",
+            "SELECT polling_rate,session FROM usage_metadata ORDER BY ts DESC,sequence DESC LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(metadata, (None, None));
-    assert_eq!(store.query("synthetic-a", 0, 200, 100).unwrap().len(), 1);
+    assert_eq!(store.query("synthetic-a", 0, 200, 100).unwrap().len(), 3);
 }
 
 fn legacy_database(path: &std::path::Path) {
@@ -337,7 +337,7 @@ fn legacy_database(path: &std::path::Path) {
         observation(60, 89, None, None),
     ] {
         db.execute(
-            "INSERT INTO readings VALUES(?1,?2,?3,?4)",
+            "INSERT INTO readings(device,ts,level,payload) VALUES(?1,?2,?3,?4)",
             params![
                 sample.reading.key,
                 sample.reading.timestamp,
@@ -375,7 +375,7 @@ fn old_database_is_readable_without_upgrade_and_upgrades_preserving_history() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM usage_metadata", [], |row| row
@@ -477,7 +477,7 @@ fn corrupt_raw_rows_break_insight_continuity() {
     store.flush().unwrap();
     let db = Connection::open(&path).unwrap();
     db.execute(
-        "INSERT INTO readings VALUES('synthetic-a',60,89,'corrupt')",
+        "INSERT INTO readings(device,ts,level,payload) VALUES('synthetic-a',60,89,'corrupt')",
         [],
     )
     .unwrap();

@@ -1,6 +1,23 @@
 use hb_core::*;
 
 #[test]
+fn same_second_rate_changes_do_not_invent_a_new_battery_session() {
+    let mut charged = point(0, 90);
+    charged.reading.charging = Some(true);
+    let mut boosted = point(120, 89);
+    boosted.polling_rate = PollingRate::try_from(2000).ok();
+    boosted.session = Some(2);
+    let mut last = boosted.clone();
+    last.reading.timestamp = 180;
+    last.reading.level = Some(88);
+    let data = summarize([charged, point(60, 90), point(120, 89), boosted, last]);
+    assert_eq!(data.cycles.len(), 1);
+    assert_eq!(data.cycles[0].evidence, CycleEvidence::ObservedCharge);
+    assert_eq!(data.cycles[0].awake_seconds, 120);
+    assert_eq!(data.cycles[0].consumed_percent, 2);
+}
+
+#[test]
 fn changed_identity_under_a_reused_key_starts_a_new_partial_cycle() {
     for field in 0..4 {
         let mut next = point(60, 50);

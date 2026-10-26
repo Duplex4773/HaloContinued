@@ -285,6 +285,17 @@ impl BluetoothProvider {
         }
         Ok(())
     }
+    fn battery_level(&mut self, mac: &str, reported: Option<u8>) -> Option<u8> {
+        if let Some(level) = reported {
+            self.levels.insert(mac.into(), level);
+        }
+        let level = self.levels.get(mac).copied();
+        if level.is_none() {
+            self.links.remove(mac);
+            self.link_status.remove(mac);
+        }
+        level
+    }
     fn snapshot(&mut self, c: &PollContext<'_>) -> PollResult {
         let set = DeviceSet(
             unsafe {
@@ -356,6 +367,12 @@ impl BluetoothProvider {
         let mut out = Vec::new();
         self.diagnostics.clear();
         for (mac, node) in nodes {
+            // A node without battery evidence needs neither a WinRT connection
+            // object nor two-second status checks. A later PnP battery property
+            // will discover it through the existing minute/event refresh.
+            let Some(level) = self.battery_level(&mac, node.level) else {
+                continue;
+            };
             // Reuse a successful status query within this snapshot. A failed
             // query can require a new WinRT object, not a false disconnection.
             let native = self.links.get(&mac).and_then(|d| d.connected().ok());
@@ -367,12 +384,6 @@ impl BluetoothProvider {
                 }
                 self.links.get(&mac).and_then(|d| d.connected().ok())
             });
-            if let Some(level) = node.level {
-                self.levels.insert(mac.clone(), level);
-            }
-            let Some(level) = self.levels.get(&mac).copied() else {
-                continue;
-            };
             // Non-battery nodes need no connection evidence. For a battery
             // device, unknown state is a failed snapshot and retains its last
             // reading through the existing bounded recovery path.
@@ -648,6 +659,22 @@ impl BatteryProvider for ControllerProvider {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn non_battery_nodes_do_not_keep_fast_connection_checks_alive() {
+        let mut provider = BluetoothProvider {
+            next_full: Duration::from_secs(60),
+            ..Default::default()
+        };
+        provider.link_status.insert("unrelated".into(), Some(true));
+        assert_eq!(provider.battery_level("unrelated", None), None);
+        assert!(provider.links.is_empty());
+        assert!(provider.link_status.is_empty());
+        assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(60)));
+        assert_eq!(provider.battery_level("mouse", Some(42)), Some(42));
+        assert_eq!(provider.battery_level("mouse", None), Some(42));
+    }
+
     #[test]
     fn bluetooth_inventory_filters_native_ids_before_allocating_strings() {
         fn previous(wide: &[u16]) -> Option<String> {
@@ -769,7 +796,6 @@ mod tests {
         }
         assert_eq!(provider.levels["sleeping-paired"], 75);
     }
-    use super::*;
     #[test]
     fn service_node_mac_and_boundaries() {
         assert_eq!(

@@ -34,6 +34,7 @@ pub struct Palette {
     pub dark: bool,
     pub high_contrast: bool,
 }
+pub(crate) const PANEL_MARKER: isize = 0x4842_504c;
 const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
 }
@@ -57,27 +58,27 @@ impl Palette {
         }
         if dark {
             Self {
-                background: rgb(22, 25, 29),
-                surface: rgb(31, 35, 40),
-                text: rgb(235, 239, 243),
-                disabled: rgb(165, 175, 186),
-                border: rgb(68, 76, 86),
-                accent: rgb(111, 222, 171),
-                selection: rgb(35, 67, 54),
-                selection_text: rgb(255, 255, 255),
+                background: rgb(22, 27, 26),
+                surface: rgb(32, 38, 37),
+                text: rgb(237, 242, 239),
+                disabled: rgb(169, 185, 174),
+                border: rgb(53, 65, 59),
+                accent: rgb(126, 225, 178),
+                selection: rgb(36, 62, 50),
+                selection_text: rgb(126, 225, 178),
                 dark,
                 high_contrast,
             }
         } else {
             Self {
-                background: rgb(246, 248, 250),
+                background: rgb(247, 248, 247),
                 surface: rgb(255, 255, 255),
-                text: rgb(31, 41, 51),
-                disabled: rgb(91, 104, 117),
-                border: rgb(192, 201, 210),
-                accent: rgb(20, 119, 83),
-                selection: rgb(222, 240, 230),
-                selection_text: rgb(20, 80, 56),
+                text: rgb(32, 38, 36),
+                disabled: rgb(89, 103, 94),
+                border: rgb(220, 227, 223),
+                accent: rgb(17, 107, 72),
+                selection: rgb(222, 241, 229),
+                selection_text: rgb(17, 107, 72),
                 dark,
                 high_contrast,
             }
@@ -178,6 +179,30 @@ impl DashboardTheme {
                 &dark as *const _ as _,
                 size_of::<i32>() as u32,
             );
+            if !self.palette.high_contrast {
+                for (attribute, color) in [
+                    (DWMWA_CAPTION_COLOR, self.palette.background),
+                    (DWMWA_TEXT_COLOR, self.palette.text),
+                    (DWMWA_BORDER_COLOR, self.palette.border),
+                ] {
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        attribute,
+                        &color as *const _ as _,
+                        size_of::<COLORREF>() as u32,
+                    );
+                }
+            } else {
+                let default_color = 0xffff_ffffu32;
+                for attribute in [DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_BORDER_COLOR] {
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        attribute,
+                        &default_color as *const _ as _,
+                        size_of::<u32>() as u32,
+                    );
+                }
+            }
             let _ = InvalidateRect(Some(hwnd), None, true);
         }
     }
@@ -252,7 +277,8 @@ impl DashboardTheme {
         }
     }
     pub fn control_colors(&self, message: u32, hdc: HDC, child: HWND) -> Option<LRESULT> {
-        let surface = matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX)
+        let surface = unsafe { GetWindowLongPtrW(child, GWLP_USERDATA) == PANEL_MARKER }
+            || matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX)
             || (message == WM_CTLCOLORSTATIC && unsafe { class_name(child) } == "Edit");
         if !surface && !matches!(message, WM_CTLCOLORSTATIC | WM_CTLCOLORBTN) {
             return None;
@@ -262,8 +288,7 @@ impl DashboardTheme {
                 hdc,
                 if IsWindowEnabled(child).as_bool() {
                     if !self.palette.high_contrast
-                        && !surface
-                        && matches!(GetDlgCtrlID(child), 45..=47 | 77 | 78 | 95..=97 | 99 | 213 | 216 | 219)
+                        && matches!(GetDlgCtrlID(child), 45..=47 | 77 | 78 | 95..=97 | 99 | 213 | 216 | 219 | 464..=466 | 472 | 481 | 489)
                     {
                         self.palette.disabled
                     } else {
@@ -295,7 +320,7 @@ impl DashboardTheme {
         }
         unsafe {
             let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
-            if item.CtlType == ODT_STATIC {
+            if item.CtlType == ODT_STATIC || (item.CtlType == ODT_BUTTON && item.CtlID >= 1000) {
                 let dpi = GetDpiForWindow(item.hwndItem).max(96);
                 let mut cache = self.widget_font.borrow_mut();
                 if cache.as_ref().is_none_or(|cached| cached.dpi != dpi) {
@@ -482,6 +507,7 @@ unsafe fn notify_scroll(hwnd: HWND, command: u32, position: i32) {
 unsafe fn scroll_input(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: usize) -> bool {
     unsafe {
         let gesture = (*(data as *const ControlAppearance)).scroll;
+        let x = lp.0 as i16 as i32;
         let y = (lp.0 >> 16) as i16 as i32;
         match msg {
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -505,6 +531,9 @@ unsafe fn scroll_input(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: usize
                         offset: y - bar.xyThumbTop,
                     };
                     SetCapture(hwnd);
+                    if GetCapture() != hwnd {
+                        (*(data as *mut ControlAppearance)).scroll = ScrollGesture::Idle;
+                    }
                     return true;
                 };
                 (*(data as *mut ControlAppearance)).scroll = ScrollGesture::Repeat {
@@ -512,8 +541,12 @@ unsafe fn scroll_input(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: usize
                     y,
                 };
                 SetCapture(hwnd);
-                // No idle timer: repeat exists only while the mouse is held.
-                SetTimer(Some(hwnd), SCROLL_REPEAT, 400, None);
+                if GetCapture() == hwnd {
+                    // No idle timer: repeat exists only while the mouse is held.
+                    SetTimer(Some(hwnd), SCROLL_REPEAT, 400, None);
+                } else {
+                    (*(data as *mut ControlAppearance)).scroll = ScrollGesture::Idle;
+                }
                 notify_scroll(hwnd, command.0 as u32, 0);
                 true
             }
@@ -537,8 +570,16 @@ unsafe fn scroll_input(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: usize
                         }
                     }
                 } else if let ScrollGesture::Repeat { command, .. } = gesture {
-                    (*(data as *mut ControlAppearance)).scroll =
-                        ScrollGesture::Repeat { command, y };
+                    let mut bounds = RECT::default();
+                    let inside = GetClientRect(hwnd, &mut bounds).is_ok()
+                        && x >= bounds.left
+                        && x < bounds.right;
+                    (*(data as *mut ControlAppearance)).scroll = ScrollGesture::Repeat {
+                        command,
+                        // Captured movement outside either side of the control
+                        // pauses repeat until the pointer returns.
+                        y: if inside { y } else { i32::MIN },
+                    };
                 }
                 true
             }
@@ -613,7 +654,19 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
             return DefSubclassProc(hwnd, msg, wp, lp);
         }
         let appearance = *(data as *const ControlAppearance);
-        let palette = appearance.palette;
+        let input_background = appearance.palette.background;
+        let mut palette = appearance.palette;
+        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) == PANEL_MARKER {
+            palette.background = palette.surface;
+        }
+        // Device cards use the same native button behaviour, with owner drawing
+        // sharing the dashboard's single cached value font.
+        if appearance.kind == ControlKind::Button
+            && GetWindowLongW(hwnd, GWL_STYLE) as u32 & BS_TYPEMASK as u32 == BS_OWNERDRAW as u32
+            && matches!(msg, WM_PAINT | WM_PRINTCLIENT | WM_PRINT)
+        {
+            return DefSubclassProc(hwnd, msg, wp, lp);
+        }
         if !palette.high_contrast && appearance.kind != ControlKind::Text && msg == WM_ERASEBKGND {
             // Buttons, selectors and the scrollbar paint their complete client
             // area. A separate native erasure exposes a light frame in dark mode.
@@ -739,7 +792,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                 rounded_surface(
                     hdc,
                     &rect,
-                    palette.surface,
+                    input_background,
                     if appearance.hovered && enabled {
                         palette.accent
                     } else {
@@ -809,16 +862,22 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                 let selected = style & BS_PUSHLIKE as u32 != 0
                     && SendMessageW(hwnd, BM_GETCHECK, None, None).0 == BST_CHECKED.0 as isize;
                 let enabled = IsWindowEnabled(hwnd).as_bool();
-                let primary = matches!(GetDlgCtrlID(hwnd), 15 | 40 | 210) && !check;
+                let id = GetDlgCtrlID(hwnd);
+                let navigation = matches!(id, 1..=4 | 6 | 17..=19 | 22 | 24);
+                let primary = matches!(id, 15 | 40 | 210 | 433 | 453) && !check;
                 let active = enabled && (appearance.hovered || state & BST_PUSHED != 0);
                 let background = if check {
                     palette.background
-                } else if (primary && enabled) || selected || active {
+                } else if primary && enabled {
+                    palette.accent
+                } else if navigation {
+                    palette.background
+                } else if selected || active {
                     palette.selection
                 } else {
                     palette.surface
                 };
-                let background = if active && !check {
+                let background = if active && !check && !navigation {
                     let amount: u32 = if state & BST_PUSHED != 0 { 20 } else { 10 };
                     let channel = |shift: u32| -> u32 {
                         let a = (background.0 >> shift) & 255;
@@ -846,7 +905,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                         hdc,
                         &mark,
                         if checked {
-                            palette.selection
+                            palette.accent
                         } else {
                             palette.surface
                         },
@@ -863,7 +922,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                         SetTextColor(
                             hdc,
                             if enabled {
-                                palette.accent
+                                palette.background
                             } else {
                                 palette.disabled
                             },
@@ -882,14 +941,16 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                         hdc,
                         &rect,
                         background,
-                        if selected || (primary && enabled) || active {
+                        if navigation {
+                            background
+                        } else if selected || (primary && enabled) || active {
                             palette.accent
                         } else {
                             palette.border
                         },
                         10 * dpi / 96,
                     );
-                    if selected {
+                    if selected && !navigation {
                         let rail = RECT {
                             left: rect.left + 14 * dpi / 96,
                             right: rect.right - 14 * dpi / 96,
@@ -909,7 +970,13 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                 SetTextColor(
                     hdc,
                     if IsWindowEnabled(hwnd).as_bool() {
-                        if selected || primary || active {
+                        if primary {
+                            if palette.dark {
+                                rgb(18, 43, 32)
+                            } else {
+                                rgb(255, 255, 255)
+                            }
+                        } else if selected || active {
                             palette.selection_text
                         } else {
                             palette.text
@@ -1102,7 +1169,7 @@ mod tests {
                         (PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND) as isize,
                     )),
                 );
-                assert_eq!(GetPixel(dc, rect.right - 4, 4), theme.palette.surface);
+                assert_eq!(GetPixel(dc, rect.right - 4, 4), theme.palette.background);
             }
             SelectObject(dc, previous);
             let _ = DeleteObject(bitmap.into());
@@ -1315,6 +1382,16 @@ mod tests {
                 assert!(matches!(
                     (*(data as *const ControlAppearance)).scroll,
                     ScrollGesture::Repeat { .. }
+                ));
+                SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(LPARAM((2 << 16) | 30)));
+                assert!(matches!(
+                    (*(data as *const ControlAppearance)).scroll,
+                    ScrollGesture::Repeat { y: i32::MIN, .. }
+                ));
+                SendMessageW(hwnd, WM_MOUSEMOVE, None, Some(LPARAM((2 << 16) | 5)));
+                assert!(matches!(
+                    (*(data as *const ControlAppearance)).scroll,
+                    ScrollGesture::Repeat { y: 2, .. }
                 ));
                 SendMessageW(hwnd, WM_CANCELMODE, None, None);
                 assert!(matches!(

@@ -173,6 +173,84 @@ fn a_bluetooth_takeover_shares_the_cooldown_when_only_its_container_is_available
 }
 
 #[test]
+fn conflicting_containers_do_not_share_or_reset_low_sound_cooldowns() {
+    let mut e = engine();
+    let mut first = reading(Some(10));
+    first.serial = Some("shared-serial".into());
+    first.container = Some("container-a".into());
+    assert_eq!(poll(&mut e, first.clone(), 0.0), Some(10));
+
+    let mut second = reading(Some(12));
+    second.key = "second-mouse".into();
+    second.source = "logitech".into();
+    second.serial = Some("SHARED-SERIAL".into());
+    second.container = Some("container-b".into());
+    e.apply("logitech", Ok(vec![second.clone()]), 1.0, false);
+    assert_eq!(e.take_low_battery_sound(), Some(12));
+    assert_eq!(poll(&mut e, first.clone(), 2.0), None);
+
+    second.charging = Some(true);
+    e.apply("logitech", Ok(vec![second.clone()]), 3.0, false);
+    assert_eq!(e.take_low_battery_sound(), None);
+    assert_eq!(poll(&mut e, first, 4.0), None);
+    second.charging = Some(false);
+    e.apply("logitech", Ok(vec![second]), 5.0, false);
+    assert_eq!(e.take_low_battery_sound(), Some(12));
+
+    // A third observation without a container cannot be assigned to either
+    // known unit merely because it shares their conflicting serial.
+    let mut unknown = reading(Some(15));
+    unknown.key = "unknown-container".into();
+    unknown.source = "other".into();
+    unknown.serial = Some("shared-serial".into());
+    e.apply("other", Ok(vec![unknown]), 6.0, false);
+    assert_eq!(e.take_low_battery_sound(), Some(15));
+}
+
+#[test]
+fn linked_wired_and_wireless_modes_keep_one_sound_cooldown() {
+    let mut e = engine();
+    let mut wireless = reading(Some(10));
+    wireless.key = "razer:00bf:TESTUNIT1234".into();
+    wireless.kind = "mouse".into();
+    wireless.via = "usb".into();
+    wireless.serial = Some("TESTUNIT1234".into());
+    wireless.container = Some("wireless-container".into());
+    assert_eq!(poll(&mut e, wireless, 0.0), Some(10));
+
+    let mut wired = reading(Some(10));
+    wired.key = "razer:00be:TESTUNIT1234".into();
+    wired.kind = "mouse".into();
+    wired.via = "usb".into();
+    wired.serial = Some("TESTUNIT1234".into());
+    wired.container = Some("wired-container".into());
+    assert_eq!(poll(&mut e, wired, 1.0), None);
+}
+
+#[test]
+fn a_healthy_serial_collision_cannot_inherit_a_departed_devices_cooldown() {
+    let mut e = engine();
+    let mut first = reading(Some(10));
+    first.serial = Some("shared-serial".into());
+    first.container = Some("container-a".into());
+    assert_eq!(poll(&mut e, first.clone(), 0.0), Some(10));
+
+    let mut second = reading(Some(80));
+    second.key = "second-mouse".into();
+    second.source = "logitech".into();
+    second.serial = Some("shared-serial".into());
+    second.container = Some("container-b".into());
+    e.apply("logitech", Ok(vec![second.clone()]), 1.0, false);
+    assert_eq!(e.take_low_battery_sound(), None);
+    assert_eq!(poll(&mut e, first, 2.0), None);
+    e.apply("razer", Ok(vec![]), 3.0, false);
+    e.apply("razer", Ok(vec![]), 4.0, false);
+    second.level = Some(10);
+    e.apply("logitech", Ok(vec![second]), 5.0, false);
+    assert_eq!(e.take_low_battery_sound(), Some(10));
+}
+
+#[test]
 fn suspend_resume_clock_reset_and_confirmed_reconnect_require_fresh_readings() {
     let mut e = engine();
     assert_eq!(poll(&mut e, reading(Some(10)), 1000.0), Some(10));

@@ -172,7 +172,7 @@ impl Engine {
         self.pending_sound = None;
         for r in self.by_provider.values().flatten() {
             if self.settings.low_for(&r.key) != settings.low_for(&r.key) {
-                for identity in related_sound_identities(r, &self.by_provider) {
+                for identity in related_sound_identities(r, &self.by_provider, &self.settings) {
                     self.sound_at.remove(&identity);
                 }
             }
@@ -217,13 +217,24 @@ impl Engine {
         self.held
             .retain(|(key, _), _| connected.contains(key.as_str()));
         if !self.sound_at.is_empty() {
-            let sound_keys: BTreeSet<_> = self
+            let mut sound_keys = BTreeSet::new();
+            for reading in self
                 .by_provider
                 .values()
                 .flatten()
                 .filter(|r| !self.settings.device(&r.key).is_some_and(|d| d.hidden))
-                .flat_map(|r| sound_identities(r).into_iter().flatten())
-                .collect();
+            {
+                let identities = sound_identities(reading);
+                if let Some(serial) = &identities[1]
+                    && self.sound_at.contains_key(serial)
+                    && conflicting_serial_containers(reading, &self.by_provider, &self.settings)
+                {
+                    // Once a serial is known to describe different containers,
+                    // an older shared cooldown cannot be assigned to either one.
+                    self.sound_at.remove(serial);
+                }
+                sound_keys.extend(identities.into_iter().flatten());
+            }
             self.sound_at.retain(|key, _| sound_keys.contains(key));
         }
     }
@@ -349,12 +360,19 @@ impl Engine {
                     // With no active cooldown there is nothing to clear. Avoid
                     // constructing identity/alias strings on every healthy poll.
                     if !self.sound_at.is_empty() {
-                        for identity in related_sound_identities(&r, &self.by_provider) {
+                        for identity in
+                            related_sound_identities(&r, &self.by_provider, &self.settings)
+                        {
                             self.sound_at.remove(&identity);
                         }
                     }
                 } else {
-                    let identities = sound_identities(&r);
+                    let mut identities = sound_identities(&r);
+                    if conflicting_serial_containers(&r, &self.by_provider, &self.settings)
+                        && let Some(serial) = identities[1].take()
+                    {
+                        self.sound_at.remove(&serial);
+                    }
                     let last = identities
                         .iter()
                         .flatten()
@@ -656,19 +674,78 @@ fn sound_identities(r: &Reading) -> [Option<String>; 3] {
     ]
 }
 
+fn linked_sound_unit(first: &str, second: &str, settings: &Settings) -> bool {
+    first != second && settings.preference_key(first) == settings.preference_key(second)
+}
+/// A vendor serial is insufficient when it is already associated with more
+/// than one unlinked Windows container. This borrows identifiers and runs
+/// only while low-sound cooldowns are in use.
+fn conflicting_serial_containers(
+    reading: &Reading,
+    providers: &BTreeMap<String, Vec<Reading>>,
+    settings: &Settings,
+) -> bool {
+    let Some(serial) = reading.serial.as_deref().and_then(trusted_identity) else {
+        return false;
+    };
+    let mut container = reading
+        .container
+        .as_deref()
+        .and_then(trusted_identity)
+        .map(|value| (value, reading.key.as_str()));
+    for other in providers.values().flatten() {
+        if !other
+            .serial
+            .as_deref()
+            .and_then(trusted_identity)
+            .is_some_and(|value| value.eq_ignore_ascii_case(serial))
+        {
+            continue;
+        }
+        if let Some(value) = other.container.as_deref().and_then(trusted_identity) {
+            if let Some((previous, key)) = container {
+                if !previous.eq_ignore_ascii_case(value)
+                    && !linked_sound_unit(key, &other.key, settings)
+                {
+                    return true;
+                }
+            } else {
+                container = Some((value, other.key.as_str()));
+            }
+        }
+    }
+    false
+}
+
 fn related_sound_identities(
     r: &Reading,
     providers: &BTreeMap<String, Vec<Reading>>,
+    settings: &Settings,
 ) -> Vec<String> {
-    let identities = sound_identities(r);
+    let container = r.container.as_deref().and_then(trusted_identity);
+    let serial = r.serial.as_deref().and_then(trusted_identity);
+    let ambiguous_serial = conflicting_serial_containers(r, providers, settings);
     providers
         .values()
         .flatten()
         .filter(|other| {
-            sound_identities(other)
-                .iter()
-                .flatten()
-                .any(|id| identities.iter().flatten().any(|own| own == id))
+            let other_container = other.container.as_deref().and_then(trusted_identity);
+            let same_serial = serial
+                .zip(other.serial.as_deref().and_then(trusted_identity))
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+            let linked = same_serial && linked_sound_unit(&r.key, &other.key, settings);
+            if let (Some(a), Some(b)) = (container, other_container)
+                && !a.eq_ignore_ascii_case(b)
+                && !linked
+            {
+                return false;
+            }
+            r.key == other.key
+                || linked
+                || container
+                    .zip(other_container)
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                || (!ambiguous_serial && same_serial)
         })
         .flat_map(|other| sound_identities(other).into_iter().flatten())
         .collect()

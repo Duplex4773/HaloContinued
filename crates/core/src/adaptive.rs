@@ -6,6 +6,8 @@ pub enum PollingActivityKind {
     Boost,
     Restore,
     Manual,
+    Saver,
+    SaverRestore,
 }
 impl PollingActivityKind {
     pub fn as_str(self) -> &'static str {
@@ -13,6 +15,8 @@ impl PollingActivityKind {
             Self::Boost => "boost",
             Self::Restore => "restore",
             Self::Manual => "manual",
+            Self::Saver => "saver",
+            Self::SaverRestore => "saver_restore",
         }
     }
 }
@@ -35,6 +39,9 @@ pub struct RecentUse {
     pub boost_sessions: u64,
     pub restores: u64,
     pub manual_changes: u64,
+    pub saver_changes: u64,
+    pub saver_restores: u64,
+    pub saver_seconds: u64,
     pub normal_rate: Option<PollingRate>,
     pub current_level: Option<u8>,
     pub last_confirmed_timestamp: Option<i64>,

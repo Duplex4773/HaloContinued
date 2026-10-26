@@ -2,6 +2,8 @@
 pub mod controls;
 pub mod dpi;
 pub use dpi::*;
+pub mod device_info;
+pub use device_info::*;
 pub mod engine;
 pub use controls::*;
 pub mod history;

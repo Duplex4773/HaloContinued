@@ -13,6 +13,7 @@ hb-core.workspace = true
 hb-providers.workspace = true
 hb-windows.workspace = true
 hb-storage.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 crossbeam-channel.workspace = true
 windows = { workspace = true, features = ["Win32_System_Time"] }

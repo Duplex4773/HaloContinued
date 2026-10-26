@@ -27,6 +27,13 @@ struct Entry {
     boost: PollingRate,
     baseline: Option<PollingRate>,
     active: bool,
+    charging_wait: Option<ChargingWait>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChargingWait {
+    Saver,
+    Awaiting(i64),
+    Seen,
 }
 struct Pending {
     request: ControlRequest,
@@ -43,6 +50,56 @@ pub struct Boost {
     sequence: u64,
 }
 impl Boost {
+    /// Adopt only ownership recorded for the same connection. The normal
+    /// desktop transition and compare-before-write path performs restoration.
+    pub fn recover(
+        &mut self,
+        record: &crate::recovery::Record,
+        reading: &Reading,
+        settings: &Settings,
+        generation: u64,
+    ) -> bool {
+        if record.layer != crate::recovery::Layer::BoostPolling
+            || !settings.polling_controls
+            || !record.device.matches_reading(reading)
+            || !reading.online()
+            || self
+                .entries
+                .get(&reading.key)
+                .is_some_and(|entry| entry.active)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.request.target.device.key == reading.key)
+            || self.entries.len() >= 512
+            || self.attempted.len() >= 512 && !self.attempted.contains(&reading.key)
+        {
+            return false;
+        }
+        let (Ok(baseline), Ok(boost)) = (
+            PollingRate::try_from(record.before),
+            PollingRate::try_from(record.applied),
+        ) else {
+            return false;
+        };
+        self.attempted.insert(reading.key.clone());
+        self.entries.insert(
+            reading.key.clone(),
+            Entry {
+                target: ControlTarget {
+                    device: record.device.clone(),
+                    generation,
+                    connection_stamp: Some(record.stamp),
+                },
+                boost,
+                baseline: Some(baseline),
+                active: true,
+                charging_wait: None,
+            },
+        );
+        true
+    }
+
     pub fn new(now: Instant) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -90,12 +147,82 @@ impl Boost {
             pending.guard.cancel.store(true, Ordering::Release);
         }
     }
-    pub fn observe_provider(&mut self, provider: &str, readings: &[Reading]) {
+    pub fn observe_provider(&mut self, provider: &str, readings: &[Reading], now: i64) {
+        let pending_key = self
+            .pending
+            .as_ref()
+            .map(|p| p.request.target.device.key.as_str());
         self.entries.retain(|_, e| {
-            e.target.device.source != provider
-                || readings.iter().any(|r| {
-                    e.target.device.matches_reading(r) && r.connection != Connection::Stale
-                })
+            if e.target.device.source != provider || e.charging_wait == Some(ChargingWait::Saver) {
+                return true;
+            }
+            let (mut present, mut online, mut conflicting, mut possible_wired) =
+                (false, false, false, false);
+            for reading in readings {
+                if reading.key == e.target.device.key {
+                    if e.target.device.matches_reading(reading) {
+                        present |= reading.connection != Connection::Stale;
+                        online |= reading.online()
+                            && reading.timestamp <= now
+                            && now.saturating_sub(reading.timestamp) <= 120;
+                    } else {
+                        conflicting = true;
+                    }
+                }
+                possible_wired |= reading.online() && reading.wired_mouse();
+            }
+            let has_pending = pending_key == Some(e.target.device.key.as_str());
+            let alias = (e.active
+                && e.baseline.is_some()
+                && e.target.connection_stamp.is_some()
+                && !e.target.device.wired_mouse()
+                && (!present || possible_wired || e.charging_wait.is_some()))
+            .then(|| e.target.device.shared_preference_key())
+            .flatten();
+            let wired = alias.as_ref().map_or(0, |alias| {
+                readings
+                    .iter()
+                    .filter(|reading| {
+                        reading.online()
+                            && reading.wired_mouse()
+                            && reading.timestamp <= now
+                            && now.saturating_sub(reading.timestamp) <= 120
+                            && ConfigurationDevice::from_reading(reading)
+                                .shared_preference_key()
+                                .as_ref()
+                                == Some(alias)
+                    })
+                    .take(2)
+                    .count()
+            });
+            let expired = matches!(e.charging_wait, Some(ChargingWait::Awaiting(since))
+                if now < since || now.saturating_sub(since) > 120);
+            if conflicting || expired || (wired > 1 && (!present || e.charging_wait.is_some())) {
+                return false;
+            }
+            if wired == 1 {
+                if has_pending {
+                    return false;
+                }
+                e.charging_wait = Some(ChargingWait::Seen);
+            } else if online {
+                match e.charging_wait {
+                    Some(ChargingWait::Awaiting(_)) => return false,
+                    Some(ChargingWait::Seen) => e.charging_wait = None,
+                    _ => {}
+                }
+            } else if !present {
+                match e.charging_wait {
+                    Some(ChargingWait::Seen) => {}
+                    Some(ChargingWait::Awaiting(since))
+                        if now >= since && now.saturating_sub(since) <= 120 => {}
+                    None if alias.is_some() && !has_pending => {
+                        e.charging_wait = Some(ChargingWait::Awaiting(now));
+                    }
+                    _ => return false,
+                }
+            }
+            true
         });
         if let Some(p) = &self.pending
             && !self.entries.contains_key(&p.request.target.device.key)
@@ -114,7 +241,7 @@ impl Boost {
             Some(true) => {
                 self.entries
                     .values()
-                    .any(|e| !e.active && e.baseline.is_some())
+                    .any(|e| e.charging_wait.is_none() && !e.active && e.baseline.is_some())
                     || settings.devices.iter().any(|(key, preferences)| {
                         preferences.fullscreen_boost_rate.is_some()
                             && !self.attempted.iter().any(|attempt| {
@@ -122,7 +249,10 @@ impl Boost {
                             })
                     })
             }
-            Some(false) => self.entries.values().any(|e| e.active),
+            Some(false) => self
+                .entries
+                .values()
+                .any(|e| e.active && e.charging_wait.is_none()),
             None => false,
         }
     }
@@ -158,25 +288,56 @@ impl Boost {
             }
         }
     }
-    /// A queued restore can wait for a sleeping device for hours. Check the
-    /// borrowed provider cache before resolving/cloning the combined inventory.
+    /// Sleeping and disconnected devices can remain unavailable for hours.
+    /// Check borrowed provider caches before resolving the combined inventory.
     pub fn ready<'a>(&self, settings: &Settings, readings: impl Fn(&str) -> &'a [Reading]) -> bool {
-        self.needs_inventory(settings)
-            && (self.stable != Some(false)
-                || self.entries.values().any(|entry| {
-                    if !entry.active {
-                        return false;
-                    }
-                    let cached = readings(&entry.target.device.source);
-                    // Missing/replaced hardware still needs the normal inventory
-                    // pass to retire ownership. Skip only a known unavailable unit.
-                    !cached
-                        .iter()
-                        .any(|r| entry.target.device.matches_reading(r))
-                        || cached
-                            .iter()
-                            .any(|r| r.online() && entry.target.device.matches_reading(r))
-                }))
+        if !self.needs_inventory(settings) {
+            return false;
+        }
+        let fullscreen = self.stable == Some(true);
+        let existing = self.entries.values().any(|entry| {
+            if entry.charging_wait.is_some() {
+                return false;
+            }
+            let needs_action = if fullscreen {
+                !entry.active && entry.baseline.is_some()
+            } else {
+                entry.active
+            };
+            if !needs_action {
+                return false;
+            }
+            let cached = readings(&entry.target.device.source);
+            // Missing/replaced hardware still needs the normal inventory pass
+            // to retire ownership. Skip only a known unavailable unit.
+            !cached
+                .iter()
+                .any(|r| entry.target.device.matches_reading(r))
+                || cached
+                    .iter()
+                    .any(|r| r.online() && entry.target.device.matches_reading(r))
+        });
+        if existing || !fullscreen {
+            return existing;
+        }
+        hb_providers::controls::POLLING_PROVIDERS
+            .iter()
+            .copied()
+            .chain(["simulation"])
+            .any(|provider| {
+                readings(provider).iter().any(|reading| {
+                    reading.online()
+                        && reading.kind == "mouse"
+                        && settings
+                            .device(&reading.key)
+                            .and_then(|p| p.fullscreen_boost_rate)
+                            .is_some()
+                        && !self.attempted.iter().any(|attempt| {
+                            settings.preference_key(attempt)
+                                == settings.preference_key(&reading.key)
+                        })
+                })
+            })
     }
     pub fn owns(&self, key: &str) -> bool {
         self.entries.contains_key(key)
@@ -184,6 +345,63 @@ impl Boost {
                 .pending
                 .as_ref()
                 .is_some_and(|p| p.request.target.device.key == key)
+    }
+    fn charging_handoff_matches(
+        &self,
+        device: &ConfigurationDevice,
+        stamp: ConnectionStamp,
+        saver_rate: Option<PollingRate>,
+    ) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.request.target.device.key == device.key)
+        {
+            return false;
+        }
+        self.entries.get(&device.key).is_some_and(|entry| {
+            entry.active
+                && entry.baseline.is_some()
+                && saver_rate.is_none_or(|rate| entry.baseline == Some(rate))
+                && entry.target.device == *device
+                && entry.target.connection_stamp == Some(stamp)
+        })
+    }
+    /// Defer an owned boost while a possible USB charging transition is being
+    /// confirmed. No polling or writes run while the wireless unit is absent.
+    pub fn hold_for_charging(
+        &mut self,
+        device: &ConfigurationDevice,
+        stamp: ConnectionStamp,
+        saver_rate: Option<PollingRate>,
+    ) {
+        if self.charging_handoff_matches(device, stamp, saver_rate)
+            && let Some(entry) = self.entries.get_mut(&device.key)
+        {
+            entry.charging_wait = Some(ChargingWait::Saver);
+        }
+    }
+    pub fn discard_unclaimed_charging(&mut self, provider: &str, keep: impl Fn(&str) -> bool) {
+        self.entries.retain(|key, entry| {
+            entry.charging_wait != Some(ChargingWait::Saver)
+                || entry.target.device.source != provider
+                || keep(key)
+        });
+    }
+    /// Transfer a confirmed boost to Battery saver when the same mouse starts
+    /// charging. No write is issued; the eventual restore still compares the
+    /// current rate and validates the original native connection.
+    pub fn handoff_for_charging(
+        &mut self,
+        device: &ConfigurationDevice,
+        stamp: ConnectionStamp,
+        saver_rate: Option<PollingRate>,
+    ) -> Option<(PollingRate, PollingRate)> {
+        if !self.charging_handoff_matches(device, stamp, saver_rate) {
+            return None;
+        }
+        let entry = self.entries.remove(&device.key)?;
+        Some((entry.baseline?, entry.boost))
     }
     pub fn manual(&mut self, key: &str) {
         if let Some(pending) = &self.pending
@@ -199,12 +417,36 @@ impl Boost {
             self.attempted.insert(key.into());
         }
     }
+    /// A manual selection on a validated wired alias also cancels any boost
+    /// owned by its wireless connection. Aliases never authorize writes.
+    pub fn manual_device(&mut self, device: &ConfigurationDevice) {
+        self.manual(&device.key);
+        if let Some(alias) = device.shared_preference_key()
+            && alias != device.key
+        {
+            self.manual(&alias);
+        }
+    }
     pub fn clear(&mut self) {
         if let Some(p) = self.pending.take() {
             p.guard.cancel.store(true, Ordering::Release);
         }
         self.entries.clear();
         self.attempted.clear();
+        self.candidate = None;
+        self.stable = None;
+    }
+    /// Keep only confirmed boosts tied to their original native connection.
+    /// An operation interrupted by suspend is uncertain and is not retried.
+    pub fn suspend(&mut self) {
+        if let Some(p) = self.pending.take() {
+            p.guard.cancel.store(true, Ordering::Release);
+            self.entries.remove(&p.request.target.device.key);
+        }
+        self.entries
+            .retain(|_, entry| entry.active && entry.target.connection_stamp.is_some());
+        // Preserve manual overrides and failed attempts until a stable desktop
+        // transition; waking in the same game must not start another boost.
         self.candidate = None;
         self.stable = None;
     }
@@ -225,16 +467,20 @@ impl Boost {
             return None;
         }
         self.entries.retain(|key, e| {
-            e.target.generation == generation
-                && readings
-                    .iter()
-                    .any(|r| &r.key == key && e.target.device.matches_reading(r))
+            e.charging_wait.is_some()
+                || e.target.generation == generation
+                    && readings
+                        .iter()
+                        .any(|r| &r.key == key && e.target.device.matches_reading(r))
         });
         let fullscreen = self.stable?;
         let existing = self
             .entries
             .iter()
             .find(|(_, e)| {
+                if e.charging_wait.is_some() {
+                    return false;
+                }
                 let online = readings
                     .iter()
                     .any(|r| e.target.device.matches_reading(r) && r.online());
@@ -277,6 +523,7 @@ impl Boost {
                     boost,
                     baseline: None,
                     active: false,
+                    charging_wait: None,
                 },
             );
             r.key.clone()
@@ -513,6 +760,240 @@ mod tests {
         });
     }
     #[test]
+    fn charging_handoff_requires_confirmed_rate_identity_and_connection() {
+        for case in 0..6 {
+            let now = Instant::now();
+            let (settings, readings) = fixture();
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost.next(&settings, 1, &readings).unwrap();
+            complete(&mut boost, &read, 1000);
+            if case != 0 {
+                let apply = boost.next(&settings, 1, &readings).unwrap();
+                complete(&mut boost, &apply, 2000);
+            }
+            if case == 4 {
+                settle(&mut boost, now + Duration::from_secs(30), false);
+                let _pending_restore = boost.next(&settings, 1, &readings).unwrap();
+            }
+            let mut device = ConfigurationDevice::from_reading(&readings[0]);
+            if case == 3 {
+                device.serial = Some("another-device".into());
+            }
+            let stamp = ConnectionStamp::new(if case == 2 { 2 } else { 1 }).unwrap();
+            let saver_rate = rate(if case == 1 { 500 } else { 1000 });
+            let result = boost.handoff_for_charging(&device, stamp, Some(saver_rate));
+            if case == 5 {
+                assert_eq!(result, Some((rate(1000), rate(2000))));
+                assert!(!boost.owns(&readings[0].key));
+            } else {
+                assert_eq!(result, None, "unsafe handoff case {case}");
+                assert!(boost.owns(&readings[0].key));
+            }
+        }
+    }
+    #[test]
+    fn manual_wired_polling_selection_cancels_only_the_matching_wireless_boost() {
+        for matching in [false, true] {
+            let now = Instant::now();
+            let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+            reading.kind = "mouse".into();
+            reading.via = "usb".into();
+            reading.serial = Some("TEST".into());
+            let mut settings = Settings {
+                polling_controls: true,
+                ..Default::default()
+            };
+            settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(2000));
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            complete(&mut boost, &read, 1000);
+            let apply = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            complete(&mut boost, &apply, 2000);
+            let mut wired = reading.clone();
+            wired.key = if matching {
+                "razer:00be:TEST"
+            } else {
+                "razer:00be:OTHER"
+            }
+            .into();
+            wired.serial = Some(if matching { "TEST" } else { "OTHER" }.into());
+            boost.manual_device(&ConfigurationDevice::from_reading(&wired));
+            assert_eq!(boost.owns(&reading.key), !matching);
+        }
+    }
+    #[test]
+    fn standalone_boost_restores_after_confirmed_usb_charging() {
+        for gap in [false, true] {
+            let now = Instant::now();
+            let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+            reading.kind = "mouse".into();
+            reading.via = "usb".into();
+            reading.serial = Some("TEST".into());
+            let mut settings = Settings {
+                polling_controls: true,
+                ..Default::default()
+            };
+            settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(2000));
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            complete(&mut boost, &read, 1000);
+            let apply = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            complete(&mut boost, &apply, 2000);
+            if gap {
+                boost.observe_provider("razer", &[], 100);
+            }
+            let mut wired = reading.clone();
+            wired.key = "razer:00be:TEST".into();
+            wired.container = Some("wired-collection".into());
+            wired.timestamp = 101;
+            boost.observe_provider("razer", std::slice::from_ref(&wired), 101);
+            assert!(
+                boost.owns(&reading.key),
+                "Boost baseline must survive charging"
+            );
+            settle(&mut boost, now + Duration::from_secs(30), false);
+            assert!(!boost.ready(&settings, |_| std::slice::from_ref(&wired)));
+            assert!(
+                boost
+                    .next(&settings, 2, std::slice::from_ref(&wired))
+                    .is_none()
+            );
+            reading.timestamp = 102;
+            boost.observe_provider("razer", std::slice::from_ref(&reading), 102);
+            let restore = boost
+                .next(&settings, 2, std::slice::from_ref(&reading))
+                .unwrap();
+            assert_eq!(restore.target.connection_stamp, ConnectionStamp::new(1));
+            assert_eq!(
+                restore.action,
+                ControlAction::ApplyIf {
+                    rate: rate(1000),
+                    expected: rate(2000)
+                }
+            );
+            complete(&mut boost, &restore, 1000);
+            assert!(!boost.owns(&reading.key));
+        }
+    }
+    #[test]
+    fn standalone_boost_never_restores_after_unproven_or_ambiguous_reconnect() {
+        for case in 0..5 {
+            let now = Instant::now();
+            let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+            reading.kind = "mouse".into();
+            reading.via = "usb".into();
+            reading.serial = Some("TEST".into());
+            let mut settings = Settings {
+                polling_controls: true,
+                ..Default::default()
+            };
+            settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(2000));
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            complete(&mut boost, &read, 1000);
+            let apply = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            complete(&mut boost, &apply, 2000);
+            boost.observe_provider("razer", &[], 100);
+            let mut wired = reading.clone();
+            wired.key = "razer:00be:TEST".into();
+            wired.timestamp = 101;
+            match case {
+                0 => {} // No evidence of a wired charging transition.
+                1 => {
+                    wired.key = "razer:00be:OTHER".into();
+                    wired.serial = Some("OTHER".into());
+                    boost.observe_provider("razer", &[wired], 101);
+                }
+                2 => {
+                    let mut duplicate = wired.clone();
+                    duplicate.container = Some("other-collection".into());
+                    boost.observe_provider("razer", &[wired, duplicate], 101);
+                }
+                3 => {
+                    wired.timestamp = 221;
+                    boost.observe_provider("razer", &[wired], 221);
+                }
+                _ => {
+                    wired.timestamp = 99;
+                    boost.observe_provider("razer", &[wired], 99);
+                }
+            }
+            let timestamp = if case == 3 { 222 } else { 102 };
+            reading.timestamp = timestamp;
+            boost.observe_provider("razer", std::slice::from_ref(&reading), timestamp);
+            settle(&mut boost, now + Duration::from_secs(30), false);
+            assert!(!boost.owns(&reading.key), "unproven connection case {case}");
+            assert!(
+                boost
+                    .next(&settings, 2, std::slice::from_ref(&reading))
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn suspend_preserves_only_confirmed_boosts_with_connection_proof() {
+        for case in 0..3 {
+            let now = Instant::now();
+            let (settings, readings) = fixture();
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost.next(&settings, 1, &readings).unwrap();
+            complete(&mut boost, &read, 1000);
+            let apply = boost.next(&settings, 1, &readings).unwrap();
+            complete(&mut boost, &apply, 2000);
+            if case == 1 {
+                boost
+                    .entries
+                    .get_mut(&readings[0].key)
+                    .unwrap()
+                    .target
+                    .connection_stamp = None;
+            } else if case == 2 {
+                settle(&mut boost, now + Duration::from_secs(30), false);
+                let pending = boost.next(&settings, 1, &readings).unwrap();
+                let guard = boost.guard(pending.request).unwrap();
+                boost.suspend();
+                assert!(guard.cancel.load(Ordering::Acquire));
+            }
+            boost.suspend();
+            assert_eq!(boost.owns(&readings[0].key), case == 0);
+            assert!(!boost.needs_inventory(&settings));
+        }
+    }
+    #[test]
+    fn suspend_does_not_reapply_a_manually_overridden_boost_in_the_same_game() {
+        let now = Instant::now();
+        let (settings, readings) = fixture();
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        boost.manual(&readings[0].key);
+        boost.suspend();
+        settle(&mut boost, now + Duration::from_secs(30), true);
+        assert!(boost.next(&settings, 1, &readings).is_none());
+        settle(&mut boost, now + Duration::from_secs(60), false);
+        settle(&mut boost, now + Duration::from_secs(90), true);
+        assert_eq!(
+            boost.next(&settings, 1, &readings).unwrap().action,
+            ControlAction::Read
+        );
+    }
+    #[test]
     fn opt_in_debounce_verified_boost_and_conditional_restore() {
         let now = Instant::now();
         let mut b = Boost::new(now);
@@ -585,7 +1066,7 @@ mod tests {
                 }
                 if scenario == 3 {
                     r[0].connection = Connection::Stale;
-                    b.observe_provider("simulation", &r);
+                    b.observe_provider("simulation", &r, 0);
                     r[0].connection = Connection::Online;
                     assert!(b.next(&s, 2, &r).is_none());
                 }
@@ -608,10 +1089,10 @@ mod tests {
         let mut other = readings[0].clone();
         other.key.push_str(":other-unit");
         // Changes to another mouse from the same provider are unrelated too.
-        b.observe_provider("simulation", &[readings[0].clone(), other]);
-        b.observe_provider("simulation", &readings);
+        b.observe_provider("simulation", &[readings[0].clone(), other], 0);
+        b.observe_provider("simulation", &readings, 0);
         for generation in 2..=20 {
-            b.observe_provider("logitech", &[]);
+            b.observe_provider("logitech", &[], 0);
             b.observe_generation(generation);
             assert!(b.owns(&readings[0].key));
             assert!(!b.needs_inventory(&settings));
@@ -738,15 +1219,15 @@ mod tests {
                         .connection_stamp = None;
                     b.observe_generation(2);
                 }
-                1 => b.observe_provider("simulation", &[]),
+                1 => b.observe_provider("simulation", &[], 0),
                 2 => {
                     readings[0].connection = Connection::Stale;
-                    b.observe_provider("simulation", &readings);
+                    b.observe_provider("simulation", &readings, 0);
                     readings[0].connection = Connection::Online;
                 }
                 _ => {
                     readings[0].container = Some("new receiver".into());
-                    b.observe_provider("simulation", &readings);
+                    b.observe_provider("simulation", &readings, 0);
                 }
             }
             settle(&mut b, now + Duration::from_secs(30), false);
@@ -817,6 +1298,60 @@ mod tests {
         assert!(!boost.ready(&settings, |_| &readings));
     }
     #[test]
+    fn fullscreen_preflight_waits_without_cloning_until_the_opted_device_is_available() {
+        let now = Instant::now();
+        let (settings, mut readings) = fixture();
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+
+        assert!(!boost.ready(&settings, |_| &[]));
+        let mut unrelated = readings[0].clone();
+        unrelated.key = "simulated:other".into();
+        assert!(!boost.ready(&settings, |_| std::slice::from_ref(&unrelated)));
+        readings[0].connection = Connection::Sleeping;
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!boost.ready(&settings, |_| &readings));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        readings[0].connection = Connection::Online;
+        assert!(boost.ready(&settings, |_| &readings));
+
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        readings[0].connection = Connection::Stale;
+        assert!(!boost.ready(&settings, |_| &readings));
+        assert!(boost.ready(&settings, |_| &[]));
+        readings[0].connection = Connection::Online;
+        assert!(boost.ready(&settings, |_| &readings));
+    }
+    #[test]
+    fn fullscreen_preflight_honours_linked_wired_and_wireless_preferences() {
+        let now = Instant::now();
+        let mut settings = Settings {
+            polling_controls: true,
+            ..Default::default()
+        };
+        settings
+            .device_mut("razer:00bf:TESTUNIT1234")
+            .fullscreen_boost_rate = Some(rate(2000));
+        let mut wired = Reading::new("razer:00be:TESTUNIT1234", "Mouse", "razer", 0);
+        wired.kind = "mouse".into();
+        wired.via = "usb".into();
+        wired.serial = Some("TESTUNIT1234".into());
+        settings.link_reading(&wired);
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        assert!(boost.ready(&settings, |source| {
+            if source == "razer" {
+                std::slice::from_ref(&wired)
+            } else {
+                &[]
+            }
+        }));
+    }
+    #[test]
     fn sleeping_device_keeps_original_until_it_wakes() {
         let now = Instant::now();
         let (settings, mut readings) = fixture();
@@ -827,7 +1362,7 @@ mod tests {
         let apply = b.next(&settings, 1, &readings).unwrap();
         complete(&mut b, &apply, 2000);
         readings[0].connection = Connection::Sleeping;
-        b.observe_provider("simulation", &readings);
+        b.observe_provider("simulation", &readings, 0);
         settle(&mut b, now + Duration::from_secs(30), false);
         assert!(b.next(&settings, 2, &readings).is_none());
         assert!(b.owns(&readings[0].key));

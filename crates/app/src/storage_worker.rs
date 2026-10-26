@@ -171,8 +171,22 @@ pub(super) fn run(
         let message =
             messages.recv_timeout(Duration::from_secs(60).saturating_sub(flush.elapsed()));
         let result = match message {
+            Ok(Storage::ReleaseHistoryCache) => {
+                if let Ok(db) = &database {
+                    db.release_history_cache();
+                }
+                Ok(())
+            }
             Ok(Storage::DpiBackup(backup, reply)) => {
                 let result = hb_storage::save_dpi_backup(&folder, &backup);
+                let _ = reply.send(result);
+                Ok(())
+            }
+            Ok(Storage::Recovery(journal, operation, reply)) => {
+                let result = journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .execute(*operation);
                 let _ = reply.send(result);
                 Ok(())
             }
@@ -519,12 +533,16 @@ mod tests {
         db.flush().unwrap();
         assert!(pending.is_empty());
         assert_eq!(
-            db.query("mouse", 5000, 5000, 10).unwrap()[0].level,
+            db.query("mouse", 5000, 5000, 10)
+                .unwrap()
+                .last()
+                .unwrap()
+                .level,
             Some(69)
         );
         // Pacing must track the latest recovered state too.
         record_in_order(&mut db, vec![observation("mouse", 5001, 69)], &mut pending).unwrap();
         db.flush().unwrap();
-        assert_eq!(db.query("mouse", 5000, 5001, 10).unwrap().len(), 1);
+        assert_eq!(db.query("mouse", 5000, 5001, 10).unwrap().len(), 2);
     }
 }

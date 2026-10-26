@@ -183,7 +183,8 @@ pub struct ControlTarget {
     /// Missing evidence keeps the conservative generation-only safety boundary.
     pub connection_stamp: Option<ConnectionStamp>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ConnectionStamp(std::num::NonZeroU64);
 impl ConnectionStamp {
     pub const fn new(value: u64) -> Option<Self> {

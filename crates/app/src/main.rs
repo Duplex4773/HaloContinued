@@ -12,6 +12,7 @@ mod chart;
 mod dashboard_theme;
 mod dashboard_widgets;
 mod icons;
+mod recovery;
 mod runtime;
 mod storage_worker;
 #[cfg(test)]

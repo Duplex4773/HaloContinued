@@ -99,7 +99,7 @@ fn legacy_database_without_metadata_retains_explicitly_observed_usage() {
     for timestamp in [0, 60] {
         let reading = sample(timestamp, None).reading;
         db.execute(
-            "INSERT INTO readings VALUES(?1,?2,?3,?4)",
+            "INSERT INTO readings(device,ts,level,payload) VALUES(?1,?2,?3,?4)",
             rusqlite::params![
                 reading.key,
                 reading.timestamp,

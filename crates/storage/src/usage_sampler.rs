@@ -101,16 +101,24 @@ impl From<&TimingReading<'_>> for TimingIdentity {
 pub(super) struct Sample {
     payload: String,
     pub timestamp: i64,
+    pub ordinal: i64,
     pub level: Option<u8>,
     position: i64,
 }
 impl Sample {
-    pub fn replace(&mut self, payload: &str, reading: &TimingReading<'_>, position: i64) {
+    pub fn replace(
+        &mut self,
+        payload: &str,
+        reading: &TimingReading<'_>,
+        position: i64,
+        ordinal: i64,
+    ) {
         // Flat portions and off-screen history reuse these few buffers instead
         // of allocating a complete Reading and all its strings for every row.
         self.payload.clear();
         self.payload.push_str(payload);
         self.timestamp = reading.timestamp;
+        self.ordinal = ordinal;
         self.level = reading.level;
         self.position = position;
     }
@@ -161,7 +169,7 @@ mod tests {
         assert_eq!(timing.key, reading.key);
         assert!(timing.awake());
         let mut sample = Sample::default();
-        sample.replace(&payload, &timing, 42);
+        sample.replace(&payload, &timing, 42, 0);
         let decoded = sample.decode().unwrap();
         assert_eq!(decoded.reading, reading);
         assert_eq!(decoded.position, 42);

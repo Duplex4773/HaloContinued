@@ -247,12 +247,12 @@ pub fn execute(
                         "Mouse reported an unknown sleep duration",
                     ));
                 }
+                out.seconds = Some(before);
                 if request.expected.is_some_and(|expected| expected != before) {
                     return Err(ProviderError::new(
                         "Sleep time changed elsewhere; automatic change cancelled",
                     ));
                 }
-                out.seconds = Some(before);
                 if let Some(seconds) = request.seconds.filter(|s| *s != before) {
                     out.may_have_changed = true;
                     out.seconds = None;
@@ -432,12 +432,12 @@ fn asus_sleep(
         ));
     }
     let current = asus_decode(before[6])?;
+    out.seconds = Some(current);
     if expected.is_some_and(|expected| expected != current) {
         return Err(ProviderError::new(
             "Sleep time changed elsewhere; automatic change cancelled",
         ));
     }
-    out.seconds = Some(current);
     if let Some(seconds) = seconds.filter(|s| *s != current) {
         let code = match seconds {
             60 => 0,
