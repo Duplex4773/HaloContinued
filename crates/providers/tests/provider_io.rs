@@ -341,7 +341,7 @@ fn asus_error_frame_stops_retries_on_optional_zero_prefix() {
     use hb_providers::protocols::padded;
     let device = hb_providers::catalog::DEVICES
         .iter()
-        .find(|d| d.provider == "asus")
+        .find(|d| d.provider == "asus" && d.variant.is_empty())
         .unwrap();
     let hid = FakeHid::new(
         vec![info(device.vid, device.pid, 0xff00)],
@@ -433,13 +433,13 @@ fn corsair_requires_heartbeat_and_drains_between_handshake_and_battery() {
     let hid = FakeHid::new(
         vec![selected],
         vec![
-            Step::Write(padded(&[0, 2, 8, 2, 0x13], 65)),
-            Step::Write(padded(&[0, 2, 8, 2, 0x12], 65)),
+            Step::Write(padded(&[2, 8, 2, 0x13], 64)),
+            Step::Write(padded(&[2, 8, 2, 0x12], 64)),
             Step::Read(Ok(vec![])),
-            Step::Write(padded(&[0, 2, 9, 2, 0x12], 65)),
+            Step::Write(padded(&[2, 9, 2, 0x12], 64)),
             Step::Read(Ok(vec![1])),
             Step::Read(Ok(vec![])),
-            Step::Write(padded(&[0, 2, 9, 2, 0x0f], 65)),
+            Step::Write(padded(&[2, 9, 2, 0x0f], 64)),
             Step::Read(Ok(vec![0, 0, 0, 0, 0xcc, 1])),
         ],
     );

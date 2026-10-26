@@ -976,6 +976,7 @@ mod tests {
     #[test]
     fn selected_combo_text_and_static_colors_use_the_dashboard_palette() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             let combo = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -983,8 +984,8 @@ mod tests {
                 w!(""),
                 WS_POPUP
                     | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
-                0,
-                0,
+                x,
+                y,
                 240,
                 200,
                 None,
@@ -1005,8 +1006,8 @@ mod tests {
                 w!("STATIC"),
                 w!("Ready"),
                 WS_POPUP,
-                0,
-                0,
+                x,
+                y,
                 240,
                 40,
                 None,
@@ -1067,14 +1068,15 @@ mod tests {
     #[test]
     fn dark_combo_print_keeps_arrow_surface_dark() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("COMBOBOX"),
                 w!(""),
                 WS_POPUP | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
-                0,
-                0,
+                x,
+                y,
                 240,
                 200,
                 None,
@@ -1112,6 +1114,7 @@ mod tests {
     #[test]
     fn dark_buttons_print_dark_surfaces_and_readable_labels() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             for style in [0, BS_AUTOCHECKBOX] {
                 let hwnd = CreateWindowExW(
@@ -1119,8 +1122,8 @@ mod tests {
                     w!("BUTTON"),
                     w!("Enable alerts"),
                     WS_POPUP | WINDOW_STYLE(style as u32),
-                    0,
-                    0,
+                    x,
+                    y,
                     240,
                     40,
                     None,
@@ -1162,6 +1165,7 @@ mod tests {
     #[test]
     fn native_controls_keep_state_across_theme_changes_and_release_subclasses() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             for _ in 0..10 {
                 let hwnd = CreateWindowExW(
@@ -1169,8 +1173,8 @@ mod tests {
                     w!("BUTTON"),
                     w!("Enable &alerts"),
                     WS_OVERLAPPEDWINDOW | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    0,
-                    0,
+                    x,
+                    y,
                     240,
                     60,
                     None,
@@ -1207,14 +1211,15 @@ mod tests {
     #[test]
     fn hover_repaints_only_at_boundaries_and_never_changes_checkbox_value() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 w!("Alerts"),
                 WS_POPUP | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                0,
-                0,
+                x,
+                y,
                 240,
                 40,
                 None,
@@ -1248,14 +1253,15 @@ mod tests {
     #[test]
     fn scrollbar_updates_defer_paint_and_cancel_tracking_without_idle_redraws() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("SCROLLBAR"),
                 w!(""),
                 WS_POPUP | WS_VISIBLE | WINDOW_STYLE(SBS_VERT as u32),
-                0,
-                0,
+                x,
+                y,
                 18,
                 300,
                 None,
@@ -1365,6 +1371,7 @@ mod tests {
     #[test]
     fn themed_controls_do_not_erase_a_light_surface_before_custom_paint() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             for class in [w!("BUTTON"), w!("COMBOBOX")] {
                 let hwnd = CreateWindowExW(
@@ -1372,8 +1379,8 @@ mod tests {
                     class,
                     w!("Test"),
                     WS_POPUP,
-                    0,
-                    0,
+                    x,
+                    y,
                     100,
                     30,
                     None,

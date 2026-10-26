@@ -59,6 +59,10 @@ for pid in table('nzxt', 'PIDS'):
     add('nzxt', 0x1e71, pid, 'NZXT Lift Elite Wireless')
 for pid in table('steam', 'PUCKS'):
     add('steam', 0x28de, pid, 'Steam Controller (2025)')
+# Hardware-confirmed additions from reviewed, pinned parent pull requests. Apply
+# last so importing the older main catalog cannot remove their protocol routing.
+for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text()):
+    add(*entry['device'])
 ordered = sorted(rows.values())
 catalog = ROOT / 'crates/providers/src/catalog.rs'
 old = catalog.read_text(encoding='utf-8')

@@ -14,6 +14,8 @@ mod dashboard_widgets;
 mod icons;
 mod runtime;
 mod storage_worker;
+#[cfg(test)]
+mod test_display;
 mod ui;
 use hb_core::*;
 use std::{

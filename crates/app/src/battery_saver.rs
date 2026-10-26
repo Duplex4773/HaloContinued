@@ -190,9 +190,6 @@ impl BatterySaver {
             {
                 continue;
             }
-            let Some(level) = r.level else {
-                continue;
-            };
             let configured = settings
                 .device(&r.key)
                 .and_then(|p| p.low_battery_mode)
@@ -205,11 +202,13 @@ impl BatterySaver {
                 if configured != Some(e.choices)
                     || r.charging == Some(true)
                     || r.wired_mouse()
-                    || level >= e.choices.threshold.saturating_add(5)
+                    || r.level
+                        .is_some_and(|level| level >= e.choices.threshold.saturating_add(5))
                 {
                     e.low = false;
                 }
-            } else if let Some(choices) = configured
+            } else if let Some(level) = r.level
+                && let Some(choices) = configured
                 && level <= choices.threshold
                 && r.charging == Some(false)
                 && !r.wired_mouse()
@@ -701,6 +700,42 @@ mod tests {
                 _ => s.polling_controls = false,
             }
             assert_eq!(b.next(&s, 1, &r, 100, &boost).is_some(), condition != 2);
+        }
+    }
+    #[test]
+    fn charging_or_opt_out_restores_owned_settings_even_without_a_percentage() {
+        for charging in [false, true] {
+            let (mut saver, mut settings, mut readings, boost) = fixture();
+            activate(&mut saver, &settings, &readings, &boost);
+            readings[0].level = None;
+            if charging {
+                readings[0].charging = Some(true);
+            } else {
+                settings.device_mut(&readings[0].key).low_battery_mode = None;
+            }
+            let action = saver
+                .next(&settings, 1, &readings, 100, &boost)
+                .expect("Unknown percentage must not prevent proven charging/opt-out restoration");
+            let Action::Polling(request) = &action else {
+                panic!("Expected rate restoration")
+            };
+            assert_eq!(
+                request.action,
+                ControlAction::ApplyIf {
+                    rate: rate(1000),
+                    expected: rate(125)
+                }
+            );
+            assert!(request.target.connection_stamp.is_some());
+            complete(&mut saver, &action, 1000);
+            let action = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            let Action::Sleep(request) = &action else {
+                panic!("Expected sleep restoration")
+            };
+            assert_eq!((request.seconds, request.expected), (Some(300), Some(60)));
+            assert!(request.target.connection_stamp.is_some());
+            complete(&mut saver, &action, 300);
+            assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
         }
     }
     #[test]

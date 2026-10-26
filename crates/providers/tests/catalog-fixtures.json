@@ -1,5 +1,21 @@
 [
   [
+    "ajazz",
+    9354,
+    23854,
+    "AJAZZ AJ179 V2 MAX",
+    "pr:ajazz",
+    0
+  ],
+  [
+    "ajazz",
+    9370,
+    23599,
+    "AJAZZ AJ179 V2 MAX",
+    "pr:ajazz",
+    0
+  ],
+  [
     "am_infinity",
     12625,
     20487,
@@ -13,6 +29,14 @@
     2844,
     "Astro A50 Gen 5",
     "",
+    0
+  ],
+  [
+    "asus",
+    2821,
+    6358,
+    "ROG Strix Go 2.4",
+    "pr:strix",
     0
   ],
   [
@@ -210,6 +234,14 @@
   [
     "asus",
     2821,
+    6862,
+    "ROG OMNI receiver",
+    "pr:omni",
+    0
+  ],
+  [
+    "asus",
+    2821,
     6899,
     "TX Gaming Mouse Mini",
     "",
@@ -254,6 +286,38 @@
     "TUF Gaming Mini Miku Edition",
     "",
     1
+  ],
+  [
+    "asus",
+    2821,
+    7258,
+    "TX Gaming Mouse Mini Miku",
+    "",
+    1
+  ],
+  [
+    "atk_keyboard",
+    12815,
+    20616,
+    "ATK V75X",
+    "pr:atk-keyboard",
+    0
+  ],
+  [
+    "atk_nearlink",
+    14139,
+    4235,
+    "ATK X1 Ultimate",
+    "pr:nearlink",
+    0
+  ],
+  [
+    "atk_nearlink",
+    14139,
+    4236,
+    "ATK X1 Ultimate",
+    "pr:nearlink",
+    0
   ],
   [
     "audeze",
@@ -301,6 +365,30 @@
     19241,
     "Audeze Maxwell 2",
     "",
+    0
+  ],
+  [
+    "aula",
+    3141,
+    65276,
+    "AULA F87 Pro V2C",
+    "pr:aula-keyboard",
+    0
+  ],
+  [
+    "aula",
+    12815,
+    8864,
+    "AULA V9 Max+",
+    "pr:aula-mouse",
+    0
+  ],
+  [
+    "aula",
+    12815,
+    8887,
+    "AULA V9 Max+",
+    "pr:aula-mouse",
     0
   ],
   [
@@ -384,6 +472,22 @@
     0
   ],
   [
+    "corsair",
+    6940,
+    11015,
+    "Corsair K65 PLUS Wireless",
+    "pr:k65",
+    0
+  ],
+  [
+    "dareu",
+    9741,
+    4212,
+    "DAREU A950 (2.4 GHz)",
+    "pr:dareu",
+    0
+  ],
+  [
     "eightbitdo",
     11720,
     24576,
@@ -437,6 +541,14 @@
     24833,
     "8BitDo SN30 Pro",
     "",
+    0
+  ],
+  [
+    "finalmouse",
+    13853,
+    256,
+    "Finalmouse UltralightX",
+    "pr:ulx",
     0
   ],
   [
@@ -936,6 +1048,14 @@
     0
   ],
   [
+    "hyperx",
+    2385,
+    5912,
+    "HyperX Cloud II Wireless (Kingston)",
+    "pr:kingston",
+    0
+  ],
+  [
     "hyperx_alpha2",
     1008,
     2238,
@@ -992,6 +1112,22 @@
     0
   ],
   [
+    "inphic",
+    7511,
+    64096,
+    "Attack Shark X11 / R1 / X3 Max",
+    "pr:inphic",
+    0
+  ],
+  [
+    "inphic",
+    7511,
+    64101,
+    "Inphic In9 Pro",
+    "pr:inphic",
+    0
+  ],
+  [
     "jbl",
     3787,
     8328,
@@ -1029,6 +1165,14 @@
     30,
     "LAMZU Maya X",
     "",
+    0
+  ],
+  [
+    "lofree",
+    1452,
+    591,
+    "Lofree Flow Lite84",
+    "pr:flow",
     0
   ],
   [
@@ -1369,10 +1513,34 @@
   ],
   [
     "mchose",
+    10525,
+    14429,
+    "MCHOSE V9 Pro",
+    "pr:v9",
+    0
+  ],
+  [
+    "mchose",
     14391,
     4107,
     "MCHOSE A7 V2 Ultra",
     "",
+    0
+  ],
+  [
+    "mchose",
+    14391,
+    24584,
+    "MCHOSE V9 Turbo+",
+    "pr:turbo",
+    0
+  ],
+  [
+    "mchose",
+    14391,
+    24586,
+    "MCHOSE V9 Turbo+",
+    "pr:turbo",
     0
   ],
   [
@@ -1498,6 +1666,14 @@
   [
     "pulsar",
     13652,
+    62814,
+    "Redragon M991 / K1NG Max",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
     62858,
     "VXE R1 Pro Max (2.4 GHz)",
     "",
@@ -1521,10 +1697,42 @@
   ],
   [
     "pulsar",
+    13652,
+    62933,
+    "Redragon M991 / K1NG Max",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
+    62966,
+    "Scyrox mouse (wired)",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
+    62967,
+    "Scyrox mouse (8K receiver)",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
     14096,
     13332,
     "Pulsar X2 CrazyLight Mini (wired)",
     "",
+    0
+  ],
+  [
+    "pulsar",
+    14096,
+    21507,
+    "Pulsar X2 V3 Mini (8K receiver)",
+    "pr:sonix",
     0
   ],
   [
@@ -1545,6 +1753,14 @@
   ],
   [
     "pulsar",
+    14139,
+    4569,
+    "ATK A9 Ultimate (receiver)",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
     14192,
     256,
     "Hitscan Hyperlight (wired)",
@@ -1557,6 +1773,46 @@
     512,
     "Hitscan Hyperlight (2.4 GHz)",
     "",
+    0
+  ],
+  [
+    "pulsar",
+    14192,
+    768,
+    "Hitscan Hyperlight (8K receiver)",
+    "pr:compx",
+    0
+  ],
+  [
+    "rapoo",
+    9390,
+    5139,
+    "Rapoo VT7 (Gen-2)",
+    "pr:rapoo",
+    0
+  ],
+  [
+    "rapoo",
+    9390,
+    6436,
+    "Rapoo V700DIY-98",
+    "pr:rapoo",
+    0
+  ],
+  [
+    "rapoo",
+    9390,
+    17939,
+    "Rapoo VT7 (Gen-2)",
+    "pr:rapoo",
+    0
+  ],
+  [
+    "rapoo",
+    9390,
+    18468,
+    "Rapoo V700DIY-98",
+    "pr:rapoo",
     0
   ],
   [
@@ -2106,6 +2362,14 @@
   [
     "razer",
     5426,
+    635,
+    "Razer Pro Type Ultra",
+    "",
+    159
+  ],
+  [
+    "razer",
+    5426,
     656,
     "Razer DeathStalker V2 Pro",
     "",
@@ -2198,6 +2462,38 @@
     "Razer BlackShark V2 Pro (2023)",
     "",
     63
+  ],
+  [
+    "razer",
+    5426,
+    1411,
+    "Razer Barracuda Pro 2.4",
+    "",
+    31
+  ],
+  [
+    "shield",
+    2389,
+    29204,
+    "NVIDIA SHIELD Controller (2017)",
+    "pr:shield",
+    0
+  ],
+  [
+    "skullcandy",
+    13552,
+    12816,
+    "Skullcandy PLYR",
+    "pr:skullcandy",
+    0
+  ],
+  [
+    "skullcandy",
+    13552,
+    21264,
+    "Skullcandy Crusher PLYR 720",
+    "pr:skullcandy",
+    0
   ],
   [
     "steam",
@@ -2584,6 +2880,38 @@
     0
   ],
   [
+    "turtlebeach",
+    4341,
+    8785,
+    "Turtle Beach Stealth 700X Gen 3",
+    "pr:turtle",
+    0
+  ],
+  [
+    "turtlebeach",
+    4341,
+    8787,
+    "Turtle Beach Stealth 700 Gen 3 headset",
+    "pr:turtle",
+    0
+  ],
+  [
+    "turtlebeach",
+    4341,
+    8859,
+    "Turtle Beach Stealth Pro II",
+    "pr:turtle",
+    0
+  ],
+  [
+    "turtlebeach",
+    4341,
+    8862,
+    "Turtle Beach Stealth Pro II",
+    "pr:turtle",
+    0
+  ],
+  [
     "wlmouse",
     13991,
     43112,
@@ -2605,6 +2933,14 @@
     43143,
     "WLmouse Beast X",
     "",
+    0
+  ],
+  [
+    "xinput",
+    14295,
+    9217,
+    "FlyDigi Vader 5 Pro",
+    "pr:flydigi",
     0
   ]
 ]

@@ -1,7 +1,7 @@
 #requires -Version 7.0
 param(
   [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$')]
-  [string]$Version = '1.0.7',
+  [string]$Version = '1.0.8',
   [string]$Executable
 )
 $ErrorActionPreference = 'Stop'

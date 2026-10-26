@@ -480,10 +480,29 @@ impl HidTransport for WindowsHid {
                 .unwrap_or_else(|p| p.into_inner())
                 .after_open(info.vendor_id, Err(error))?,
         };
-        Ok(Box::new(Session(handle)))
+        Ok(Box::new(Session(handle, info.output_length)))
     }
 }
-struct Session(HidDevice);
+struct Session(HidDevice, Option<usize>);
+fn complete_write(
+    requested: usize,
+    reported: usize,
+    output_length: Option<usize>,
+) -> Result<(), ProviderError> {
+    // The statically linked Windows HIDAPI zero-pads to the collection's
+    // longest report and returns that padded count. A larger count can therefore
+    // be success (e.g. FlyDigi's six-byte query returns 33, parent PR #216).
+    // When caps are known, still reject an incomplete padded report.
+    let complete = requested > 0
+        && output_length
+            .filter(|n| *n > 0)
+            .map_or(reported >= requested, |n| reported == requested.max(n));
+    if complete {
+        Ok(())
+    } else {
+        Err(ProviderError::new("incomplete HID write"))
+    }
+}
 /// Most HID reads are small and drains often return no report. Keep the scratch
 /// buffer on the existing worker stack; allocate only for bytes actually read.
 /// Larger reports retain their original full buffer and are never truncated.
@@ -521,10 +540,7 @@ impl HidSession for Session {
     }
     fn write(&mut self, data: &[u8]) -> Result<(), ProviderError> {
         let n = self.0.write(data).map_err(error)?;
-        if n != data.len() {
-            return Err(ProviderError::new("short HID write"));
-        }
-        Ok(())
+        complete_write(data.len(), n, self.1)
     }
     fn read(&mut self, length: usize, timeout: Duration) -> Result<Vec<u8>, ProviderError> {
         read_input(length, |data| {
@@ -549,6 +565,28 @@ impl HidSession for Session {
 }
 #[cfg(test)]
 mod cache_tests {
+    #[test]
+    fn windows_padding_is_accepted_but_incomplete_native_reports_are_rejected() {
+        for (requested, cap, reported) in [
+            (6, Some(33), 33),
+            (32, Some(64), 64),
+            (64, Some(64), 64),
+            (65, Some(64), 65),
+            (6, None, 33),
+        ] {
+            assert!(super::complete_write(requested, reported, cap).is_ok());
+        }
+        for (requested, cap, reported) in [
+            (6, Some(33), 6),
+            (6, Some(33), 32),
+            (32, Some(64), 33),
+            (65, Some(65), 64),
+            (6, None, 5),
+            (0, None, 0),
+        ] {
+            assert!(super::complete_write(requested, reported, cap).is_err());
+        }
+    }
     use super::*;
     #[test]
     fn empty_small_reads_allocate_nothing_and_live_reports_keep_their_bytes() {

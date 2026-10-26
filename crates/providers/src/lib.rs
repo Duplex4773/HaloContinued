@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod community;
 pub mod configuration;
 pub mod controls;
 pub mod dpi;

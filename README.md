@@ -28,27 +28,30 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Current release: **1.0.7** for Windows 11 x64, available as an unsigned per-user
+Current release: **1.0.8** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.0.7 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.7/HaloContinued-1.0.7-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.0.7 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.7/HaloContinued-1.0.7-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.0.8 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.8/HaloContinued-1.0.8-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.0.8 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.8/HaloContinued-1.0.8-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.7/HaloContinued-1.0.7-SHA256SUMS.txt)
-· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.7)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.8/HaloContinued-1.0.8-SHA256SUMS.txt)
+· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.8)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
-**New in 1.0.7:** Supported mice can recover a missing polling-rate reading
-after waking, Refresh or a connection change, even after days of uptime. Recovery
-uses bounded, read-only checks and yields to device actions and fullscreen boost.
-Insights distinguishes missing rate information from learning battery drain,
-shows the confirmed percentage and keeps its explanation clear and unclipped.
-Existing unknown history stays excluded; saved preferences are never treated as
-proof of the rate. There are no additional background timers or workers.
-[Read the changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.7).
+**New in 1.0.8:** Battery support expands by **42 hardware IDs**, based on
+successful hardware reports in parent pull requests. New additions include mice,
+wireless keyboards, headsets and the NVIDIA SHIELD controller; existing G-Wolves,
+Corsair and Maxwell support also gains fixes. Unknown charging states remain
+unknown, and device configuration support keeps its existing boundaries.
+Low-battery mode can restore settings when the percentage is temporarily
+unavailable. Insights handles replacement devices correctly and no longer rounds
+incomplete rate coverage up to its learning requirement. Background checks avoid
+repeated work for unsupported or absent devices, with no additional workers.
+[New devices and limitations](#device-support-and-limitations)
+· [Full changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.8).
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -171,7 +174,7 @@ and working without vendor suites originate in HaloBattery too.
 
 ## Device support and limitations
 
-Battery monitoring covers **30 provider families and 326 hardware IDs** across supported mice,
+Battery monitoring covers **41 provider families and 368 hardware IDs** across supported mice,
 keyboards, headsets and controllers. Configuration support is narrower than
 battery support, and depends on the exact model, firmware and connection.
 
@@ -209,6 +212,43 @@ through [`2251f05`](https://github.com/HeyOkay/HaloBattery/commit/2251f05):
 Receiver/cable readings share an icon when trusted hardware identity proves they
 belong together. Devices with ambiguous identities remain separate. These are
 battery-support additions; they do not expand polling, DPI or sleep write allowlists.
+
+Additional battery support from **hardware-confirmed parent pull requests**, reviewed
+25 October 2026. The reports confirm the connections listed here; the Rust implementations
+are tested with simulated transports, not newly certified on all of this hardware.
+The exact source revisions are retained in the [reviewed device catalog](crates/providers/reviewed-devices.json).
+
+| Device | Enabled connections and limits | Parent reports |
+| --- | --- | --- |
+| NVIDIA SHIELD Controller (2017) | `0955:7214`, USB and Bluetooth; board identity joins proven transport aliases and prefers USB. Unknown charging stays unknown; alerts wait for confirmation. | [#250](https://github.com/HeyOkay/HaloBattery/pull/250) |
+| Razer Pro Type Ultra; Barracuda Pro receiver revision | `1532:027B` keyboard receiver, with corrected transaction fallback and sleep recovery; `1532:0583` headset receiver uses its PA battery exchange. | [#203](https://github.com/HeyOkay/HaloBattery/pull/203), [#315](https://github.com/HeyOkay/HaloBattery/pull/315) |
+| Redragon M991 / K1NG Max; Scyrox mice | Redragon `3554:F5D5` receiver / `F55E` cable; Scyrox `3554:F5F7` receiver / `F5F6` cable. Shared receiver names avoid claiming a specific unidentified mouse. | [#200](https://github.com/HeyOkay/HaloBattery/pull/200), [#182](https://github.com/HeyOkay/HaloBattery/pull/182) |
+| Hitscan Hyperlight; ATK A9 Ultimate | Hitscan 8K receiver `3770:0300`; A9 receiver `373B:11D9`. The untested A9 cable is excluded. | [#158](https://github.com/HeyOkay/HaloBattery/pull/158), [#305](https://github.com/HeyOkay/HaloBattery/pull/305) |
+| G-Wolves shared 8K receiver | Existing ID `33E4:3854` gains the confirmed Compx path when its 17-byte output collection is present and no legacy 65-byte feature collection is available. Existing feature-report units retain their protocol. | [#317](https://github.com/HeyOkay/HaloBattery/pull/317) |
+| Pulsar X2 V3 Mini | `3710:5403` 8K receiver, using its separate Sonix feature report. The unverified cable ID is excluded; charging is unknown. | [#213](https://github.com/HeyOkay/HaloBattery/pull/213) |
+| Finalmouse UltralightX | Receiver `361D:0100`; battery and charging. Voltage-based levels are labelled approximate and may rise while charging, matching the manufacturer's curve. | [#284](https://github.com/HeyOkay/HaloBattery/pull/284) |
+| ATK X1 Ultimate Nearlink; V75X | X1 `373B:108C` receiver / `108B` cable; V75X `320F:5088` receiver requires the exact product name because the ID is shared. | [#279](https://github.com/HeyOkay/HaloBattery/pull/279), [#308](https://github.com/HeyOkay/HaloBattery/pull/308) |
+| Inphic In9 Pro; Attack Shark X11 / R1 / X3 Max | Receivers `1D57:FA65` / `FA60`; passive reads send no commands. R1 levels are coarse, with no charging field. | [#181](https://github.com/HeyOkay/HaloBattery/pull/181) |
+| Rapoo VT7 Gen-2; V700DIY-98 | Mouse `24AE:1413` / `4613`; keyboard `24AE:1924` / `4824`. Passive battery and charging reports. | [#215](https://github.com/HeyOkay/HaloBattery/pull/215) |
+| MCHOSE V9 Pro; V9 Turbo+ | Pro `291D:385D`; Turbo+ receiver `3837:6008` / headset `600A`. Turbo+ charging is unavailable, so no charging state is invented. | [#248](https://github.com/HeyOkay/HaloBattery/pull/248), [#215](https://github.com/HeyOkay/HaloBattery/pull/215) |
+| Lofree Flow Lite84; AULA V9 Max+ / F87 Pro V2C | Flow receiver `05AC:024F` requires its vendor collection; ordinary Apple keyboards sharing the ID are untouched. AULA mouse `320F:22A0` / `22B7`; keyboard receiver `0C45:FEFC`. No battery support is claimed for the keyboard's cable. | [#169](https://github.com/HeyOkay/HaloBattery/pull/169), [#327](https://github.com/HeyOkay/HaloBattery/pull/327) |
+| ASUS TX Gaming Mouse Mini Miku; Strix Go 2.4 | Mouse `0B05:1C5A`; headset receiver `0B05:18D6`. The headset reports voltage-derived bands, not an exact percentage. Its untested cable is excluded. | [#205](https://github.com/HeyOkay/HaloBattery/pull/205), [#296](https://github.com/HeyOkay/HaloBattery/pull/296) |
+| ASUS ROG OMNI | `0B05:1ACE`; reads the pair list before querying the confirmed Harpe Ace Mini and Falchion RX Low Profile. Other paired models are not queried. | [#185](https://github.com/HeyOkay/HaloBattery/pull/185) |
+| HyperX Cloud II Wireless, Kingston revision | `0951:1718`, its own 62-byte battery and charging exchange. | [#198](https://github.com/HeyOkay/HaloBattery/pull/198) |
+| Corsair K65 PLUS Wireless; Void v2 family | K65 receiver `1B1C:2B07`, battery only. Existing Void v2 / Virtuoso Max / HS80 Max support gains the Windows 64-byte framing fix with a refused-write fallback. | [#293](https://github.com/HeyOkay/HaloBattery/pull/293), [#176](https://github.com/HeyOkay/HaloBattery/pull/176) |
+| Turtle Beach Stealth Pro II; Stealth 700 Gen 3 | Pro II `10F5:229B` transmitter / `229E` cable; 700X transmitter `2251` / headset cable `2253`. The 700's charging status is unknown; unconfirmed transmitter `2250` is excluded. | [#194](https://github.com/HeyOkay/HaloBattery/pull/194), [#211](https://github.com/HeyOkay/HaloBattery/pull/211) |
+| Skullcandy PLYR / Crusher PLYR 720 | Receivers `34F0:3210` / `5310`; battery only. SLYR Pro remains excluded. | [#207](https://github.com/HeyOkay/HaloBattery/pull/207) |
+| DAREU A950; AJAZZ AJ179 V2 MAX | DAREU receiver `260D:1074`; charging stays unknown because its owner saw the same flag on and off the cable. AJAZZ `249A:5C2F` receiver / `248A:5D2E` cable; a known firmware quirk can return a stored level after reboot until replugged. | [#212](https://github.com/HeyOkay/HaloBattery/pull/212), [#246](https://github.com/HeyOkay/HaloBattery/pull/246) |
+| FlyDigi Vader 5 Pro | `37D7:2401`, coarse battery and charging on its vendor channel, attributed only to a matching Windows controller. Ambiguous controllers are not queried. | [#216](https://github.com/HeyOkay/HaloBattery/pull/216) |
+
+Already supported proposals were checked before adding identities: Logitech unit-ID
+deduplication and SteelSeries Nova 3P use existing implementations; the latter's
+[hardware confirmation](https://github.com/HeyOkay/HaloBattery/pull/175) is retained.
+The Maxwell Xbox receiver's off-state name is also recognized
+([#254](https://github.com/HeyOkay/HaloBattery/pull/254)). Proposals explicitly awaiting
+hardware confirmation, including Viper V3 Pro SE and HyperX Cloud Alpha Wireless,
+are not enabled by this review. Sony INZONE H9's proposed transport also needs
+protocol evidence before it can be included.
 
 After a slow Windows boot, an empty inventory is retried every ten seconds for
 up to ninety seconds. Sleeping Pulsar-family mice use Windows' last-input timestamp
@@ -443,11 +483,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.0.7
+.\tools\package-rust.ps1 -Version 1.0.8
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.0.7-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.0.8-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -457,13 +497,13 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.0.7
+.\tools\package-installer.ps1 -Version 1.0.8
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.0.7-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.0.7-windows-x64.exe` and
-`dist/HaloContinued-1.0.7-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.0.8-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.0.8-windows-x64.exe` and
+`dist/HaloContinued-1.0.8-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with
@@ -503,6 +543,11 @@ Thanks also to the protocol researchers and contributors behind
 [OpenLinkHub](https://github.com/jurkovic-nikola/OpenLinkHub),
 [ckb-next](https://github.com/ckb-next/ckb-next),
 [HyperHeadset](https://github.com/LennardKittner/HyperHeadset),
+[Headroom](https://github.com/patalbansishashank/Headroom),
+[MousePower](https://github.com/vamyane/MousePower),
+[the ULX battery implementation by voiddog30](https://github.com/voiddog30/HaloBattery),
+[the Pulsar Sonix reference](https://github.com/jonkristian/pulsar-x3-python),
+[the MCHOSE V9 reference](https://github.com/JoaoKSS/MCHOSE_v9_PRO_Controller),
 [Linux-Arctis-Manager](https://github.com/elegos/Linux-Arctis-Manager),
 [Arctis-Sound-Manager](https://github.com/loteran/Arctis-Sound-Manager) and
 [hitscan-battery](https://github.com/sopparus/hitscan-battery), along with the

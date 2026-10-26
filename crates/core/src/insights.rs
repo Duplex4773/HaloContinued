@@ -116,6 +116,7 @@ pub struct InsightsBuilder {
     recent: crate::RecentUse,
     previous_activity: Option<crate::PollingActivityKind>,
     previous: Option<UsageObservation>,
+    contiguous: bool,
     rates: [RateInsight; 7],
     previous_counted_rate: Option<u32>,
     pending_projection_seconds: u64,
@@ -134,6 +135,7 @@ impl Default for InsightsBuilder {
             recent: crate::RecentUse::default(),
             previous_activity: None,
             previous: None,
+            contiguous: false,
             rates: [125, 250, 500, 1000, 2000, 4000, 8000].map(|hz| RateInsight {
                 hz,
                 ..RateInsight::default()
@@ -175,7 +177,9 @@ impl InsightsBuilder {
     }
 
     fn reset_continuity(&mut self) {
-        self.previous = None;
+        // Retain the previous identity across damaged rows without cloning its
+        // strings. It must not supply an interval or a remaining-use estimate.
+        self.contiguous = false;
         self.previous_counted_rate = None;
         self.pending_projection_seconds = 0;
         self.projection_anchored = false;
@@ -211,7 +215,8 @@ impl InsightsBuilder {
     }
 
     /// Feed chronological raw observations for one device. All memory is bounded.
-    /// Equal/backwards timestamps and identity changes start a partial period.
+    /// Equal/backwards timestamps start a partial period; a different physical
+    /// unit starts fresh learning even when it reuses the same storage key.
     /// Session/rate changes and pauses exclude their boundary interval only.
     pub fn push(&mut self, observation: UsageObservation) {
         self.push_with_activity(observation, None);
@@ -222,6 +227,26 @@ impl InsightsBuilder {
         activity: Option<crate::PollingActivityKind>,
     ) {
         let reading = &observation.reading;
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| !reading.same_battery_identity(&previous.reading))
+        {
+            // Preserve historical sessions/totals, but do not lend their drain
+            // model or recent-rate mix to a different physical battery.
+            let since = self.recent.since.max(reading.timestamp);
+            self.reset_continuity();
+            self.previous = None;
+            self.previous_activity = None;
+            self.recent = crate::RecentUse {
+                since,
+                ..Default::default()
+            };
+            self.rates = crate::INSIGHT_RATES.map(|hz| RateInsight {
+                hz,
+                ..Default::default()
+            });
+        }
         if observation.polling_rate.is_some()
             && observation.session.is_some()
             && valid_level(reading).is_some()
@@ -241,7 +266,7 @@ impl InsightsBuilder {
         }
         let discontinuity = self.previous.as_ref().is_some_and(|previous| {
             let old = &previous.reading;
-            reading.timestamp <= old.timestamp || !reading.same_battery_identity(old)
+            reading.timestamp <= old.timestamp
         });
         if discontinuity {
             self.reset_continuity();
@@ -265,13 +290,14 @@ impl InsightsBuilder {
             let previous_observation = self.previous.take();
             let previous = previous_observation.as_ref();
             let delta = previous.and_then(|p| reading.timestamp.checked_sub(p.reading.timestamp));
-            let continuous = previous.is_some_and(|p| {
-                discharging(&p.reading)
-                    && delta.is_some_and(|seconds| (1..=600).contains(&seconds))
-                    && reading.via == p.reading.via
-                    && observation.polling_rate == p.polling_rate
-                    && observation.session == p.session
-            });
+            let continuous = self.contiguous
+                && previous.is_some_and(|p| {
+                    discharging(&p.reading)
+                        && delta.is_some_and(|seconds| (1..=600).contains(&seconds))
+                        && reading.via == p.reading.via
+                        && observation.polling_rate == p.polling_rate
+                        && observation.session == p.session
+                });
             let level = reading.level.unwrap();
             let increase = self.pending_charge.is_none()
                 && ((continuous
@@ -399,6 +425,7 @@ impl InsightsBuilder {
                 self.coverage.excluded_interval_count.saturating_add(1);
         }
         self.previous = Some(observation);
+        self.contiguous = true;
         self.previous_activity = activity;
     }
 

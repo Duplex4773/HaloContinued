@@ -532,9 +532,19 @@ impl Store {
         }
         let mut result = builder.finish_at(until);
         if self.has_polling_events {
-            let mut query = self.db.prepare("SELECT kind,rate,previous_rate FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts").map_err(sql_error)?;
+            // A reused identity can cut the interval later than seven days ago.
+            // At its first timestamp, both units can have saved an event: require
+            // matching session evidence within the new unit's retained period.
+            let sql = if self.has_usage_metadata
+                && result.recent.since > until.saturating_sub(7 * 86400)
+            {
+                "SELECT kind,rate,previous_rate FROM polling_events e WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?2 OR EXISTS(SELECT 1 FROM usage_metadata m WHERE m.device=e.device AND m.ts BETWEEN ?2 AND ?3 AND m.session=e.session)) ORDER BY ts"
+            } else {
+                "SELECT kind,rate,previous_rate FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts"
+            };
+            let mut query = self.db.prepare(sql).map_err(sql_error)?;
             let mut rows = query
-                .query(params![key, until.saturating_sub(7 * 86400), until])
+                .query(params![key, result.recent.since, until])
                 .map_err(sql_error)?;
             while let Some(row) = rows.next().map_err(sql_error)? {
                 // One malformed event must not prevent the rest of the user's

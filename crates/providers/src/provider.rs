@@ -38,6 +38,17 @@ pub const FAMILIES: &[(&str, &str)] = &[
     ("corsair", "Corsair"),
     ("lamzu", "LAMZU"),
     ("am_infinity", "AM Infinity 8K"),
+    ("inphic", "Inphic / Attack Shark mice"),
+    ("turtlebeach", "Turtle Beach headsets"),
+    ("rapoo", "Rapoo mice and keyboards"),
+    ("atk_nearlink", "ATK Nearlink mice"),
+    ("atk_keyboard", "ATK keyboards"),
+    ("dareu", "DAREU mice"),
+    ("finalmouse", "Finalmouse"),
+    ("skullcandy", "Skullcandy headsets"),
+    ("ajazz", "AJAZZ mice"),
+    ("shield", "NVIDIA SHIELD controllers"),
+    ("aula", "AULA mice and keyboards"),
 ];
 pub fn providers() -> Vec<Box<dyn BatteryProvider>> {
     FAMILIES
@@ -46,6 +57,9 @@ pub fn providers() -> Vec<Box<dyn BatteryProvider>> {
         .collect()
 }
 pub struct HidProvider {
+    community_enabled: bool,
+    // Allocated only when an enumerated, reviewed device needs these protocols.
+    community: Option<Box<crate::community::Community>>,
     jbl: crate::passive_jbl::PassiveJbl,
     id: &'static str,
     // The catalog is static; retain its ordered vendor set across polls.
@@ -84,6 +98,11 @@ pub struct HidProvider {
 impl HidProvider {
     pub fn new(id: &'static str) -> Self {
         Self {
+            community_enabled: DEVICES.iter().any(|d| {
+                d.provider == id
+                    && (d.variant.starts_with("pr:") || id == "gwolves" && d.pid == 0x3854)
+            }),
+            community: None,
             jbl: Default::default(),
             id,
             vendors: DEVICES
@@ -527,12 +546,28 @@ impl HidProvider {
                     charging,
                 ));
             }
-            if [4, 0x100].contains(&self.razer_status) {
-                self.razer_cache.insert(cache_key, (info.path.clone(), tid));
+            if self.razer_status == 0x100
+                || self.razer_status == 4
+                    && cached.as_ref().is_some_and(|(path, _)| path == &info.path)
+            {
                 break;
             }
         }
         Ok(None)
+    }
+    fn corsair_write(
+        s: &mut dyn HidSession,
+        prefixed: &mut bool,
+        head: &[u8],
+    ) -> Result<(), ProviderError> {
+        let packet = p::padded(head, 65);
+        let first = if *prefixed { &packet[..] } else { &packet[1..] };
+        if s.write(first).is_err() {
+            let fallback = if *prefixed { &packet[1..] } else { &packet[..] };
+            s.write(fallback)?;
+            *prefixed = !*prefixed;
+        }
+        Ok(())
     }
     fn read(
         &mut self,
@@ -542,7 +577,7 @@ impl HidProvider {
         c: &PollContext<'_>,
     ) -> Result<Option<Battery>, ProviderError> {
         match self.id {
-            "razer" if [0x555, 0x556].contains(&d.pid) => self.read_pa(s, c, false),
+            "razer" if [0x555, 0x556, 0x583].contains(&d.pid) => self.read_pa(s, c, false),
             "razer" if d.pid == 0x0528 => self.query_blackshark2020(s, c),
             "razer" => self.read_razer(d, info, s, c),
             "barracuda" => self.read_pa(s, c, true),
@@ -853,14 +888,18 @@ impl HidProvider {
                 Ok(p::corsair_nxp(&reply))
             }
             "corsair" => {
-                s.write(&p::padded(&[0, 2, 8, 2, 0x13], 65))?;
-                s.write(&p::padded(&[0, 2, 8, 2, 0x12], 65))?;
+                // Windows collections in this family often require 64 bytes
+                // without report ID 0. Retain a refused-shape fallback and reuse
+                // the accepted shape throughout this read (parent PR #176).
+                let mut prefixed = info.output_length == Some(65);
+                Self::corsair_write(s, &mut prefixed, &[0, 2, 8, 2, 0x13])?;
+                Self::corsair_write(s, &mut prefixed, &[0, 2, 8, 2, 0x12])?;
                 for _ in 0..4 {
                     if s.read(64, Duration::from_millis(30))?.is_empty() {
                         break;
                     }
                 }
-                s.write(&p::padded(&[0, 2, 9, 2, 0x12], 65))?;
+                Self::corsair_write(s, &mut prefixed, &[0, 2, 9, 2, 0x12])?;
                 if s.read(64, Duration::from_millis(500))?.is_empty() {
                     return Ok(None);
                 }
@@ -873,7 +912,7 @@ impl HidProvider {
                     if !c.active() {
                         break;
                     }
-                    s.write(&p::padded(&[0, 2, 9, 2, 0x0f], 65))?;
+                    Self::corsair_write(s, &mut prefixed, &[0, 2, 9, 2, 0x0f])?;
                     let reply = s.read(64, Duration::from_millis(500))?;
                     if let Some(b) = p::corsair(&reply) {
                         return Ok(Some(b));
@@ -1794,7 +1833,7 @@ fn reading_key(id: &str, d: &Device, i: &HidInfo) -> String {
 fn razer_keyboard_interface(pid: u16) -> Option<i32> {
     match pid {
         0x0290 | 0x0296 | 0x02d5 => Some(2),
-        0x0292 | 0x0298 | 0x02d7 | 0x0271 | 0x0258 | 0x02ba | 0x02b9 => Some(3),
+        0x0292 | 0x0298 | 0x02d7 | 0x0271 | 0x0258 | 0x02ba | 0x02b9 | 0x027b => Some(3),
         _ => None,
     }
 }
@@ -2006,10 +2045,15 @@ impl BatteryProvider for HidProvider {
     fn invalidate(&mut self) {
         self.jbl.clear();
         self.centurion_features.clear();
+        if let Some(state) = &mut self.community {
+            state.invalidate();
+        }
     }
     fn poll(&mut self, hid: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
-        if self.id == "jbl" && !c.active() {
-            self.jbl.clear();
+        if !c.active() {
+            if self.id == "jbl" {
+                self.jbl.clear();
+            }
             return Ok(Vec::new());
         }
         self.diagnostics.clear();
@@ -2021,6 +2065,23 @@ impl BatteryProvider for HidProvider {
         for &vendor in &self.vendors {
             infos.extend(hid.enumerate(vendor)?);
         }
+        let mut community_result = Ok(Vec::new());
+        if self.community_enabled
+            && infos.iter().any(|i| {
+                DEVICES.iter().any(|d| {
+                    d.provider == self.id
+                        && d.vid == i.vendor_id
+                        && d.pid == i.product_id
+                        && crate::community::handles(d, i, &infos)
+                })
+            })
+        {
+            let state = self.community.get_or_insert_with(Default::default);
+            community_result = state.poll(self.id, &infos, hid, c);
+            self.diagnostics.append(&mut state.diagnostics);
+        } else {
+            self.community = None;
+        }
         if ["nzxt", "steam"].contains(&self.id) {
             return self.poll_added115(&infos, hid, c);
         }
@@ -2031,6 +2092,10 @@ impl BatteryProvider for HidProvider {
             return self.poll_jbl(&infos, hid, c);
         }
         if self.id == "wlmouse" {
+            if infos.is_empty() {
+                self.wl_backoff = (0, 0, 0);
+                return Ok(Vec::new());
+            }
             let signature = infos.iter().fold(0u128, |h, i| h ^ stable_guid(&i.path));
             if signature != self.wl_backoff.2 {
                 self.wl_backoff = (0, 0, signature);
@@ -2102,6 +2167,7 @@ impl BatteryProvider for HidProvider {
                     .map(|d| (d, i))
             })
             .filter(|(d, i)| candidate_group(self.id, d, i, &infos))
+            .filter(|(d, i)| !crate::community::handles(d, i, &infos))
             .collect();
         if self.id == "steelseries" {
             selected.retain(|(d, i)| {
@@ -2188,7 +2254,8 @@ impl BatteryProvider for HidProvider {
                         && other
                             .product
                             .trim()
-                            .eq_ignore_ascii_case("Audeze Maxwell Dongle")
+                            .to_ascii_lowercase()
+                            .ends_with("dongle")
                 })
             {
                 self.first_seen
@@ -2251,7 +2318,11 @@ impl BatteryProvider for HidProvider {
                 Ok(s) => s,
                 Err(e) => {
                     self.log(e.to_string());
-                    if self.id == "razer" && ![0x528, 0x555, 0x556].contains(&d.pid) {
+                    if self.id == "razer"
+                        && ![0x528, 0x555, 0x556, 0x583].contains(&d.pid)
+                        && (d.pid != 0x027b
+                            || !self.razer_cache.values().any(|(path, _)| path == &i.path))
+                    {
                         self.razer_dead.insert(
                             i.path.clone(),
                             c.clock.monotonic() + Duration::from_secs(300),
@@ -2349,7 +2420,7 @@ impl BatteryProvider for HidProvider {
                     }
                 };
             }
-            if self.id == "razer" && [0x555, 0x556].contains(&d.pid) && self.pa_accepted {
+            if self.id == "razer" && [0x555, 0x556, 0x583].contains(&d.pid) && self.pa_accepted {
                 self.razer_cache.insert(
                     format!("{:04x}:{}", d.pid, trusted_identity(i)),
                     (i.path.clone(), 0),
@@ -2358,7 +2429,11 @@ impl BatteryProvider for HidProvider {
                     seen.insert(key.clone());
                 }
             }
-            if self.id == "razer" && ![0x528, 0x555, 0x556].contains(&d.pid) && result.is_err() {
+            if self.id == "razer"
+                && ![0x528, 0x555, 0x556, 0x583].contains(&d.pid)
+                && result.is_err()
+                && (d.pid != 0x027b || !self.razer_cache.values().any(|(path, _)| path == &i.path))
+            {
                 self.razer_dead.insert(
                     i.path.clone(),
                     c.clock.monotonic() + Duration::from_secs(300),
@@ -2393,21 +2468,22 @@ impl BatteryProvider for HidProvider {
                                 || razer_keyboard_interface(d.pid).is_some())
                     {
                         "keyboard"
-                    } else if [
-                        "audeze",
-                        "barracuda",
-                        "astro",
-                        "hyperx",
-                        "hyperx_cloud3",
-                        "hyperx_alpha2",
-                        "jbl",
-                        "corsair",
-                        "steelseries",
-                    ]
-                    .contains(&self.id)
-                        && !(["nxp", "bragi"].contains(&d.variant) && d.pid == 0x1b7f
-                            || d.variant.contains("rival")
-                            || d.variant.contains("aerox"))
+                    } else if self.id == "razer" && [0x555, 0x556, 0x583].contains(&d.pid)
+                        || [
+                            "audeze",
+                            "barracuda",
+                            "astro",
+                            "hyperx",
+                            "hyperx_cloud3",
+                            "hyperx_alpha2",
+                            "jbl",
+                            "corsair",
+                            "steelseries",
+                        ]
+                        .contains(&self.id)
+                            && !(["nxp", "bragi"].contains(&d.variant) && d.pid == 0x1b7f
+                                || d.variant.contains("rival")
+                                || d.variant.contains("aerox"))
                     {
                         "headset"
                     } else {
@@ -2629,6 +2705,10 @@ impl BatteryProvider for HidProvider {
                 self.wl_backoff.0
             };
         }
+        match community_result {
+            Ok(readings) => output.extend(readings),
+            Err(error) => errors.push(error),
+        }
         if output.is_empty() && !errors.is_empty() {
             Err(errors.remove(0))
         } else {
@@ -2676,6 +2756,37 @@ mod allocation_tests {
         COUNT.with(|c| c.set(Some(0)));
         f();
         COUNT.with(|c| c.replace(None).unwrap())
+    }
+    #[test]
+    fn absent_devices_do_not_allocate_during_repeated_polling_of_expanded_registry() {
+        use super::cache_test_support::{FakeClock, FakeHid, context};
+        let mut providers = providers();
+        let hid = FakeHid::new(vec![], vec![]);
+        let clock = FakeClock::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        // Measure steady state after the initial discovery.
+        for provider in &mut providers {
+            assert!(
+                provider
+                    .poll(&hid, &context(&clock, &cancel))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let count = allocations(|| {
+            for _ in 0..100 {
+                for provider in &mut providers {
+                    assert!(
+                        provider
+                            .poll(&hid, &context(&clock, &cancel))
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        });
+        assert_eq!(count, 0);
+        assert!(hid.opened.lock().unwrap().is_empty());
     }
     #[test]
     fn razer_alias_filter_preserves_identity_rules_without_allocating() {

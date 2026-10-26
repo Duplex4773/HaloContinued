@@ -342,6 +342,7 @@ impl Engine {
             if self.settings.low_sound
                 && fresh_here
                 && r.online()
+                && (r.source != "shield" || r.charging.is_some())
                 && let Some(level) = r.level
             {
                 if low == 0 || level > low || r.charging == Some(true) {
@@ -389,7 +390,12 @@ impl Engine {
                 alert.low = false;
                 alert.threshold = Some(low);
             }
-            if let Some(level) = r.level.filter(|_| r.online()) {
+            // SHIELD explicitly reports an unknown charger state during link
+            // transitions. Its parent protocol waits for confirmation (#250).
+            if let Some(level) = r
+                .level
+                .filter(|_| r.online() && (r.source != "shield" || r.charging.is_some()))
+            {
                 let recovered = r.charging == Some(true) || level > low.saturating_add(5);
                 let low_notification =
                     !recovered && low > 0 && level <= low && !alert.low && self.settings.notify;
@@ -472,7 +478,7 @@ impl Engine {
             }
             // An unavailable reading cannot confirm recovery or disconnect. Keep the
             // pending alert until fresh data permits delivery or invalidates it.
-            if !r.online() || r.level.is_none() {
+            if !r.online() || r.level.is_none() || r.source == "shield" && r.charging.is_none() {
                 self.held.insert((n.key.clone(), n.kind), n);
                 continue;
             }

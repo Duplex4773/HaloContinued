@@ -1,0 +1,506 @@
+[
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62933,
+      "Redragon M991 / K1NG Max",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 200,
+    "revision": "a2b1ddefd7d38dc6b8eb5d1a5984cb38c0e8eab9"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62814,
+      "Redragon M991 / K1NG Max",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 200,
+    "revision": "a2b1ddefd7d38dc6b8eb5d1a5984cb38c0e8eab9"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62967,
+      "Scyrox mouse (8K receiver)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 182,
+    "revision": "e16d0cb4fe76b736bcc6b92261dc761f45e4e997"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62966,
+      "Scyrox mouse (wired)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 182,
+    "revision": "e16d0cb4fe76b736bcc6b92261dc761f45e4e997"
+  },
+  {
+    "device": [
+      "pulsar",
+      14192,
+      768,
+      "Hitscan Hyperlight (8K receiver)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 158,
+    "revision": "79665f92573871253daaf6b3f42e84ef2a8ccefb"
+  },
+  {
+    "device": [
+      "pulsar",
+      14139,
+      4569,
+      "ATK A9 Ultimate (receiver)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 305,
+    "revision": "72d0c3b7a79b99f23165bcf0702df6cea4924173"
+  },
+  {
+    "device": [
+      "razer",
+      5426,
+      635,
+      "Razer Pro Type Ultra",
+      "",
+      159
+    ],
+    "pull_request": 203,
+    "revision": "7805395dc54461a9349392eb1b15d6baf07143b6"
+  },
+  {
+    "device": [
+      "razer",
+      5426,
+      1411,
+      "Razer Barracuda Pro 2.4",
+      "",
+      31
+    ],
+    "pull_request": 315,
+    "revision": "52409ba11896c2253b28d77047fe3cef024cdfe2"
+  },
+  {
+    "device": [
+      "asus",
+      2821,
+      7258,
+      "TX Gaming Mouse Mini Miku",
+      "",
+      1
+    ],
+    "pull_request": 205,
+    "revision": "0ad07514241a9295252a495300bab3f248a08800"
+  },
+  {
+    "device": [
+      "asus",
+      2821,
+      6358,
+      "ROG Strix Go 2.4",
+      "pr:strix",
+      0
+    ],
+    "pull_request": 296,
+    "revision": "d70fc0ff8b60ce2d5099d42ef0f267e2153669e3"
+  },
+  {
+    "device": [
+      "asus",
+      2821,
+      6862,
+      "ROG OMNI receiver",
+      "pr:omni",
+      0
+    ],
+    "pull_request": 185,
+    "revision": "af45255df4fab50a5df2b7cd20d8dcfc44952b69"
+  },
+  {
+    "device": [
+      "hyperx",
+      2385,
+      5912,
+      "HyperX Cloud II Wireless (Kingston)",
+      "pr:kingston",
+      0
+    ],
+    "pull_request": 198,
+    "revision": "a1e67965b553323a72d2e23cb5a75c998ce9d068"
+  },
+  {
+    "device": [
+      "lofree",
+      1452,
+      591,
+      "Lofree Flow Lite84",
+      "pr:flow",
+      0
+    ],
+    "pull_request": 169,
+    "revision": "55c6985c2cb52a68245e089c78543a27bd92ffcd"
+  },
+  {
+    "device": [
+      "corsair",
+      6940,
+      11015,
+      "Corsair K65 PLUS Wireless",
+      "pr:k65",
+      0
+    ],
+    "pull_request": 293,
+    "revision": "d25b08bd77b7d6dccd08eeac6b3d3cd31568f152"
+  },
+  {
+    "device": [
+      "inphic",
+      7511,
+      64101,
+      "Inphic In9 Pro",
+      "pr:inphic",
+      0
+    ],
+    "pull_request": 181,
+    "revision": "4d7ad7183ad66e7ddcefd7e4bf03021f68ac1fec"
+  },
+  {
+    "device": [
+      "inphic",
+      7511,
+      64096,
+      "Attack Shark X11 / R1 / X3 Max",
+      "pr:inphic",
+      0
+    ],
+    "pull_request": 181,
+    "revision": "4d7ad7183ad66e7ddcefd7e4bf03021f68ac1fec"
+  },
+  {
+    "device": [
+      "turtlebeach",
+      4341,
+      8859,
+      "Turtle Beach Stealth Pro II",
+      "pr:turtle",
+      0
+    ],
+    "pull_request": 194,
+    "revision": "86fc5d8befe3a8a1075e6dcdd0ca95ca3a19d302"
+  },
+  {
+    "device": [
+      "turtlebeach",
+      4341,
+      8862,
+      "Turtle Beach Stealth Pro II",
+      "pr:turtle",
+      0
+    ],
+    "pull_request": 194,
+    "revision": "86fc5d8befe3a8a1075e6dcdd0ca95ca3a19d302"
+  },
+  {
+    "device": [
+      "turtlebeach",
+      4341,
+      8785,
+      "Turtle Beach Stealth 700X Gen 3",
+      "pr:turtle",
+      0
+    ],
+    "pull_request": 194,
+    "revision": "86fc5d8befe3a8a1075e6dcdd0ca95ca3a19d302"
+  },
+  {
+    "device": [
+      "turtlebeach",
+      4341,
+      8787,
+      "Turtle Beach Stealth 700 Gen 3 headset",
+      "pr:turtle",
+      0
+    ],
+    "pull_request": 194,
+    "revision": "86fc5d8befe3a8a1075e6dcdd0ca95ca3a19d302"
+  },
+  {
+    "device": [
+      "rapoo",
+      9390,
+      5139,
+      "Rapoo VT7 (Gen-2)",
+      "pr:rapoo",
+      0
+    ],
+    "pull_request": 215,
+    "revision": "e5e6335abf06559d4056f6f34b5a0269aa86143e"
+  },
+  {
+    "device": [
+      "rapoo",
+      9390,
+      17939,
+      "Rapoo VT7 (Gen-2)",
+      "pr:rapoo",
+      0
+    ],
+    "pull_request": 215,
+    "revision": "e5e6335abf06559d4056f6f34b5a0269aa86143e"
+  },
+  {
+    "device": [
+      "rapoo",
+      9390,
+      6436,
+      "Rapoo V700DIY-98",
+      "pr:rapoo",
+      0
+    ],
+    "pull_request": 215,
+    "revision": "e5e6335abf06559d4056f6f34b5a0269aa86143e"
+  },
+  {
+    "device": [
+      "rapoo",
+      9390,
+      18468,
+      "Rapoo V700DIY-98",
+      "pr:rapoo",
+      0
+    ],
+    "pull_request": 215,
+    "revision": "e5e6335abf06559d4056f6f34b5a0269aa86143e"
+  },
+  {
+    "device": [
+      "mchose",
+      14391,
+      24584,
+      "MCHOSE V9 Turbo+",
+      "pr:turbo",
+      0
+    ],
+    "pull_request": 215,
+    "revision": "e5e6335abf06559d4056f6f34b5a0269aa86143e"
+  },
+  {
+    "device": [
+      "mchose",
+      14391,
+      24586,
+      "MCHOSE V9 Turbo+",
+      "pr:turbo",
+      0
+    ],
+    "pull_request": 215,
+    "revision": "e5e6335abf06559d4056f6f34b5a0269aa86143e"
+  },
+  {
+    "device": [
+      "mchose",
+      10525,
+      14429,
+      "MCHOSE V9 Pro",
+      "pr:v9",
+      0
+    ],
+    "pull_request": 248,
+    "revision": "7b80acae86f98fdc0c55d2bd697fcabf89de3c72"
+  },
+  {
+    "device": [
+      "atk_nearlink",
+      14139,
+      4236,
+      "ATK X1 Ultimate",
+      "pr:nearlink",
+      0
+    ],
+    "pull_request": 279,
+    "revision": "4c94e626402eb075fc1d8a207d3e28312e6ad455"
+  },
+  {
+    "device": [
+      "atk_nearlink",
+      14139,
+      4235,
+      "ATK X1 Ultimate",
+      "pr:nearlink",
+      0
+    ],
+    "pull_request": 279,
+    "revision": "4c94e626402eb075fc1d8a207d3e28312e6ad455"
+  },
+  {
+    "device": [
+      "atk_keyboard",
+      12815,
+      20616,
+      "ATK V75X",
+      "pr:atk-keyboard",
+      0
+    ],
+    "pull_request": 308,
+    "revision": "94684f3dfb375dd5291d8212faf75dd9978146a2"
+  },
+  {
+    "device": [
+      "dareu",
+      9741,
+      4212,
+      "DAREU A950 (2.4 GHz)",
+      "pr:dareu",
+      0
+    ],
+    "pull_request": 212,
+    "revision": "c99434e6b11b11d6160abfd44646dd30cfdd3f74"
+  },
+  {
+    "device": [
+      "pulsar",
+      14096,
+      21507,
+      "Pulsar X2 V3 Mini (8K receiver)",
+      "pr:sonix",
+      0
+    ],
+    "pull_request": 213,
+    "revision": "0bd8bbf5df87b1d3901379f7b8cd1b2fd5b4e3fb"
+  },
+  {
+    "device": [
+      "finalmouse",
+      13853,
+      256,
+      "Finalmouse UltralightX",
+      "pr:ulx",
+      0
+    ],
+    "pull_request": 284,
+    "revision": "8f9a2239be02c5454069103829f6b4d117748557"
+  },
+  {
+    "device": [
+      "skullcandy",
+      13552,
+      12816,
+      "Skullcandy PLYR",
+      "pr:skullcandy",
+      0
+    ],
+    "pull_request": 207,
+    "revision": "d8e72011c75651dab4feb524ec012fc6f43a1403"
+  },
+  {
+    "device": [
+      "skullcandy",
+      13552,
+      21264,
+      "Skullcandy Crusher PLYR 720",
+      "pr:skullcandy",
+      0
+    ],
+    "pull_request": 207,
+    "revision": "d8e72011c75651dab4feb524ec012fc6f43a1403"
+  },
+  {
+    "device": [
+      "ajazz",
+      9370,
+      23599,
+      "AJAZZ AJ179 V2 MAX",
+      "pr:ajazz",
+      0
+    ],
+    "pull_request": 246,
+    "revision": "62ae2ea6f0e67947aee3337db0f59945999a5774"
+  },
+  {
+    "device": [
+      "ajazz",
+      9354,
+      23854,
+      "AJAZZ AJ179 V2 MAX",
+      "pr:ajazz",
+      0
+    ],
+    "pull_request": 246,
+    "revision": "62ae2ea6f0e67947aee3337db0f59945999a5774"
+  },
+  {
+    "device": [
+      "shield",
+      2389,
+      29204,
+      "NVIDIA SHIELD Controller (2017)",
+      "pr:shield",
+      0
+    ],
+    "pull_request": 250,
+    "revision": "83aa84b95d1f9faf2fc62ebeaadebb220fdfd22d"
+  },
+  {
+    "device": [
+      "aula",
+      12815,
+      8864,
+      "AULA V9 Max+",
+      "pr:aula-mouse",
+      0
+    ],
+    "pull_request": 327,
+    "revision": "5610c8a7dfe3579041e25a2bc66425ebac6ef59f"
+  },
+  {
+    "device": [
+      "aula",
+      12815,
+      8887,
+      "AULA V9 Max+",
+      "pr:aula-mouse",
+      0
+    ],
+    "pull_request": 327,
+    "revision": "5610c8a7dfe3579041e25a2bc66425ebac6ef59f"
+  },
+  {
+    "device": [
+      "aula",
+      3141,
+      65276,
+      "AULA F87 Pro V2C",
+      "pr:aula-keyboard",
+      0
+    ],
+    "pull_request": 327,
+    "revision": "5610c8a7dfe3579041e25a2bc66425ebac6ef59f"
+  },
+  {
+    "device": [
+      "xinput",
+      14295,
+      9217,
+      "FlyDigi Vader 5 Pro",
+      "pr:flydigi",
+      0
+    ],
+    "pull_request": 216,
+    "revision": "60b3d3902488a4e0c49757bb399b36c7ece13a74"
+  }
+]

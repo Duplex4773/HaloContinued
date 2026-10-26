@@ -1362,9 +1362,7 @@ impl InitialPollingReads {
             if !recovery_reading_ready(reading, unix) {
                 continue;
             }
-            if reading.source != "simulation"
-                && !hb_providers::controls::POLLING_PROVIDERS.contains(&reading.source.as_str())
-            {
+            if !polling_battery_source(&reading.source) {
                 continue;
             }
             if self.attempted.get(&reading.key) == Some(&Some(session)) {
@@ -1418,7 +1416,10 @@ impl InitialPollingReads {
             && (readings.any(|reading| {
                 reading.kind == "mouse"
                     && reading.online()
-                    && ((self.initial_open && !self.attempted.contains_key(&reading.key))
+                    && polling_battery_source(&reading.source)
+                    && ((self.initial_open
+                        && self.attempted.len() < 512
+                        && !self.attempted.contains_key(&reading.key))
                         || (recovery_reading_ready(reading, unix)
                             && self
                                 .pending
@@ -1428,6 +1429,8 @@ impl InitialPollingReads {
                 && configuration.iter().any(|device| {
                     device.online()
                         && device.kind == "mouse"
+                        && polling_battery_source(&device.source)
+                        && self.attempted.len() < 512
                         && !self.attempted.contains_key(&device.key)
                 })))
     }
@@ -1470,15 +1473,33 @@ impl InitialPollingReads {
             return None;
         }
         let device = devices.find(|device| {
-            device.online()
-                && hb_providers::controls::polling_menu_candidate(device)
-                && ((self.initial_open
+            if !device.online() || device.kind != "mouse" || !polling_battery_source(&device.source)
+            {
+                return false;
+            }
+            if !((self.initial_open
+                && self.attempted.len() < 512
+                && !self.attempted.contains_key(&device.key))
+                || self
+                    .pending
+                    .get(&device.key)
+                    .is_some_and(|attempt| attempt.retry_at.is_some_and(|due| now >= due)))
+            {
+                return false;
+            }
+            if !hb_providers::controls::polling_menu_candidate(device) {
+                // Remember a startup allowlist miss in the existing bounded
+                // state. An unconfigurable model must not clone the combined
+                // inventory again on every idle wake for the next five minutes.
+                if self.initial_open
+                    && self.attempted.len() < 512
                     && !self.attempted.contains_key(&device.key)
-                    && self.attempted.len() < 512)
-                    || self
-                        .pending
-                        .get(&device.key)
-                        .is_some_and(|attempt| attempt.retry_at.is_some_and(|due| now >= due)))
+                {
+                    self.attempted.insert(device.key.clone(), None);
+                }
+                return false;
+            }
+            true
         })?;
         if !self.attempted.contains_key(&device.key) {
             self.attempted.insert(device.key.clone(), None);
@@ -1506,6 +1527,9 @@ impl InitialPollingReads {
         self.next_request += 1;
         Some(Command::Polling(request, epoch, None))
     }
+}
+fn polling_battery_source(source: &str) -> bool {
+    source == "simulation" || hb_providers::controls::POLLING_PROVIDERS.contains(&source)
 }
 fn recovery_reading_ready(reading: &Reading, now: i64) -> bool {
     reading.kind == "mouse"
@@ -5347,6 +5371,44 @@ mod tests {
         }
         assert!(reads.next(now, 0, 4, std::iter::once(device)).is_none());
         assert!(reads.pending.is_empty());
+    }
+    #[test]
+    fn startup_rate_reads_do_not_rebuild_inventory_for_unsupported_mice() {
+        let now = Instant::now();
+        let mut reading = recovery_sample(1000, 1).reading;
+        reading.source = "razer".into();
+        reading.key = "razer:0001:SYNTHETIC".into();
+        reading.via = "usb".into();
+        let mut reads = InitialPollingReads::new(&startup_settings(), now);
+        assert!(reads.needs_inventory(now, 1000, std::iter::once(&reading), &[]));
+        assert!(
+            reads
+                .next(
+                    now,
+                    0,
+                    1,
+                    std::iter::once(ConfigurationDevice::from_reading(&reading))
+                )
+                .is_none()
+        );
+        assert!(
+            !reads.needs_inventory(now, 1000, std::iter::once(&reading), &[]),
+            "An unsupported model was already checked"
+        );
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!reads.needs_inventory(now, 1000, std::iter::once(&reading), &[]));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        assert_eq!(allocations.bytes, 0);
+        let reads = InitialPollingReads::new(&startup_settings(), now);
+        reading.source = "corsair".into();
+        reading.key = "corsair:SYNTHETIC".into();
+        assert!(
+            !reads.needs_inventory(now, 1000, std::iter::once(&reading), &[]),
+            "Battery-only providers cannot expose polling controls"
+        );
     }
     #[test]
     fn startup_uncertain_restore_only_rechecks_and_confirmation_stops_recovery() {

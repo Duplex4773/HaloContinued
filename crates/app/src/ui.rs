@@ -832,12 +832,15 @@ impl InsightsUi {
     fn abandon(&mut self) {
         self.pending = None;
     }
+    fn invalidate(&mut self) {
+        self.abandon();
+        self.data = None;
+        self.status.clear();
+    }
     fn select(&mut self, key: Option<String>) {
         if self.key != key {
-            self.abandon();
+            self.invalidate();
             self.key = key;
-            self.data = None;
-            self.status.clear();
         }
     }
     fn accept(
@@ -928,6 +931,11 @@ fn insight_missing_rate_data(
         && prediction.full_hours.is_none()
         && prediction.coverage_percent < 80.0
 }
+fn insight_coverage_percent(prediction: &AdaptivePrediction) -> u8 {
+    // Do not round progress up to a requirement the underlying evidence has
+    // not met (for example, 79.99% must not claim the required 80%).
+    prediction.coverage_percent.clamp(0.0, 100.0) as u8
+}
 fn insight_prediction_explanation(
     data: Option<&BatteryInsights>,
     prediction: &AdaptivePrediction,
@@ -951,8 +959,8 @@ fn insight_prediction_explanation(
                 "Turn on Allow device settings changes in Settings to resume rate checks."
             };
             format!(
-                "Polling rate was confirmed for {:.0}% of recent use (80% needed). {recovery} Older unknown periods stay excluded.",
-                prediction.coverage_percent
+                "Polling rate was confirmed for {}% of recent use (80% needed). {recovery} Older unknown periods stay excluded.",
+                insight_coverage_percent(prediction)
             )
         }
         Some(_) if !prediction.missing_rates.is_empty() => format!(
@@ -2691,6 +2699,10 @@ impl State {
                 self.dashboard_destroyed(h);
             }
             let ptr = self.context;
+            #[cfg(test)]
+            let (x, y) = crate::test_display::origin();
+            #[cfg(not(test))]
+            let (x, y) = (CW_USEDEFAULT, CW_USEDEFAULT);
             let dpi = GetDpiForWindow(self.monitor).max(96) as i32;
             let title = wide(concat!("Halo Continued ", env!("CARGO_PKG_VERSION")));
             match CreateWindowExW(
@@ -2698,8 +2710,8 @@ impl State {
                 w!("HaloBatteryNext.Native"),
                 PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                x,
+                y,
                 840 * dpi / 96,
                 780 * dpi / 96,
                 None,
@@ -2708,6 +2720,8 @@ impl State {
                 Some(ptr.cast()),
             ) {
                 Ok(h) => {
+                    #[cfg(test)]
+                    crate::test_display::assert_placement(h);
                     self.dashboard = Some(h);
                     let mut info = MONITORINFO {
                         cbSize: size_of::<MONITORINFO>() as u32,
@@ -3609,7 +3623,7 @@ impl State {
             &format!(
                 "Known polling rate\n{}\nOf recorded use in the last 7 days",
                 data.filter(|d| d.recent.total_seconds > 0)
-                    .map(|_| format!("{:.0}%", prediction.coverage_percent))
+                    .map(|_| format!("{}%", insight_coverage_percent(&prediction)))
                     .unwrap_or_else(|| "—".into())
             ),
         );
@@ -5324,6 +5338,15 @@ impl State {
                 .unwrap_or_else(|| self.selected.min(s.devices.len().saturating_sub(1)));
             let battery_selection_changed =
                 previous_key != s.devices.get(selected).map(|d| d.reading.key.as_str());
+            let battery_identity_changed = self
+                .snapshot
+                .devices
+                .get(self.selected)
+                .zip(s.devices.get(selected))
+                .is_some_and(|(before, after)| {
+                    !DeviceDescriptorRef::from(&before.reading)
+                        .same_identity(DeviceDescriptorRef::from(&after.reading))
+                });
             let previous_device = current_device_state(
                 &self.snapshot.devices,
                 &self.configuration_devices,
@@ -5373,8 +5396,11 @@ impl State {
                 .map(|d| &d.reading.key);
             if battery_selection_changed {
                 self.polling.abandon();
-                self.insights.select(selected_key.cloned());
                 polling_selection_changed = true;
+            }
+            if battery_selection_changed || battery_identity_changed {
+                self.insights.invalidate();
+                self.insights.select(selected_key.cloned());
             }
             self.refresh_device_details();
             self.sync_trays(TrayUpdate::Changed);
@@ -5415,6 +5441,10 @@ impl State {
                         send(*h, CB_SETCURSEL, WPARAM(selection), LPARAM(0));
                     }
                 }
+            }
+            if self.page == 6 && (battery_selection_changed || battery_identity_changed) {
+                self.render_insights();
+                self.query_insights();
             }
         }
         // Startup readback can arrive before its first battery snapshot. Apply
@@ -5481,14 +5511,17 @@ impl State {
                 t.registration
                     .update_with(&t.data, update, changed, &mut shell_notify);
             } else if let Ok(frames) = icons::frames(d, settings, dark, 32) {
+                let guid = stable_guid(&d.reading.key);
+                #[cfg(test)]
+                let guid = crate::test_display::tray_guid(guid);
                 let mut data = NOTIFYICONDATAW {
                     cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                     hWnd: self.monitor,
-                    uID: stable_guid(&d.reading.key) as u32,
+                    uID: guid as u32,
                     uFlags: NIF_GUID | NIF_ICON | NIF_MESSAGE | NIF_TIP,
                     uCallbackMessage: TRAY,
                     hIcon: frames[0].0,
-                    guidItem: GUID::from_u128(stable_guid(&d.reading.key)),
+                    guidItem: GUID::from_u128(guid),
                     ..Default::default()
                 };
                 copy_tray_tooltip(
@@ -5564,6 +5597,10 @@ impl State {
             (*self.context).popup.replace(appearance);
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
+            #[cfg(test)]
+            {
+                (point.x, point.y) = crate::test_display::origin();
+            }
             let _ = SetForegroundWindow(self.monitor);
             let chosen = TrackPopupMenu(
                 menu.0,
@@ -5882,8 +5919,19 @@ fn provider_label(id: &str) -> &str {
         "corsair" => "Corsair",
         "lamzu" => "LAMZU",
         "am_infinity" => "AM Infinity 8K",
+        "inphic" => "Attack Shark / Inphic",
+        "turtlebeach" => "Turtle Beach",
+        "rapoo" => "Rapoo",
+        "atk_nearlink" => "ATK Nearlink",
+        "atk_keyboard" => "ATK keyboards",
+        "dareu" => "DAREU",
+        "finalmouse" => "Finalmouse",
+        "skullcandy" => "Skullcandy",
+        "ajazz" => "AJAZZ",
+        "shield" => "NVIDIA SHIELD",
+        "aula" => "AULA",
         "bluetooth" => "Bluetooth",
-        "xinput" => "Xbox controllers",
+        "xinput" => "Xbox / FlyDigi",
         other => other,
     }
 }
@@ -6133,7 +6181,7 @@ mod behaviour_tests {
     #[test]
     fn every_provider_has_a_unique_readable_settings_label() {
         let ids = providers();
-        assert_eq!(ids.len(), 30);
+        assert_eq!(ids.len(), 41);
         let labels = ids
             .iter()
             .map(|id| provider_label(id))
@@ -8138,6 +8186,44 @@ mod tooltip_polling_tests {
 mod insights_tests {
     use super::*;
     #[test]
+    fn replacement_invalidates_cached_insights_and_rejects_the_old_same_key_reply() {
+        let mut ui = InsightsUi::default();
+        ui.select(Some("synthetic".into()));
+        ui.data = Some(BatteryInsights::default());
+        let old = ui.begin("synthetic").unwrap();
+        ui.invalidate();
+        assert!(ui.data.is_none());
+        let current = ui.begin("synthetic").unwrap();
+        assert!(current > old);
+        assert!(!ui.accept(old, Some("synthetic"), Ok(BatteryInsights::default())));
+        assert!(ui.data.is_none());
+        assert!(ui.accept(current, Some("synthetic"), Ok(BatteryInsights::default())));
+    }
+    #[test]
+    fn rate_coverage_below_the_required_boundary_never_displays_as_eighty_percent() {
+        let mut data = BatteryInsights::default();
+        data.coverage.observation_count = 200;
+        data.recent.total_seconds = 10000;
+        data.recent.rates[3] = 7999;
+        data.rates.push(RateInsight {
+            hz: 1000,
+            projection_seconds: 7200,
+            projection_consumed_percent: 10,
+            projected_full_charge_hours: Some(70.0),
+            ..Default::default()
+        });
+        let prediction = data.adaptive_prediction(None, None);
+        assert!(insight_missing_rate_data(Some(&data), &prediction));
+        let explanation = insight_prediction_explanation(Some(&data), &prediction, true);
+        assert!(explanation.contains("for 79%"), "{explanation}");
+        assert_eq!(insight_coverage_percent(&prediction), 79);
+        data.recent.rates[3] = 8000;
+        let prediction = data.adaptive_prediction(None, None);
+        assert_eq!(insight_coverage_percent(&prediction), 80);
+        assert!(prediction.full_hours.is_some());
+        assert!(!insight_missing_rate_data(Some(&data), &prediction));
+    }
+    #[test]
     fn adaptive_cards_explain_missing_rate_data_instead_of_restarting_learning() {
         let mut data = BatteryInsights::default();
         data.coverage.observation_count = 1000;
@@ -8680,13 +8766,14 @@ mod dashboard_lifecycle_tests {
             {
                 let mut state = context.state.borrow_mut();
                 state.context = ptr;
+                let (x, y) = crate::test_display::origin();
                 state.monitor = CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     class,
                     w!("Test monitor"),
                     WINDOW_STYLE::default(),
-                    0,
-                    0,
+                    x,
+                    y,
                     0,
                     0,
                     None,
@@ -8696,6 +8783,13 @@ mod dashboard_lifecycle_tests {
                 )
                 .unwrap();
                 context.monitor.set(state.monitor);
+                // Match production startup: consume the launcher's show mode
+                // on the hidden monitor, before exercising dashboard visibility.
+                let _ = ShowWindow(state.monitor, SW_HIDE);
+                assert!(
+                    !IsWindowVisible(state.monitor).as_bool(),
+                    "The monitoring window must stay hidden under inherited launcher show modes"
+                );
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !state.tooltip_rates.contains_key("simulated:mouse")
                     && Instant::now() < deadline
@@ -9015,9 +9109,15 @@ mod dashboard_lifecycle_tests {
                 state.build();
             }
             for mode in [SW_MINIMIZE, SW_HIDE] {
+                assert_eq!(context.state.borrow().dashboard, Some(first));
                 let _ = ShowWindow(first, mode);
                 dispatch_monitor(monitor);
-                assert!(!context.state.borrow().dashboard_visible());
+                assert!(
+                    !context.state.borrow().dashboard_visible(),
+                    "mode={mode:?}; visible={}, minimized={}",
+                    IsWindowVisible(first).as_bool(),
+                    IsIconic(first).as_bool()
+                );
                 assert!(!context.state.borrow().runtime.configuration_visible());
                 send(monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
                 assert_eq!(context.state.borrow().dashboard, Some(first));
@@ -9320,6 +9420,9 @@ mod dashboard_lifecycle_tests {
                 state.tray_polling.generation = generation;
                 let saved_tooltip_rates = std::mem::take(&mut state.tooltip_rates);
                 let saved_sleep = std::mem::take(&mut state.sleep);
+                let saved_insights_data = state.insights.data.clone();
+                let saved_insights_key = state.insights.key.clone();
+                let saved_insights_status = state.insights.status.clone();
                 for configuration_only in [false, true] {
                     let before_snapshot = state.snapshot.clone();
                     let before_configuration = state.configuration_devices.clone();
@@ -9345,6 +9448,15 @@ mod dashboard_lifecycle_tests {
                     device.serial = Some("SYNTHETIC-REPLACEMENT-UNIT".into());
                     let (events, received) = crossbeam_channel::bounded(1);
                     let real_events = std::mem::replace(&mut state.runtime.events, received);
+                    let old_insights_request = if !configuration_only {
+                        state.page = 6;
+                        state.build();
+                        state.insights.data = Some(BatteryInsights::default());
+                        state.insights.abandon();
+                        state.insights.begin(&device_key)
+                    } else {
+                        None
+                    };
                     if configuration_only {
                         events
                             .send(Event::ConfigurationInventory {
@@ -9360,6 +9472,23 @@ mod dashboard_lifecycle_tests {
                     }
                     state.drain();
                     state.runtime.events = real_events;
+                    if let Some(old) = old_insights_request {
+                        assert!(
+                            state.insights.data.is_none(),
+                            "Replacement hardware inherited displayed Insights"
+                        );
+                        assert!(
+                            state.insights.sequence > old,
+                            "Visible Insights must request the replacement's history"
+                        );
+                        assert!(!state.insights.accept(
+                            old,
+                            Some(&device_key),
+                            Ok(BatteryInsights::default())
+                        ));
+                        state.page = 1;
+                        state.build();
+                    }
                     assert!(
                         state.restorable_dpi().is_none(),
                         "Replacement hardware inherited the old DPI restore value"
@@ -9384,6 +9513,10 @@ mod dashboard_lifecycle_tests {
                 state.tray_polling = saved_tray_polling;
                 state.tooltip_rates = saved_tooltip_rates;
                 state.sleep = saved_sleep;
+                state.insights.abandon();
+                state.insights.data = saved_insights_data;
+                state.insights.key = saved_insights_key;
+                state.insights.status = saved_insights_status;
                 state.snapshot.devices[0].reading = saved;
                 state.selected_device = Some("synthetic-mouse".into());
                 state.dpi = DpiUi::default();

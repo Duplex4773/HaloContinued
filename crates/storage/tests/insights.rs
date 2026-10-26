@@ -52,6 +52,54 @@ fn usage_and_insights_do_not_bridge_reused_keys_after_identity_changes() {
         );
     }
 }
+#[test]
+fn reused_keys_do_not_mix_previous_units_drain_or_boost_events_and_keep_raw_history() {
+    use hb_core::{PollingActivity, PollingActivityKind};
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+    for i in 0..=10 {
+        store
+            .record_usage(&observation(i * 600, 90 - i as u8, Some(1000), Some(1)))
+            .unwrap();
+    }
+    for (timestamp, session, kind) in [
+        (3000, 1, PollingActivityKind::Boost),
+        (6600, 1, PollingActivityKind::Boost),
+        (6600, 2, PollingActivityKind::Restore),
+    ] {
+        store
+            .record_polling_activity(&PollingActivity {
+                key: "synthetic-a".into(),
+                timestamp,
+                session,
+                kind,
+                rate: PollingRate::try_from(1000).unwrap(),
+                previous: PollingRate::try_from(500).ok(),
+            })
+            .unwrap();
+    }
+    for (timestamp, level) in [(6600, 80), (7200, 79)] {
+        let mut replacement = observation(timestamp, level, Some(1000), Some(2));
+        replacement.reading.container = Some("REPLACEMENT_TEST_CONTAINER".into());
+        store.record_usage(&replacement).unwrap();
+    }
+    store.flush().unwrap();
+    let data = store.query_insights("synthetic-a", 7200).unwrap();
+    assert_eq!(data.coverage.awake_seconds, 6600);
+    assert_eq!(data.recent.total_seconds, 600);
+    assert_eq!(data.recent.boost_sessions, 0);
+    assert_eq!(data.recent.restores, 1);
+    assert!(
+        data.rates
+            .iter()
+            .all(|r| r.projected_full_charge_hours.is_none())
+    );
+    assert_eq!(
+        store.query("synthetic-a", 0, 7200, 100).unwrap().len(),
+        13,
+        "Identity separation must not delete or rewrite the raw history"
+    );
+}
 
 #[test]
 fn linked_activity_uses_insertion_order_when_event_timestamps_match() {

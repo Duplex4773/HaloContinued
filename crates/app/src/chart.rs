@@ -522,14 +522,15 @@ mod tests {
     #[test]
     fn history_target_can_paint_and_release_repeatedly() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let (x, y) = crate::test_display::origin();
         unsafe {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
                 w!("Halo chart test"),
                 WS_OVERLAPPEDWINDOW,
-                0,
-                0,
+                x,
+                y,
                 840,
                 820,
                 None,

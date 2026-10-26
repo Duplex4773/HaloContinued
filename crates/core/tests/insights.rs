@@ -93,6 +93,39 @@ fn summarize(points: impl IntoIterator<Item = UsageObservation>) -> BatteryInsig
     }
     builder.finish()
 }
+#[test]
+fn a_replacement_unit_never_inherits_old_rate_learning_even_after_a_corrupt_row() {
+    for corrupt_boundary in [false, true] {
+        let mut builder = InsightsBuilder::default().recent_since(-10000);
+        for index in 0..=10 {
+            builder.push(point(index * 600, 90 - index as u8));
+        }
+        if corrupt_boundary {
+            builder.break_continuity();
+        }
+        for (timestamp, level) in [(6600, 80), (7200, 79)] {
+            let mut replacement = point(timestamp, level);
+            replacement.reading.serial = Some("REPLACEMENT_TEST_UNIT".into());
+            replacement.session = Some(2);
+            builder.push(replacement);
+        }
+        let data = builder.finish_at(7200);
+        assert_eq!(
+            data.coverage.awake_seconds, 6600,
+            "Historical recorded use stays available"
+        );
+        assert_eq!(data.recent.total_seconds, 600);
+        assert_eq!(data.recent.since, 6600);
+        assert!(
+            data.rates
+                .iter()
+                .all(|r| r.projected_full_charge_hours.is_none())
+        );
+        assert_eq!(data.cycles.len(), 2);
+        assert!(!data.cycles[0].current);
+        assert_eq!(data.cycles[1].start_timestamp, 6600);
+    }
+}
 
 #[test]
 fn projections_require_counted_time_and_measured_drop() {

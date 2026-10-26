@@ -557,7 +557,7 @@ impl BatteryProvider for ControllerProvider {
     fn diagnostics(&self) -> Vec<String> {
         vec![]
     }
-    fn poll(&mut self, _: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
+    fn poll(&mut self, hid: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
         if !c.active() {
             return Err(ProviderError::new("Controller snapshot deadline exceeded"));
         }
@@ -566,6 +566,7 @@ impl BatteryProvider for ControllerProvider {
         // The projected iterator hides enumeration errors as end-of-list.
         // Check size/entries so partial discovery cannot imply disconnection.
         let count = controller_query(controllers.Size(), "inventory size")?;
+        let mut flydigi = Vec::new();
         for index in 0..count {
             if !c.active() {
                 return Err(ProviderError::new("Controller snapshot deadline exceeded"));
@@ -589,6 +590,9 @@ impl BatteryProvider for ControllerProvider {
             r.kind = "gamepad".into();
             let vendor = raw.HardwareVendorId().unwrap_or(0);
             let product = raw.HardwareProductId().unwrap_or(0);
+            if vendor == 0x37d7 && product == 0x2401 {
+                flydigi.push(out.len());
+            }
             let bt = xbox_bluetooth(vendor, product);
             r.via = if bt { "bluetooth" } else { "wireless" }.into();
             if let Ok(report) = raw.TryGetBatteryReport() {
@@ -610,6 +614,15 @@ impl BatteryProvider for ControllerProvider {
                 r.approx = Some("Battery available through Windows Bluetooth devices".into())
             }
             out.push(r);
+        }
+        if flydigi.len() == 1
+            && let Ok(Some(b)) = hb_providers::community::flydigi_battery(hid, c)
+        {
+            let r = &mut out[flydigi[0]];
+            r.level = Some(b.level);
+            r.charging = b.charging;
+            r.precision = Precision::Coarse;
+            r.approx = Some(format!("about {}%", b.level));
         }
         // Windows exposes no dependable WGI-to-XInput slot identity. Keep every slot;
         // a WGI report from one pad must never hide another pad's XInput report.

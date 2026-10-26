@@ -81,7 +81,10 @@ fn asus_exact_request_reference_reading_and_strict_vendor_interface() {
 }
 #[test]
 fn asus_all_catalog_models_percent_steps_report_id_and_ranges() {
-    for x in DEVICES.iter().filter(|d| d.provider == "asus") {
+    for x in DEVICES
+        .iter()
+        .filter(|d| d.provider == "asus" && d.variant.is_empty())
+    {
         for numbered in [false, true] {
             let raw = if x.parameter == 25 { 2 } else { 87 };
             let h = FakeHid::new(
@@ -187,7 +190,10 @@ fn pulsar_steps(reply: &[u8]) -> Vec<Step> {
 }
 #[test]
 fn pulsar_all_claimed_ids_exact_frame_names_and_charging() {
-    for x in DEVICES.iter().filter(|d| d.provider == "pulsar") {
+    for x in DEVICES
+        .iter()
+        .filter(|d| d.provider == "pulsar" && d.variant.is_empty())
+    {
         let h = FakeHid::new(
             vec![
                 d("pulsar", x.pid, 0xff02, 2, 1, "control"),
@@ -426,7 +432,7 @@ fn asus_original_parser_edges_are_verified_through_transactions() {
     assert!(
         DEVICES
             .iter()
-            .filter(|d| d.provider == "asus")
+            .filter(|d| d.provider == "asus" && d.variant.is_empty())
             .all(|d| [1, 25].contains(&d.parameter))
     );
 }
