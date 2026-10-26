@@ -28,30 +28,28 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Current release: **1.0.8** for Windows 11 x64, available as an unsigned per-user
+Current release: **1.0.9** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.0.8 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.8/HaloContinued-1.0.8-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.0.8 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.8/HaloContinued-1.0.8-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.0.9 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.9/HaloContinued-1.0.9-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.0.9 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.9/HaloContinued-1.0.9-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.8/HaloContinued-1.0.8-SHA256SUMS.txt)
-· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.8)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.9/HaloContinued-1.0.9-SHA256SUMS.txt)
+· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.9)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
-**New in 1.0.8:** Battery support expands by **42 hardware IDs**, based on
-successful hardware reports in parent pull requests. New additions include mice,
-wireless keyboards, headsets and the NVIDIA SHIELD controller; existing G-Wolves,
-Corsair and Maxwell support also gains fixes. Unknown charging states remain
-unknown, and device configuration support keeps its existing boundaries.
-Low-battery mode can restore settings when the percentage is temporarily
-unavailable. Insights handles replacement devices correctly and no longer rounds
-incomplete rate coverage up to its learning requirement. Background checks avoid
-repeated work for unsupported or absent devices, with no additional workers.
-[New devices and limitations](#device-support-and-limitations)
-· [Full changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.8).
+**New in 1.0.9:** Battery readings stay consistent across sleep and receiver/cable
+changes. Previously detected receivers keep their last known level when their
+battery-reading interface is temporarily unavailable. Working interfaces are
+remembered separately for each connection, avoiding repeated failed opens.
+SHIELD controllers keep the preferred USB reading regardless of discovery order.
+Cancelled battery checks stop before sending another request, and optional
+provider state is allocated only when needed and released when its cache expires.
+No additional background timers, workers or polling frequency were introduced.
+[Full changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.9).
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -483,11 +481,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.0.8
+.\tools\package-rust.ps1 -Version 1.0.9
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.0.8-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.0.9-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -497,13 +495,13 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.0.8
+.\tools\package-installer.ps1 -Version 1.0.9
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.0.8-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.0.8-windows-x64.exe` and
-`dist/HaloContinued-1.0.8-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.0.9-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.0.9-windows-x64.exe` and
+`dist/HaloContinued-1.0.9-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with

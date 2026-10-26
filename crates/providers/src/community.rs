@@ -16,11 +16,12 @@ use std::{
 };
 
 const MAX_DEVICES: usize = 64;
+type Endpoint = (u16, u16, String);
 
 #[derive(Default)]
 pub(crate) struct Community {
     last: BTreeMap<String, (Reading, Duration)>,
-    hints: BTreeMap<String, Hint>,
+    hints: BTreeMap<Endpoint, Hint>,
     sequence: u16,
     generation: Option<u64>,
     pub diagnostics: Vec<String>,
@@ -31,22 +32,25 @@ struct Hint {
     swept: Option<Duration>,
 }
 
+fn legacy_gwolves_collection(i: &HidInfo, infos: &[HidInfo]) -> bool {
+    infos.iter().any(|other| {
+        other.vendor_id == i.vendor_id
+            && other.product_id == i.product_id
+            && other.feature_length == Some(65)
+            && trusted_identity(other) == trusted_identity(i)
+    })
+}
 pub(crate) fn handles(d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool {
     d.variant.starts_with("pr:")
         || d.provider == "gwolves"
             && d.pid == 0x3854
-            && !infos.iter().any(|other| {
-                other.vendor_id == i.vendor_id
-                    && other.product_id == i.product_id
-                    && trusted_identity(other) == trusted_identity(i)
-                    && other.feature_length == Some(65)
-            })
+            && !legacy_gwolves_collection(i, infos)
             && infos.iter().any(|other| {
                 other.vendor_id == i.vendor_id
                     && other.product_id == i.product_id
-                    && trusted_identity(other) == trusted_identity(i)
                     && (other.usage_page, other.usage) == (0xff02, 2)
                     && other.output_length == Some(17)
+                    && trusted_identity(other) == trusted_identity(i)
             })
 }
 fn protocol(d: &Device) -> &str {
@@ -128,6 +132,14 @@ fn candidate(d: &Device, i: &HidInfo) -> bool {
         _ => false,
     }
 }
+pub(crate) fn queryable(d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool {
+    handles(d, i, infos)
+        && if protocol(d) == "omni" {
+            i.interface == 2 && i.usage_page == 0xff02
+        } else {
+            candidate(d, i)
+        }
+}
 fn retain_level(d: &Device) -> bool {
     matches!(protocol(d), "compx" | "sonix" | "dareu" | "nearlink")
 }
@@ -139,6 +151,9 @@ fn keep_sleeping(d: &Device) -> bool {
 }
 
 impl Community {
+    pub fn is_empty(&self) -> bool {
+        self.last.is_empty() && self.hints.is_empty()
+    }
     pub fn invalidate(&mut self) {
         self.hints.clear();
         self.generation = None;
@@ -163,14 +178,13 @@ impl Community {
             self.hints.clear();
             self.generation = Some(hid.generation());
         }
-        let mut groups: BTreeMap<(u16, u16, String), (Device, Vec<&HidInfo>)> = BTreeMap::new();
+        let mut groups: BTreeMap<Endpoint, (Device, Vec<&HidInfo>)> = BTreeMap::new();
         for i in infos {
             if let Some(d) = DEVICES
                 .iter()
                 .find(|d| d.provider == source && d.vid == i.vendor_id && d.pid == i.product_id)
-                && handles(d, i, infos)
+                && queryable(d, i, infos)
                 && protocol(d) != "omni"
-                && candidate(d, i)
             {
                 let group = (d.vid, d.pid, trusted_identity(i));
                 if groups.len() >= MAX_DEVICES && !groups.contains_key(&group) {
@@ -184,19 +198,50 @@ impl Community {
             }
         }
         let mut result = Vec::new();
-        let present: BTreeSet<_> = groups.values().map(|(d, mine)| key(d, mine[0])).collect();
-        self.hints.retain(|k, _| present.contains(k));
+        let mut present: BTreeSet<_> = groups.values().map(|(d, mine)| key(d, mine[0])).collect();
+        self.hints
+            .retain(|endpoint, _| groups.contains_key(endpoint));
+        // Enumeration can still prove a receiver is present while its control
+        // collection/caps are temporarily unavailable. Retain only previously
+        // observed devices; never relax the collection filters to query them.
+        // The normal queryable path skips this recovery scan entirely.
+        for (cached_key, (last, at)) in &self.last {
+            if present.contains(cached_key) {
+                continue;
+            }
+            let device = infos.iter().find_map(|i| {
+                DEVICES
+                    .iter()
+                    .find(|d| d.provider == source && d.vid == i.vendor_id && d.pid == i.product_id)
+                    .filter(|d| {
+                        d.variant.starts_with("pr:")
+                            || d.provider == "gwolves"
+                                && d.pid == 0x3854
+                                && !legacy_gwolves_collection(i, infos)
+                    })
+                    .filter(|d| key(d, i) == *cached_key)
+            });
+            if let Some(d) = device
+                && let Some(r) = cached_reading(d, last, *at, c.clock.monotonic())
+            {
+                present.insert(cached_key.clone());
+                result.push(r);
+            }
+        }
         self.last.retain(|k, _| present.contains(k));
         let mut failures = Vec::new();
         let mut successful = false;
-        for (_, (d, mut mine)) in groups.into_iter().take(MAX_DEVICES) {
+        for (endpoint, (d, mut mine)) in groups.into_iter().take(MAX_DEVICES) {
             if !c.active() {
                 break;
             }
             let k = key(&d, mine[0]);
             let now = c.clock.monotonic();
             let passive = matches!(protocol(&d), "inphic" | "rapoo");
-            let hint = self.hints.entry(k.clone()).or_default();
+            if !self.hints.contains_key(&endpoint) {
+                self.hints.insert(endpoint.clone(), Hint::default());
+            }
+            let hint = self.hints.get_mut(&endpoint).unwrap();
             let known = hint
                 .path
                 .as_ref()
@@ -243,7 +288,7 @@ impl Community {
                             "{} {:04x}:{:04x}: {:?}%, charging {:?}",
                             d.name, d.vid, d.pid, r.level, r.charging
                         ));
-                        self.hints.entry(k.clone()).or_default().path = Some(i.path.clone());
+                        self.hints.get_mut(&endpoint).unwrap().path = Some(i.path.clone());
                         if r.key.is_empty() {
                             r.key = k.clone();
                         }
@@ -263,24 +308,16 @@ impl Community {
                 break;
             }
             if let Some(r) = found {
-                if keep_sleeping(&d) {
-                    self.last
-                        .insert(k.clone(), (r.clone(), c.clock.monotonic()));
+                if let Some(chosen) = merge(&mut result, r)
+                    && keep_sleeping(&d)
+                {
+                    self.last.insert(k, (chosen.clone(), c.clock.monotonic()));
                 }
-                merge(&mut result, r);
             } else if keep_sleeping(&d)
                 && let Some((last, at)) = self.last.get(&k)
+                && let Some(r) = cached_reading(&d, last, *at, now)
             {
-                let age = now.saturating_sub(*at);
-                if retain_level(&d) || age < Duration::from_secs(300) {
-                    let mut r = last.clone();
-                    r.connection = if protocol(&d) == "inphic" && age < Duration::from_secs(90) {
-                        Connection::Online
-                    } else {
-                        Connection::Sleeping
-                    };
-                    merge(&mut result, r);
-                }
+                let _ = merge(&mut result, r);
             }
         }
         if source == "asus" {
@@ -311,10 +348,15 @@ impl Community {
         first: bool,
     ) -> Result<Option<Reading>, ProviderError> {
         let mut s = hid.open(i)?;
+        if !c.active() {
+            return Ok(None);
+        }
         let s = &mut *s;
         let b = match protocol(d) {
             "compx" => {
-                drain(s, c, 17, 4)?;
+                if !drain(s, c, 17, 4)? {
+                    return Ok(None);
+                }
                 s.write(&p::pulsar_request())?;
                 receive(s, c, 4, 250, 17, p::pulsar)?
             }
@@ -362,6 +404,9 @@ impl Community {
                         return Ok(None);
                     }
                     let _ = s.input_report(6, 62);
+                    if !c.active() {
+                        return Ok(None);
+                    }
                     s.write(&p::padded(
                         &[
                             6, 0, 2, 0, 0x9a, 0, 0, 0x68, 0x4a, 0x8e, 0x0a, 0, 0, 0, 0xbb, cmd, 0,
@@ -386,7 +431,9 @@ impl Community {
                 b
             }
             "k65" => {
-                drain(s, c, 65, 4)?;
+                if !drain(s, c, 65, 4)? {
+                    return Ok(None);
+                }
                 let mut values = Vec::new();
                 for _ in 0..2 {
                     if !c.active() {
@@ -436,8 +483,8 @@ impl Community {
                 } else {
                     4
                 };
-                if protocol(d) == "nearlink" {
-                    drain(s, c, 64, 4)?;
+                if protocol(d) == "nearlink" && !drain(s, c, 64, 4)? {
+                    return Ok(None);
                 }
                 s.write(&p::padded(
                     &[report, seq as u8, (seq >> 8) as u8, 0x1a],
@@ -469,7 +516,9 @@ impl Community {
                     return Ok(None);
                 };
                 let mut input = hid.open(reply)?;
-                drain(&mut *input, c, 17, 4)?;
+                if !drain(&mut *input, c, 17, 4)? {
+                    return Ok(None);
+                }
                 s.send_feature(&p::pulsar_request())?;
                 receive(&mut *input, c, 4, 250, 17, |r| compx(r, 9, 4))?.map(|mut b| {
                     b.charging = None;
@@ -510,6 +559,9 @@ impl Community {
             "ajazz" => self.ajazz(s, c, i.vendor_id == 0x248a)?,
             "skullcandy" => {
                 let before = s.input_report(7, 62).unwrap_or_default();
+                if !c.active() {
+                    return Ok(None);
+                }
                 s.write(&p::padded(&[6, 7, 0x80, 5, 0x5a, 3, 0, 0xd6, 0x0c, 0], 62))?;
                 let mut b = None;
                 for attempt in 0..12 {
@@ -612,6 +664,9 @@ impl Community {
             }
             let packet = p::padded(head, 64);
             if let Err(e) = s.write(&packet) {
+                if !c.active() {
+                    return Ok(None);
+                }
                 if e.message
                     .to_ascii_lowercase()
                     .contains("incorrect function")
@@ -721,6 +776,9 @@ impl Community {
                 }
                 let _ = s.input_report(7, 62);
             }
+            if !c.active() {
+                return Ok(None);
+            }
             s.write(&p::padded(&[6, 6, 0, 5, 0x5a, 2, 0, 0x42, 0x99], 62))?;
             if !pause(c, 300) {
                 return Ok(None);
@@ -730,6 +788,9 @@ impl Community {
                     return Ok(None);
                 }
                 let _ = s.input_report(7, 62);
+            }
+            if !c.active() {
+                return Ok(None);
             }
             s.write(&p::padded(
                 &[
@@ -809,8 +870,7 @@ impl Community {
                        accept: fn(&[u8]) -> bool|
              -> Result<Option<Vec<u8>>, ProviderError> {
                 let mut s = hid.open(i)?;
-                drain(&mut *s, c, 64, 16)?;
-                if !c.active() {
+                if !drain(&mut *s, c, 64, 16)? {
                     return Ok(None);
                 }
                 s.write(&p::padded(head, 64))?;
@@ -880,14 +940,39 @@ impl Community {
     }
 }
 
-fn merge(out: &mut Vec<Reading>, r: Reading) {
-    if let Some(old) = out.iter_mut().find(|old| old.key == r.key) {
-        if r.charging == Some(true) || old.via == "bluetooth" && r.via == "usb" {
-            *old = r;
+fn cached_reading(d: &Device, last: &Reading, at: Duration, now: Duration) -> Option<Reading> {
+    let age = now.saturating_sub(at);
+    if !retain_level(d) && age >= Duration::from_secs(300) {
+        return None;
+    }
+    let mut r = last.clone();
+    r.connection = if protocol(d) == "inphic" && age < Duration::from_secs(90) {
+        Connection::Online
+    } else {
+        Connection::Sleeping
+    };
+    Some(r)
+}
+fn merge(out: &mut Vec<Reading>, r: Reading) -> Option<&Reading> {
+    let index = if let Some(index) = out.iter().position(|old| old.key == r.key) {
+        let old = &out[index];
+        let replace = if r.online() != old.online() {
+            r.online()
+        } else if r.source == "shield" && old.via != r.via {
+            r.via == "usb"
+        } else {
+            r.charging == Some(true) || old.via == "bluetooth" && r.via == "usb"
+        };
+        if !replace {
+            return None;
         }
+        out[index] = r;
+        index
     } else {
         out.push(r);
-    }
+        out.len() - 1
+    };
+    Some(&out[index])
 }
 fn reading(d: &Device, i: &HidInfo, b: Battery, c: &PollContext<'_>) -> Reading {
     let mut r = Reading::new(key(d, i), d.name, d.provider, c.clock.unix());
@@ -953,6 +1038,9 @@ fn receive<T>(
             break;
         }
         let r = read(s, c, size, ms)?;
+        if !c.active() {
+            break;
+        }
         if let Some(v) = parse(&r) {
             return Ok(Some(v));
         }
@@ -964,13 +1052,13 @@ fn drain(
     c: &PollContext<'_>,
     size: usize,
     n: usize,
-) -> Result<(), ProviderError> {
+) -> Result<bool, ProviderError> {
     for _ in 0..n {
         if !c.active() || s.read(size, Duration::ZERO)?.is_empty() {
             break;
         }
     }
-    Ok(())
+    Ok(c.active())
 }
 fn compx(r: &[u8], header: u8, cmd: u8) -> Option<Battery> {
     if r.len() < 17
@@ -1282,6 +1370,9 @@ pub fn flydigi_battery(
         return Ok(None);
     }
     let mut s = hid.open(candidates[0])?;
+    if !c.active() {
+        return Ok(None);
+    }
     s.write(&p::padded(&[0, 0x5a, 0xa5, 7, 0, 0], 6))?;
     if !c.active() {
         return Ok(None);

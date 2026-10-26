@@ -576,6 +576,9 @@ impl HidProvider {
         s: &mut dyn HidSession,
         c: &PollContext<'_>,
     ) -> Result<Option<Battery>, ProviderError> {
+        if !c.active() {
+            return Ok(None);
+        }
         match self.id {
             "razer" if [0x555, 0x556, 0x583].contains(&d.pid) => self.read_pa(s, c, false),
             "razer" if d.pid == 0x0528 => self.query_blackshark2020(s, c),
@@ -2066,19 +2069,22 @@ impl BatteryProvider for HidProvider {
             infos.extend(hid.enumerate(vendor)?);
         }
         let mut community_result = Ok(Vec::new());
-        if self.community_enabled
+        let community_queryable = self.community_enabled
             && infos.iter().any(|i| {
                 DEVICES.iter().any(|d| {
                     d.provider == self.id
                         && d.vid == i.vendor_id
                         && d.pid == i.product_id
-                        && crate::community::handles(d, i, &infos)
+                        && crate::community::queryable(d, i, &infos)
                 })
-            })
-        {
+            });
+        if self.community_enabled && (community_queryable || self.community.is_some()) {
             let state = self.community.get_or_insert_with(Default::default);
             community_result = state.poll(self.id, &infos, hid, c);
             self.diagnostics.append(&mut state.diagnostics);
+            if !community_queryable && state.is_empty() {
+                self.community = None;
+            }
         } else {
             self.community = None;
         }
@@ -3020,6 +3026,44 @@ mod cache_retention_tests {
             assert!(provider.mchose_models.is_empty());
             clock.0.store(0, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn expired_community_cache_releases_optional_state_when_control_metadata_is_missing() {
+        use super::cache_test_support::Step;
+        let clock = FakeClock::default();
+        let cancel = AtomicBool::new(false);
+        let mut provider = HidProvider::new("mchose");
+        let mut control = info(0x3837, 0x6008, 0xff01);
+        control.serial = "SYNTHETIC-MCHOSE-RECEIVER".into();
+        let hid = FakeHid::new(
+            vec![control.clone()],
+            vec![
+                Step::Write(p::padded(&[0x55, 0xaa, 1, 0, 1, 0, 1, 0x0b, 0], 64)),
+                Step::Read(Ok(vec![0x55, 0xaa, 1, 0, 3, 0, 1, 0x0b, 1, 60, 0])),
+            ],
+        );
+        assert_eq!(
+            provider
+                .poll(&hid, &context(&clock, &cancel))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(provider.community.is_some());
+        hid.done();
+        control.usage_page = 1;
+        control.usage = 2;
+        let metadata_only = FakeHid::new(vec![control], vec![]);
+        clock.sleep(Duration::from_secs(300));
+        assert!(
+            provider
+                .poll(&metadata_only, &context(&clock, &cancel))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(provider.community.is_none());
+        assert!(metadata_only.opened.lock().unwrap().is_empty());
     }
 
     #[test]
