@@ -4754,6 +4754,95 @@ mod tests {
     }
 
     #[test]
+    fn rearmed_owned_recovery_settles_without_replacing_original_settings() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(125).ok(),
+            sleep_seconds: Some(60),
+        };
+        for kind in 0..3 {
+            let (layer, before, applied) = match kind {
+                0 => (Layer::SaverPolling(mode), 1000, 125),
+                1 => (Layer::SaverSleep(mode), 300, 60),
+                _ => (Layer::BoostPolling, 1000, 4000),
+            };
+            let (_folder, mut reading, settings, record, journal) =
+                recovery_audit_fixture(layer, before, applied);
+            reading.level = Some(10);
+            let now = Instant::now();
+            let mut saver = crate::battery_saver::BatterySaver::default();
+            let mut boost = crate::boost::Boost::new(now);
+            for attempt in 0..3 {
+                if attempt != 0 {
+                    journal.lock().unwrap().rearm_confirmed();
+                }
+                assert!(!recover_available(
+                    &journal,
+                    "razer",
+                    std::slice::from_ref(&reading),
+                    100,
+                    RecoveryContext {
+                        settings: &settings,
+                        generation: 1,
+                        saver: &mut saver,
+                        boost: &mut boost
+                    }
+                ));
+            }
+            // An incompatible record must not replace ownership or even alter
+            // the active saver episode's low-battery latch before rejecting it.
+            let mut conflicting = record.clone();
+            conflicting.before = if kind == 1 { 600 } else { 2000 };
+            if kind == 2 {
+                assert!(!boost.recover(&conflicting, &reading, &settings, 1));
+            } else {
+                assert!(!saver.recover(&conflicting, &reading, &settings, 1));
+                assert!(
+                    saver
+                        .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                        .is_none()
+                );
+            }
+            for changed in 0..2 {
+                let mut conflicting = record.clone();
+                if changed == 0 {
+                    conflicting.stamp = ConnectionStamp::new(2).unwrap();
+                } else {
+                    conflicting.device.serial = Some("DIFFERENT-UNIT".into());
+                }
+                assert!(!if kind == 2 {
+                    boost.recover(&conflicting, &reading, &settings, 1)
+                } else {
+                    saver.recover(&conflicting, &reading, &settings, 1)
+                });
+            }
+            reading.level = Some(100);
+            if kind == 2 {
+                boost.sample(now, Some(false));
+                boost.sample(now + Duration::from_secs(15), Some(false));
+                let request = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                assert_eq!(request.action.rate().map(PollingRate::hz), Some(before));
+                assert_eq!(request.target.connection_stamp, Some(record.stamp));
+            } else {
+                let request = saver
+                    .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                    .unwrap();
+                match request {
+                    crate::battery_saver::Action::Sleep(request) => {
+                        assert_eq!(request.seconds.map(u32::from), Some(before))
+                    }
+                    crate::battery_saver::Action::Polling(request) => {
+                        assert_eq!(request.action.rate().map(PollingRate::hz), Some(before))
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cancelled_rebound_restore_keeps_live_and_durable_connection_proofs_in_sync() {
         use crate::recovery::{Layer, Operation, SettingKind};
         let mode = hb_core::settings::LowBatteryMode {
@@ -5044,6 +5133,66 @@ mod tests {
                 rate: PollingRate::try_from(1000).unwrap(), expected: PollingRate::try_from(125).unwrap(),
             })
         );
+    }
+
+    #[test]
+    fn deferred_recovery_survives_changed_saver_preferences_and_display_name() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(125).ok(),
+            sleep_seconds: Some(60),
+        };
+        for sleep in [false, true] {
+            let (layer, before, applied) = if sleep {
+                (Layer::SaverSleep(mode), 300, 60)
+            } else {
+                (Layer::SaverPolling(mode), 1000, 125)
+            };
+            let (_folder, mut reading, mut settings, _, journal) =
+                recovery_audit_fixture(layer, before, applied);
+            reading.level = Some(10);
+            reading.name = "Updated model name".into();
+            settings.device_mut(&reading.key).low_battery_mode =
+                Some(hb_core::settings::LowBatteryMode {
+                    polling_rate: PollingRate::try_from(250).ok(),
+                    sleep_seconds: Some(120),
+                    ..mode
+                });
+            let mut saver = crate::battery_saver::BatterySaver::default();
+            let mut boost = crate::boost::Boost::new(Instant::now());
+            // A normal provider event may build a preflight while the recovery
+            // journal is busy. It has not performed any hardware operation.
+            saver.observe(&settings, 1, std::slice::from_ref(&reading), 100);
+            assert!(!recover_available(
+                &journal,
+                "razer",
+                std::slice::from_ref(&reading),
+                100,
+                RecoveryContext {
+                    settings: &settings,
+                    generation: 1,
+                    saver: &mut saver,
+                    boost: &mut boost,
+                },
+            ));
+            match saver.next(&settings, 1, std::slice::from_ref(&reading), 100, &boost) {
+                Some(crate::battery_saver::Action::Sleep(request)) if sleep => {
+                    assert_eq!(request.seconds, Some(300));
+                    assert_eq!(request.expected, Some(60));
+                }
+                Some(crate::battery_saver::Action::Polling(request)) if !sleep => {
+                    assert_eq!(
+                        request.action,
+                        ControlAction::ApplyIf {
+                            rate: PollingRate::try_from(1000).unwrap(),
+                            expected: PollingRate::try_from(125).unwrap(),
+                        }
+                    );
+                }
+                _ => panic!("The original setting must be recovered before a new saver episode"),
+            }
+        }
     }
 
     #[test]

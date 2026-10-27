@@ -62,7 +62,7 @@ pub struct Record {
     pub manual_pending: bool,
 }
 impl Record {
-    fn matches_stamp(&self, stamp: ConnectionStamp) -> bool {
+    pub fn matches_stamp(&self, stamp: ConnectionStamp) -> bool {
         self.stamp == stamp || self.rebound_stamp == Some(stamp)
     }
     fn valid(&self) -> bool {

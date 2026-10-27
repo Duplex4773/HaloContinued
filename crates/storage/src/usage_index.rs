@@ -8,14 +8,14 @@ pub(super) struct Checkpoint {
 pub(super) struct UsageIndex {
     pub key: String,
     pub bounds: Option<(i64, i64, i64, i64)>,
-    pub revision: (u64, i64),
+    pub revision: i64,
     pub total: i64,
     points: Vec<Checkpoint>,
     stride: usize,
     count: usize,
 }
 impl UsageIndex {
-    pub fn new(key: &str, bounds: Option<(i64, i64, i64, i64)>, revision: (u64, i64)) -> Self {
+    pub fn new(key: &str, bounds: Option<(i64, i64, i64, i64)>, revision: i64) -> Self {
         Self {
             key: key.into(),
             bounds,
@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     #[test]
     fn index_remains_bounded_after_repeated_compaction() {
-        let mut index = UsageIndex::new("mouse", None, (0, 0));
+        let mut index = UsageIndex::new("mouse", None, 0);
         for n in 0..1_000_000 {
             index.push(Checkpoint {
                 timestamp: n,

@@ -23,6 +23,9 @@ fn flush_activities(
         db.record_polling_activity(activity)?;
         pending.pop_front();
     }
+    // Recovery is exceptional. A successful drain should not retain a full
+    // outage buffer during subsequent quiet background monitoring.
+    *pending = VecDeque::new();
     Ok(())
 }
 
@@ -31,31 +34,48 @@ fn record_activity(
     activity: PollingActivity,
     pending: &mut VecDeque<PollingActivity>,
 ) -> Result<(), ProviderError> {
+    if !pending.is_empty() {
+        // Use the same identity as SQLite's unique key. Replayed events must
+        // not crowd distinct history out of the bounded outage backlog.
+        let duplicate = pending.iter().any(|old| {
+            old.key == activity.key
+                && old.session == activity.session
+                && old.timestamp == activity.timestamp
+                && old.kind == activity.kind
+        });
+        if let Err(error) = flush_activities(database, pending) {
+            if duplicate {
+                return Err(error);
+            }
+            // Apply the bound only after trying recovery: the database may now
+            // be writable, or a partial drain may already have made room.
+            let overflow = pending.len() == MAX_RECOVERY_ACTIVITIES;
+            if overflow {
+                pending.pop_front();
+            }
+            pending.push_back(activity);
+            return Err(if overflow {
+                ProviderError::new(
+                    "Polling history recovery is full; the oldest unsaved event was discarded",
+                )
+            } else {
+                error
+            });
+        }
+        if duplicate {
+            return Ok(());
+        }
+    }
     // The normal path needs no recovery allocation. SQL's unique event key
     // makes replay safe even if a prior commit had an ambiguous outcome.
-    if pending.is_empty() {
-        let result = database
-            .as_mut()
-            .map_err(|e| e.clone())
-            .and_then(|db| db.record_polling_activity(&activity));
-        if result.is_err() {
-            pending.push_back(activity);
-        }
-        return result;
+    let result = database
+        .as_mut()
+        .map_err(|e| e.clone())
+        .and_then(|db| db.record_polling_activity(&activity));
+    if result.is_err() {
+        pending.push_back(activity);
     }
-    let overflow = pending.len() == MAX_RECOVERY_ACTIVITIES;
-    if overflow {
-        pending.pop_front();
-    }
-    pending.push_back(activity);
-    let result = flush_activities(database, pending);
-    if overflow {
-        Err(ProviderError::new(
-            "Polling history recovery is full; the oldest unsaved event was discarded",
-        ))
-    } else {
-        result
-    }
+    result
 }
 
 /// Once a batch cannot be recorded, retain its latest unprocessed observation
@@ -386,6 +406,93 @@ mod tests {
         assert_eq!(insights.recent.restores, 1);
         flush_activities(&mut database, &mut pending).unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn recovered_full_event_backlog_is_flushed_before_applying_its_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut database = Err(ProviderError::new("Synthetic unavailable history"));
+        let mut pending = VecDeque::new();
+        for timestamp in 0..MAX_RECOVERY_ACTIVITIES as i64 {
+            assert!(
+                record_activity(
+                    &mut database,
+                    activity(timestamp, PollingActivityKind::Boost),
+                    &mut pending,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(pending.len(), MAX_RECOVERY_ACTIVITIES);
+        database = Store::open(&path);
+        record_activity(
+            &mut database,
+            activity(MAX_RECOVERY_ACTIVITIES as i64, PollingActivityKind::Boost),
+            &mut pending,
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(
+            pending.capacity(),
+            0,
+            "Recovery must release its idle buffer"
+        );
+        let insights = database
+            .as_ref()
+            .unwrap()
+            .query_insights("synthetic:mouse", 300)
+            .unwrap();
+        assert_eq!(
+            insights.recent.boost_sessions,
+            MAX_RECOVERY_ACTIVITIES as u64 + 1
+        );
+    }
+
+    #[test]
+    fn repeated_failed_event_replays_do_not_evict_distinct_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut database = Err(ProviderError::new("Synthetic unavailable history"));
+        let mut pending = VecDeque::new();
+        for (timestamp, kind) in [
+            (0, PollingActivityKind::Boost),
+            (1, PollingActivityKind::Manual),
+        ] {
+            assert!(
+                record_activity(&mut database, activity(timestamp, kind), &mut pending).is_err()
+            );
+        }
+        for _ in 0..MAX_RECOVERY_ACTIVITIES * 2 {
+            assert!(
+                record_activity(
+                    &mut database,
+                    activity(0, PollingActivityKind::Boost),
+                    &mut pending
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            pending.len(),
+            2,
+            "Replay must preserve distinct events without growing recovery memory"
+        );
+        database = Store::open(&path);
+        record_activity(
+            &mut database,
+            activity(0, PollingActivityKind::Boost),
+            &mut pending,
+        )
+        .unwrap();
+        assert_eq!(pending.capacity(), 0);
+        let insights = database
+            .as_ref()
+            .unwrap()
+            .query_insights("synthetic:mouse", 300)
+            .unwrap();
+        assert_eq!(insights.recent.boost_sessions, 1);
+        assert_eq!(insights.recent.manual_changes, 1);
     }
 
     #[test]

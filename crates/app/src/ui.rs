@@ -1135,6 +1135,53 @@ fn charge_cycle_text(cycle: &ChargeCycle) -> String {
         polling_timestamp(cycle.end_timestamp),
     )
 }
+/// Four coalesced lifecycle actions, held without an allocation or a timer.
+/// Reposting while a native modal loop owns State would keep that loop busy.
+#[derive(Default)]
+struct DeferredDashboard(Cell<[Option<(u32, usize)>; 4]>);
+impl DeferredDashboard {
+    fn push(&self, message: u32, parameter: usize) {
+        let mut messages = self.0.get();
+        if let Some(index) = messages
+            .iter()
+            .position(|item| item.is_some_and(|(m, _)| m == message))
+        {
+            messages.copy_within(index + 1.., index);
+            messages[3] = None;
+        }
+        if let Some(slot) = messages.iter_mut().find(|item| item.is_none()) {
+            *slot = Some((message, parameter));
+        }
+        self.0.set(messages);
+    }
+}
+#[cfg(test)]
+mod deferred_dashboard_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_actions_coalesce_in_order_without_allocating() {
+        let queue = DeferredDashboard::default();
+        let (_, allocated) = crate::allocation_counter::measure(|| {
+            for index in 0..1000 {
+                queue.push(WM_APP + 8, 0);
+                queue.push(WM_APP + 9, index);
+                queue.push(WM_APP + 11, index);
+                queue.push(WM_APP + 12, 0);
+            }
+            queue.push(WM_APP + 8, 0);
+        });
+        assert_eq!(allocated.calls, 0);
+        assert_eq!(
+            queue.0.get(),
+            [
+                Some((WM_APP + 9, 999)),
+                Some((WM_APP + 11, 999)),
+                Some((WM_APP + 12, 0)),
+                Some((WM_APP + 8, 0))
+            ]
+        );
+    }
+}
 struct UiContext {
     state: RefCell<State>,
     monitor: Cell<HWND>,
@@ -1142,6 +1189,31 @@ struct UiContext {
     // immutable, owned theme available without borrowing application state.
     paint: RefCell<Option<(HWND, Rc<DashboardTheme>)>>,
     popup: RefCell<Option<Rc<PopupAppearance>>>,
+    deferred: DeferredDashboard,
+}
+impl UiContext {
+    fn retry_deferred(&self) {
+        if self.deferred.0.get()[0].is_none() || self.state.try_borrow_mut().is_err() {
+            return;
+        }
+        let mut blocked = false;
+        for (message, parameter) in self.deferred.0.replace([None; 4]).into_iter().flatten() {
+            if blocked
+                || unsafe {
+                    PostMessageW(
+                        Some(self.monitor.get()),
+                        message,
+                        WPARAM(parameter),
+                        LPARAM(0),
+                    )
+                }
+                .is_err()
+            {
+                blocked = true;
+                self.deferred.push(message, parameter);
+            }
+        }
+    }
 }
 fn merged_device_rows(
     batteries: &[DeviceView],
@@ -1582,6 +1654,7 @@ pub fn run(
             monitor: Cell::new(HWND::default()),
             paint: RefCell::new(None),
             popup: RefCell::new(None),
+            deferred: DeferredDashboard::default(),
         });
         let ptr = &*context as *const UiContext;
         let mut state = context.state.borrow_mut();
@@ -1626,6 +1699,7 @@ pub fn run(
         drop(state);
         let mut message = MSG::default();
         loop {
+            context.retry_deferred();
             let result = GetMessageW(&mut message, None, 0, 0).0;
             if result <= 0 {
                 break;
@@ -1696,15 +1770,27 @@ fn dashboard_message(context: &UiContext, message: &MSG) -> bool {
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    let context = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const UiContext };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         if msg == WM_NCCREATE {
             let cs = &*(lp.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const UiContext;
+        let ptr = context;
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        if hwnd != (*ptr).monitor.get()
+            && (msg == WM_SHOWWINDOW
+                || msg == WM_WINDOWPOSCHANGED
+                    && lp.0 != 0
+                    && (*(lp.0 as *const WINDOWPOS)).flags.0 & (SWP_HIDEWINDOW | SWP_SHOWWINDOW).0
+                        != 0)
+        {
+            // SetWindowPos can change visibility without WM_SHOWWINDOW.
+            // Defer until native processing and any outer State borrow finish.
+            (*ptr).deferred.push(WM_APP + 12, 0);
         }
         if let Some(result) = dashboard_paint_message(&*ptr, hwnd, msg, wp, lp) {
             return result;
@@ -1718,12 +1804,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 if let Ok(mut state) = (*ptr).state.try_borrow_mut() {
                     state.dashboard_destroyed(hwnd);
                 } else {
-                    let _ = PostMessageW(
-                        Some((*ptr).monitor.get()),
-                        WM_APP + 11,
-                        WPARAM(hwnd.0 as usize),
-                        LPARAM(0),
-                    );
+                    (*ptr).deferred.push(WM_APP + 11, hwnd.0 as usize);
                 }
             }
             return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1733,11 +1814,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             // let that bypass State cleanup while a native callback reenters.
             let deferred = match msg {
                 WM_CLOSE => Some((WM_APP + 9, WPARAM(hwnd.0 as usize))),
-                m if m == WM_APP + 8 || m == WM_APP + 9 || m == WM_APP + 11 => Some((m, wp)),
+                m if m == WM_APP + 8 || m == WM_APP + 9 || m == WM_APP + 11 || m == WM_APP + 12 => {
+                    Some((m, wp))
+                }
                 _ => None,
             };
             if let Some((message, param)) = deferred {
-                let _ = PostMessageW(Some((*ptr).monitor.get()), message, param, lp);
+                (*ptr).deferred.push(message, param.0);
                 return LRESULT(0);
             }
             return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1921,12 +2004,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 LRESULT(0)
             }
-            WM_SHOWWINDOW if Some(hwnd) == s.dashboard => {
-                // WM_SHOWWINDOW precedes the native visibility flag update.
-                // Defer reading that state until ShowWindow has completed.
-                let _ = PostMessageW(Some(s.monitor), WM_APP + 12, WPARAM(0), LPARAM(0));
-                LRESULT(0)
-            }
             m if m == WM_APP + 12 => {
                 s.configuration_visibility();
                 LRESULT(0)
@@ -2014,7 +2091,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             PostQuitMessage(1);
         }
         LRESULT(0)
-    })
+    });
+    // The callback's State borrow has ended. If this is an inner native call,
+    // the outer borrow keeps the actions parked until its callback returns.
+    if !context.is_null() {
+        unsafe {
+            (*context).retry_deferred();
+        }
+    }
+    result
 }
 unsafe fn dashboard_paint_message(
     context: &UiContext,
@@ -9267,6 +9352,10 @@ mod dashboard_lifecycle_tests {
     unsafe fn dispatch_monitor(monitor: HWND) {
         let mut message = MSG::default();
         unsafe {
+            let context = GetWindowLongPtrW(monitor, GWLP_USERDATA) as *const UiContext;
+            if !context.is_null() {
+                (*context).retry_deferred();
+            }
             // Scope pumping to this test's monitor. Do not consume another
             // process/window's commands or depend on timer timing.
             while PeekMessageW(
@@ -9846,6 +9935,7 @@ mod dashboard_lifecycle_tests {
                 monitor: Cell::new(HWND::default()),
                 paint: RefCell::new(None),
                 popup: RefCell::new(None),
+                deferred: DeferredDashboard::default(),
             });
             let ptr = &*context as *const UiContext;
             {
@@ -10006,7 +10096,30 @@ mod dashboard_lifecycle_tests {
                 // Synchronous close enters proc while State is borrowed: it
                 // must defer rather than silently use DefWindowProc's destroy.
                 send(dashboard, WM_CLOSE, WPARAM(0), LPARAM(0));
+                // Requests arriving inside a modal loop are coalesced, but
+                // the most recent close must still follow the reopen request.
+                send(state.monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
+                send(dashboard, WM_CLOSE, WPARAM(0), LPARAM(0));
                 assert!(IsWindow(Some(dashboard)).as_bool());
+                let mut reentrant = MSG::default();
+                let mut retries = 0;
+                while retries < 8
+                    && PeekMessageW(
+                        &mut reentrant,
+                        Some(state.monitor),
+                        WM_APP + 9,
+                        WM_APP + 9,
+                        PM_REMOVE,
+                    )
+                    .as_bool()
+                {
+                    DispatchMessageW(&reentrant);
+                    retries += 1;
+                }
+                assert!(
+                    retries <= 1,
+                    "A deferred close must not spin inside a native modal loop"
+                );
             }
             let monitor = context.monitor.get();
             dispatch_monitor(monitor);
@@ -10267,9 +10380,28 @@ mod dashboard_lifecycle_tests {
                 state.settings.polling_controls = false;
                 state.build();
             }
-            for mode in [SW_MINIMIZE, SW_HIDE] {
+            for (mode, position_hide) in [(SW_MINIMIZE, false), (SW_HIDE, false), (SW_HIDE, true)] {
                 assert_eq!(context.state.borrow().dashboard, Some(first));
-                let _ = ShowWindow(first, mode);
+                if position_hide {
+                    // Establish the hidden fixture state directly, independently
+                    // of an earlier native restore/activation transition.
+                    SetWindowPos(
+                        first,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+                    )
+                    .unwrap();
+                    assert!(
+                        !IsWindowVisible(first).as_bool(),
+                        "Native fixture must be hidden before dispatch"
+                    );
+                } else {
+                    let _ = ShowWindow(first, mode);
+                }
                 dispatch_monitor(monitor);
                 assert!(
                     !context.state.borrow().dashboard_visible(),

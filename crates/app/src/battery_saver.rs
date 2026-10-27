@@ -170,9 +170,27 @@ impl BatterySaver {
                 wired_transition: None,
             });
         if entry.target.device != record.device || entry.choices != choices {
-            return false;
+            if !entry.target.device.matches_reading(reading)
+                || matches!(entry.rate, Setting::Active { .. })
+                || matches!(entry.sleep, Setting::Active { .. })
+            {
+                return false;
+            }
+            // A provider event can prepare the newly configured saver while
+            // storage is still loading/rearming the old episode. Retire that
+            // unwritten preparation and recover the durable originals first.
+            // Never replace another identity or an already owned change.
+            entry.target.device = record.device.clone();
+            entry.target.generation = generation;
+            entry.target.connection_stamp = None;
+            entry.choices = choices;
+            entry.low = low;
+            entry.rate = Setting::Done;
+            entry.sleep = Setting::Done;
+            entry.rate_stamp = None;
+            entry.sleep_stamp = None;
+            entry.wired_transition = None;
         }
-        entry.low &= low;
         let (state, stamp) = if sleep {
             (&mut entry.sleep, &mut entry.sleep_stamp)
         } else {
@@ -181,8 +199,17 @@ impl BatterySaver {
         // A deferred startup claim can replace a preflight that has not sent
         // its SET. It must never replace an operation already in flight.
         if matches!(*state, Setting::Active { .. }) {
-            return false;
+            // Re-enabling controls can rearm an already-owned journal slot.
+            // Acknowledge the exact ownership without changing its episode or
+            // repeatedly cloning/reconsidering this record on every poll.
+            return *state
+                == (Setting::Active {
+                    before: record.before,
+                    applied: record.applied,
+                })
+                && stamp.is_some_and(|stamp| record.matches_stamp(stamp));
         }
+        entry.low &= low;
         *state = Setting::Active {
             before: record.before,
             applied: record.applied,

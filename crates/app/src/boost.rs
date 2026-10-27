@@ -64,15 +64,9 @@ impl Boost {
             || !record.device.matches_reading(reading)
             || !reading.online()
             || self
-                .entries
-                .get(&reading.key)
-                .is_some_and(|entry| entry.active)
-            || self
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.request.target.device.key == reading.key)
-            || self.entries.len() >= 512
-            || self.attempted.len() >= 512 && !self.attempted.contains(&reading.key)
         {
             return false;
         }
@@ -82,6 +76,20 @@ impl Boost {
         ) else {
             return false;
         };
+        if let Some(entry) = self.entries.get(&reading.key).filter(|entry| entry.active) {
+            return entry.target.device == record.device
+                && entry.baseline == Some(baseline)
+                && entry.boost == boost
+                && entry
+                    .target
+                    .connection_stamp
+                    .is_some_and(|stamp| record.matches_stamp(stamp));
+        }
+        if self.entries.len() >= 512 && !self.entries.contains_key(&reading.key)
+            || self.attempted.len() >= 512 && !self.attempted.contains(&reading.key)
+        {
+            return false;
+        }
         self.attempted.insert(reading.key.clone());
         self.entries.insert(
             reading.key.clone(),

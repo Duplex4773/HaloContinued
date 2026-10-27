@@ -725,12 +725,13 @@ impl Store {
                 },
             )
             .map_err(sql_error)?;
-        let revision = (
-            self.db.total_changes(),
-            self.db
-                .pragma_query_value(None, "data_version", |r| r.get(0))
-                .map_err(sql_error)?,
-        );
+        // flush/prune invalidate this cache when local history changes.
+        // Check other connections here, but do not invalidate for unrelated
+        // estimator checkpoints or polling-activity writes on this connection.
+        let revision = self
+            .db
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .map_err(sql_error)?;
         let mut index = self.usage_index.borrow_mut();
         if !index
             .as_ref()
@@ -2041,6 +2042,25 @@ mod usage_index_tests {
         let second = store.query_usage("mouse", until + 1, 600, 160).unwrap();
         assert_eq!(second.until, first.until);
         assert!(store.usage_rows.get() < 512);
+        store.save_estimator(&Estimator::default()).unwrap();
+        store
+            .record_polling_activity(&PollingActivity {
+                key: "mouse".into(),
+                timestamp: until,
+                session: 1,
+                kind: PollingActivityKind::Boost,
+                rate: PollingRate::try_from(4000).unwrap(),
+                previous: PollingRate::try_from(1000).ok(),
+            })
+            .unwrap();
+        store.usage_rows.set(0);
+        let after_unrelated_writes = store.query_usage("mouse", until + 1, 600, 160).unwrap();
+        assert_eq!(after_unrelated_writes.until, first.until);
+        assert!(
+            store.usage_rows.get() < 512,
+            "Unrelated checkpoint/activity writes rescanned {} history rows",
+            store.usage_rows.get()
+        );
         store.prune_expired(until).unwrap();
         store.usage_rows.set(0);
         store.query_usage("mouse", until + 1, 600, 160).unwrap();
@@ -2073,6 +2093,17 @@ mod usage_index_tests {
         assert_eq!(
             store.query_usage("mouse", until, 600, 80).unwrap().until,
             until - 60
+        );
+        assert!(store.usage_rows.get() >= 4000);
+        // A local insertion inside the existing time bounds must invalidate
+        // the index too, even when the first/last row and data_version agree.
+        r.timestamp = until - 120;
+        store.record(&r).unwrap();
+        store.flush().unwrap();
+        store.usage_rows.set(0);
+        assert_eq!(
+            store.query_usage("mouse", until, 600, 80).unwrap().until,
+            until - 120
         );
         assert!(store.usage_rows.get() >= 4000);
         store.release_history_cache();
