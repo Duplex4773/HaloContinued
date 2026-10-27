@@ -28,6 +28,9 @@ struct Entry {
     baseline: Option<PollingRate>,
     active: bool,
     charging_wait: Option<ChargingWait>,
+    restore_retry: u8,
+    restore_failures: u8,
+    recovered: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChargingWait {
@@ -39,6 +42,12 @@ struct Pending {
     request: ControlRequest,
     guard: Guard,
     settings_cancelled: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChargingHandoff {
+    pub baseline: PollingRate,
+    pub applied: PollingRate,
+    pub recovered: bool,
 }
 pub struct Boost {
     entries: BTreeMap<String, Entry>,
@@ -103,6 +112,9 @@ impl Boost {
                 baseline: Some(baseline),
                 active: true,
                 charging_wait: None,
+                restore_retry: 0,
+                restore_failures: 0,
+                recovered: true,
             },
         );
         true
@@ -160,6 +172,7 @@ impl Boost {
             .pending
             .as_ref()
             .map(|p| p.request.target.device.key.as_str());
+        let mut cancel_pending = false;
         self.entries.retain(|_, e| {
             if e.target.device.source != provider || e.charging_wait == Some(ChargingWait::Saver) {
                 return true;
@@ -180,7 +193,7 @@ impl Boost {
                 possible_wired |= reading.online() && reading.wired_mouse();
             }
             let has_pending = pending_key == Some(e.target.device.key.as_str());
-            let alias = (e.active
+            let alias = ((e.active || has_pending)
                 && e.baseline.is_some()
                 && e.target.connection_stamp.is_some()
                 && !e.target.device.wired_mouse()
@@ -210,7 +223,10 @@ impl Boost {
             }
             if wired == 1 {
                 if has_pending {
-                    return false;
+                    // A confirmed original remains owned until the pending
+                    // restore reports whether a SET began. Charging cancels
+                    // the request; an uncertain completion still discards it.
+                    cancel_pending = true;
                 }
                 e.charging_wait = Some(ChargingWait::Seen);
             } else if online {
@@ -224,8 +240,9 @@ impl Boost {
                     Some(ChargingWait::Seen) => {}
                     Some(ChargingWait::Awaiting(since))
                         if now >= since && now.saturating_sub(since) <= 120 => {}
-                    None if alias.is_some() && !has_pending => {
+                    None if alias.is_some() => {
                         e.charging_wait = Some(ChargingWait::Awaiting(now));
+                        cancel_pending |= has_pending;
                     }
                     _ => return false,
                 }
@@ -233,7 +250,7 @@ impl Boost {
             true
         });
         if let Some(p) = &self.pending
-            && !self.entries.contains_key(&p.request.target.device.key)
+            && (cancel_pending || !self.entries.contains_key(&p.request.target.device.key))
         {
             p.guard.cancel.store(true, Ordering::Release);
         }
@@ -250,21 +267,29 @@ impl Boost {
                 self.entries
                     .values()
                     .any(|e| e.charging_wait.is_none() && !e.active && e.baseline.is_some())
-                    || settings.devices.iter().any(|(key, preferences)| {
-                        preferences.fullscreen_boost_rate.is_some()
-                            && !self.attempted.iter().any(|attempt| {
-                                settings.preference_key(attempt) == settings.preference_key(key)
-                            })
-                    })
+                    || self.entries.len() < 512
+                        && self.attempted.len() < 512
+                        && settings.devices.iter().any(|(key, preferences)| {
+                            !self.entries.contains_key(key)
+                                && preferences.fullscreen_boost_rate.is_some()
+                                && !self.attempted.iter().any(|attempt| {
+                                    settings.preference_key(attempt) == settings.preference_key(key)
+                                })
+                        })
             }
             Some(false) => self
                 .entries
                 .values()
-                .any(|e| e.active && e.charging_wait.is_none()),
+                .any(|e| e.active && e.charging_wait.is_none() && e.restore_retry == 0),
             None => false,
         }
     }
     pub fn sample(&mut self, now: Instant, state: Option<bool>) {
+        if now >= self.next_sample {
+            for entry in self.entries.values_mut() {
+                entry.restore_retry = entry.restore_retry.saturating_sub(1);
+            }
+        }
         self.next_sample = now + Duration::from_secs(5);
         if let Some(pending) = &self.pending
             && state != Some(pending.guard.fullscreen)
@@ -283,9 +308,19 @@ impl Boost {
                 {
                     if !state && self.stable != Some(false) {
                         self.attempted.clear();
-                        // A cancelled preflight owns no hardware state. Do not let it
-                        // block battery saver or reuse its baseline in a later game.
-                        self.entries.retain(|_, entry| entry.active);
+                        // A cancelled preflight owns no hardware state. A SET
+                        // can already have completed while its readback is in
+                        // flight, so retain its proven original until completion.
+                        let pending_key = self
+                            .pending
+                            .as_ref()
+                            .map(|p| p.request.target.device.key.as_str());
+                        self.entries.retain(|key, entry| {
+                            entry.active
+                                || pending_key == Some(key.as_str())
+                                    && entry.baseline.is_some()
+                                    && entry.target.connection_stamp.is_some()
+                        });
                     }
                     self.stable = Some(state);
                 }
@@ -310,20 +345,18 @@ impl Boost {
             let needs_action = if fullscreen {
                 !entry.active && entry.baseline.is_some()
             } else {
-                entry.active
+                entry.active && entry.restore_retry == 0
             };
             if !needs_action {
                 return false;
             }
             let cached = readings(&entry.target.device.source);
-            // Missing/replaced hardware still needs the normal inventory pass
-            // to retire ownership. Skip only a known unavailable unit.
-            !cached
+            // Filtered/disabled caches are not authoritative disconnect evidence.
+            // Confirmed provider observations revoke missing/replaced hardware;
+            // until then keep ownership without resolving an empty inventory.
+            cached
                 .iter()
-                .any(|r| entry.target.device.matches_reading(r))
-                || cached
-                    .iter()
-                    .any(|r| r.online() && entry.target.device.matches_reading(r))
+                .any(|r| r.online() && entry.target.device.matches_reading(r))
         });
         if existing || !fullscreen {
             return existing;
@@ -336,6 +369,7 @@ impl Boost {
                 readings(provider).iter().any(|reading| {
                     reading.online()
                         && reading.kind == "mouse"
+                        && !self.entries.contains_key(&reading.key)
                         && settings
                             .device(&reading.key)
                             .and_then(|p| p.fullscreen_boost_rate)
@@ -404,12 +438,16 @@ impl Boost {
         device: &ConfigurationDevice,
         stamp: ConnectionStamp,
         saver_rate: Option<PollingRate>,
-    ) -> Option<(PollingRate, PollingRate)> {
+    ) -> Option<ChargingHandoff> {
         if !self.charging_handoff_matches(device, stamp, saver_rate) {
             return None;
         }
         let entry = self.entries.remove(&device.key)?;
-        Some((entry.baseline?, entry.boost))
+        Some(ChargingHandoff {
+            baseline: entry.baseline?,
+            applied: entry.boost,
+            recovered: entry.recovered,
+        })
     }
     pub fn manual(&mut self, key: &str) {
         if let Some(pending) = &self.pending
@@ -464,6 +502,24 @@ impl Boost {
             .filter(|p| p.request.request == request)
             .map(|p| p.guard.clone())
     }
+    /// Read-only evidence that the device no longer has our boosted value.
+    /// This can also supersede an underlying Battery saver polling layer.
+    pub fn external_change<'a>(
+        &self,
+        outcome: &'a ControlOutcome,
+    ) -> Option<&'a PollingObservation> {
+        let pending = self.pending.as_ref()?;
+        let expected = pending.request.action.expected()?;
+        let observed = outcome.observation.as_ref()?;
+        (pending.request.request == outcome.request
+            && pending.request.target.device.key == outcome.key
+            && outcome.failure.is_some()
+            && !outcome.may_have_changed
+            && observed.target.device == pending.request.target.device
+            && observed.target.generation == pending.request.target.generation
+            && observed.rate.is_some_and(|rate| rate != expected))
+        .then_some(observed)
+    }
     pub fn next(
         &mut self,
         settings: &Settings,
@@ -474,13 +530,6 @@ impl Boost {
         if !self.needs_inventory(settings) {
             return None;
         }
-        self.entries.retain(|key, e| {
-            e.charging_wait.is_some()
-                || e.target.generation == generation
-                    && readings
-                        .iter()
-                        .any(|r| &r.key == key && e.target.device.matches_reading(r))
-        });
         let fullscreen = self.stable?;
         let existing = self
             .entries
@@ -496,19 +545,22 @@ impl Boost {
                     && if fullscreen {
                         !e.active && e.baseline.is_some()
                     } else {
-                        e.active
+                        e.active && e.restore_retry == 0
                     }
             })
             .map(|(key, _)| key.clone());
         let key = if let Some(key) = existing {
             key
         } else if fullscreen {
-            if self.attempted.len() >= 512 {
+            if self.entries.len() >= 512 || self.attempted.len() >= 512 {
                 return None;
             }
             let r = readings.iter().find(|r| {
                 r.online()
                     && r.kind == "mouse"
+                    // A prior session can still own a delayed/sleeping restore.
+                    // Never replace its original baseline with a new preflight.
+                    && !self.entries.contains_key(&r.key)
                     && !self.attempted.contains(&r.key)
                     && settings
                         .device(&r.key)
@@ -532,6 +584,9 @@ impl Boost {
                     baseline: None,
                     active: false,
                     charging_wait: None,
+                    restore_retry: 0,
+                    restore_failures: 0,
+                    recovered: false,
                 },
             );
             r.key.clone()
@@ -586,6 +641,16 @@ impl Boost {
         let Some(entry) = self.entries.get_mut(key) else {
             return false;
         };
+        let observation = outcome.observation.as_ref();
+        let original_still_owned = observation.is_none_or(|observed| {
+            observed.target.device == entry.target.device
+                && observed.target.generation == p.request.target.generation
+                && (observed.target.connection_stamp == entry.target.connection_stamp
+                    || entry.recovered
+                        && crate::recovery::strong_identity(&entry.target.device)
+                        && observed.target.connection_stamp.is_some())
+                && observed.rate.is_none_or(|rate| rate == entry.boost)
+        });
         let interrupted_restore =
             entry.active && !p.guard.fullscreen && p.guard.cancel.load(Ordering::Acquire);
         if (entry.target.generation != p.request.target.generation
@@ -594,17 +659,49 @@ impl Boost {
             && entry.target.connection_stamp.is_some()
             && p.request.target.connection_stamp.is_some()
             && !outcome.may_have_changed
+            && (!entry.active || original_still_owned)
         {
             // Refresh/settings or a fullscreen transition cancelled before SET.
             // Retain the verified original; a later stable desktop must still
             // revalidate the connection and expected rate before restoring it.
+            if !entry.active && self.stable == Some(false) {
+                // The desktop already settled while this SET was pending.
+                // Its unwritten completion owns no hardware; do not leave a
+                // preflight latch blocking saver or the next game indefinitely.
+                self.entries.remove(key);
+            }
             return true;
         }
-        let observation = outcome.observation.as_ref();
+        if entry.active
+            && !p.guard.fullscreen
+            && outcome.failure.is_some()
+            && !outcome.may_have_changed
+            && entry.target.connection_stamp.is_some()
+            && entry.target.connection_stamp == p.request.target.connection_stamp
+            && original_still_owned
+        {
+            // No SET began: keep the verified original and the exact connection
+            // proof. Existing five-second Shell samples pace retries at 30, 60,
+            // 120, then 300 seconds; idle monitoring gains no timer or worker.
+            // A startup worker may already have persisted a verified rebind.
+            // Keep the original journal stamp: a retry must repeat that probe,
+            // never adopt a new connection from this failure alone.
+            entry.restore_failures = entry.restore_failures.saturating_add(1).min(4);
+            entry.restore_retry = match entry.restore_failures {
+                1 => 6,
+                2 => 12,
+                3 => 24,
+                _ => 60,
+            };
+            return true;
+        }
         if outcome.failure.is_some()
             || observation.is_none()
             || observation.is_some_and(|o| {
-                o.target.generation != entry.target.generation
+                // The cache may have refreshed after a successful native SET.
+                // This completion must match its own request and the saved
+                // native connection, rather than the newer cache generation.
+                o.target.generation != p.request.target.generation
                     || o.target.device != entry.target.device
                     || (entry.target.connection_stamp.is_some()
                         && o.target.connection_stamp != entry.target.connection_stamp)
@@ -792,7 +889,14 @@ mod tests {
             let saver_rate = rate(if case == 1 { 500 } else { 1000 });
             let result = boost.handoff_for_charging(&device, stamp, Some(saver_rate));
             if case == 5 {
-                assert_eq!(result, Some((rate(1000), rate(2000))));
+                assert_eq!(
+                    result,
+                    Some(ChargingHandoff {
+                        baseline: rate(1000),
+                        applied: rate(2000),
+                        recovered: false
+                    })
+                );
                 assert!(!boost.owns(&readings[0].key));
             } else {
                 assert_eq!(result, None, "unsafe handoff case {case}");
@@ -1264,6 +1368,515 @@ mod tests {
         );
     }
     #[test]
+    fn unwritten_restore_failure_keeps_original_until_a_paced_retry() {
+        let now = Instant::now();
+        let (mut settings, readings) = fixture();
+        settings.device_mut(&readings[0].key).fullscreen_boost_rate = Some(rate(4000));
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        let apply = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &apply, 4000);
+        settle(&mut boost, now + Duration::from_secs(30), false);
+        let restore = boost.next(&settings, 1, &readings).unwrap();
+        assert_eq!(
+            restore.action,
+            ControlAction::ApplyIf {
+                rate: rate(1000),
+                expected: rate(4000)
+            }
+        );
+        assert!(boost.complete(&ControlOutcome::failed(
+            &restore,
+            "Recovery storage is busy."
+        )));
+        assert!(
+            boost.owns(&readings[0].key),
+            "A failed preflight must not forget the original desktop rate"
+        );
+        assert!(!boost.needs_inventory(&settings));
+        assert!(boost.next(&settings, 1, &readings).is_none());
+        for tick in 1..=6 {
+            boost.sample(now + Duration::from_secs(45 + tick * 5), Some(false));
+            if tick < 6 {
+                assert!(!boost.ready(&settings, |_| &readings));
+            }
+        }
+        let retry = boost.next(&settings, 1, &readings).unwrap();
+        assert_eq!(retry.action, restore.action);
+        assert_eq!(
+            retry.target.connection_stamp,
+            restore.target.connection_stamp
+        );
+        complete(&mut boost, &retry, 1000);
+        assert!(!boost.owns(&readings[0].key));
+    }
+    #[test]
+    fn usb_charging_during_an_unwritten_restore_retains_the_desktop_original() {
+        for gap in [false, true] {
+            for uncertain in [false, true] {
+                let now = Instant::now();
+                let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+                reading.kind = "mouse".into();
+                reading.via = "usb".into();
+                reading.serial = Some("TEST".into());
+                let mut settings = Settings {
+                    polling_controls: true,
+                    ..Default::default()
+                };
+                settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(4000));
+                let mut boost = Boost::new(now);
+                settle(&mut boost, now, true);
+                let read = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                complete(&mut boost, &read, 1000);
+                let apply = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                complete(&mut boost, &apply, 4000);
+                settle(&mut boost, now + Duration::from_secs(30), false);
+                let restore = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                let guard = boost.guard(restore.request).unwrap();
+                if gap {
+                    boost.observe_provider("razer", &[], 100);
+                }
+                let mut wired = reading.clone();
+                wired.key = "razer:00be:TEST".into();
+                wired.timestamp = 101;
+                wired.charging = Some(true);
+                boost.observe_provider("razer", &[wired], 101);
+                assert!(guard.cancel.load(Ordering::Acquire));
+                let mut outcome =
+                    ControlOutcome::failed(&restore, "Charging cancelled restore before SET");
+                outcome.may_have_changed = uncertain;
+                boost.complete(&outcome);
+                assert_eq!(boost.owns(&reading.key), !uncertain);
+                assert!(!boost.needs_inventory(&settings));
+                reading.timestamp = 102;
+                boost.observe_provider("razer", std::slice::from_ref(&reading), 102);
+                let retry = boost.next(&settings, 2, std::slice::from_ref(&reading));
+                if uncertain {
+                    assert!(retry.is_none());
+                } else {
+                    let retry = retry.unwrap();
+                    assert_eq!(retry.action, restore.action);
+                    assert_eq!(
+                        retry.target.connection_stamp,
+                        restore.target.connection_stamp
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn cancellation_does_not_hide_a_readback_that_revokes_ownership() {
+        for actual in [1000, 2000] {
+            let now = Instant::now();
+            let (mut boost, settings, readings, restore) = pending_restore_fixture(now);
+            boost.settings_changed();
+            let mut outcome =
+                ControlOutcome::failed(&restore, "Setting changed before cancellation");
+            outcome.observation = Some(PollingObservation {
+                target: restore.target.clone(),
+                supported: vec![rate(1000), rate(2000), rate(4000)],
+                rate: Some(rate(actual)),
+                timestamp: 100,
+                evidence: "test".into(),
+            });
+            assert!(boost.complete(&outcome));
+            assert!(!boost.owns(&readings[0].key));
+            assert!(boost.next(&settings, 1, &readings).is_none());
+        }
+    }
+    #[test]
+    fn filtered_inventory_does_not_revoke_an_owned_restore() {
+        let now = Instant::now();
+        let (mut boost, settings, readings, restore) = pending_restore_fixture(now);
+        boost.settings_changed();
+        assert!(boost.complete(&ControlOutcome::failed(&restore, "Refresh before SET")));
+        boost.observe_generation(2);
+        assert!(boost.next(&settings, 2, &[]).is_none());
+        assert!(
+            boost.owns(&readings[0].key),
+            "Filtered inventory is not proof of a physical disconnect"
+        );
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!boost.ready(&settings, |_| &[]));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        let retry = boost.next(&settings, 2, &readings).unwrap();
+        assert_eq!(retry.action, restore.action);
+        assert_eq!(
+            retry.target.connection_stamp,
+            restore.target.connection_stamp
+        );
+        // A confirmed provider disappearance still revokes the old unit.
+        boost.observe_provider("simulation", &[], 100);
+        assert!(
+            boost
+                .guard(retry.request)
+                .unwrap()
+                .cancel
+                .load(Ordering::Acquire)
+        );
+        assert!(!boost.complete(&ControlOutcome::failed(&retry, "Device disconnected")));
+        assert!(!boost.owns(&readings[0].key));
+    }
+    #[test]
+    fn retained_restore_owners_remain_bounded_without_idle_allocations() {
+        let now = Instant::now();
+        let mut settings = Settings {
+            polling_controls: true,
+            ..Default::default()
+        };
+        let mut boost = Boost::new(now);
+        for index in 0..512 {
+            let mut reading = Reading::new(
+                format!("simulation:owned-{index}"),
+                "Mouse",
+                "simulation",
+                100,
+            );
+            reading.kind = "mouse".into();
+            let record = crate::recovery::Record {
+                device: ConfigurationDevice::from_reading(&reading),
+                stamp: ConnectionStamp::new(1).unwrap(),
+                rebound_stamp: None,
+                before: 1000,
+                applied: 4000,
+                layer: crate::recovery::Layer::BoostPolling,
+                confirmed: true,
+                manual_pending: false,
+            };
+            assert!(boost.recover(&record, &reading, &settings, 1));
+        }
+        settle(&mut boost, now, false);
+        settle(&mut boost, now + Duration::from_secs(30), true);
+        let mut new_device = Reading::new("simulation:new-device", "Mouse", "simulation", 100);
+        new_device.kind = "mouse".into();
+        settings.device_mut(&new_device.key).fullscreen_boost_rate = Some(rate(4000));
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!boost.needs_inventory(&settings));
+                assert!(!boost.ready(&settings, |_| panic!(
+                    "Full ownership cache must not query inventory"
+                )));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        assert!(boost.next(&settings, 1, &[new_device]).is_none());
+        assert_eq!(boost.entries.len(), 512);
+    }
+    #[test]
+    fn verified_boost_apply_retains_its_original_across_refresh() {
+        let now = Instant::now();
+        let (settings, readings) = fixture();
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        let apply = boost.next(&settings, 1, &readings).unwrap();
+        boost.observe_generation(2);
+        complete(&mut boost, &apply, 2000);
+        assert!(
+            boost.owns(&readings[0].key),
+            "A verified late SET must retain its desktop original"
+        );
+        settle(&mut boost, now + Duration::from_secs(30), false);
+        let restore = boost.next(&settings, 2, &readings).unwrap();
+        assert_eq!(
+            restore.action,
+            ControlAction::ApplyIf {
+                rate: rate(1000),
+                expected: rate(2000)
+            }
+        );
+        assert_eq!(restore.target.connection_stamp, ConnectionStamp::new(1));
+    }
+    #[test]
+    fn charging_during_boost_apply_keeps_only_a_verified_original() {
+        for gap in [false, true] {
+            for case in 0..7 {
+                let now = Instant::now();
+                let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+                reading.kind = "mouse".into();
+                reading.via = "usb".into();
+                reading.serial = Some("TEST".into());
+                let mut settings = Settings {
+                    polling_controls: true,
+                    ..Default::default()
+                };
+                settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(4000));
+                let mut boost = Boost::new(now);
+                settle(&mut boost, now, true);
+                let read = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                complete(&mut boost, &read, 1000);
+                let apply = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                if gap || case == 6 {
+                    boost.observe_provider("razer", &[], 100);
+                }
+                let mut wired = reading.clone();
+                wired.key = "razer:00be:TEST".into();
+                wired.charging = Some(true);
+                wired.timestamp = 101;
+                if case == 5 {
+                    let mut duplicate = wired.clone();
+                    duplicate.container = Some("DUPLICATE-COLLECTION".into());
+                    boost.observe_provider("razer", &[wired.clone(), duplicate], 101);
+                } else if case != 6 {
+                    boost.observe_provider("razer", std::slice::from_ref(&wired), 101);
+                }
+                boost.observe_generation(2);
+                if case == 3 {
+                    boost.manual(&reading.key);
+                }
+                let mut outcome = ControlOutcome::failed(&apply, "Apply interrupted by charging");
+                outcome.may_have_changed = case != 2;
+                if !matches!(case, 1 | 2) {
+                    outcome.failure = None;
+                    outcome.observation = Some(PollingObservation {
+                        target: ControlTarget {
+                            connection_stamp: ConnectionStamp::new(if case == 4 { 2 } else { 1 }),
+                            ..apply.target.clone()
+                        },
+                        supported: vec![rate(1000), rate(4000)],
+                        rate: Some(rate(4000)),
+                        timestamp: 101,
+                        evidence: "test".into(),
+                    });
+                }
+                boost.complete(&outcome);
+                settle(&mut boost, now + Duration::from_secs(30), false);
+                assert_eq!(
+                    boost.owns(&reading.key),
+                    case == 0 || case == 6,
+                    "Charging must retain a confirmed apply, but not uncertain, manual or changed-connection state"
+                );
+                assert!(boost.next(&settings, 2, &[wired]).is_none());
+                reading.timestamp = 102;
+                boost.observe_provider("razer", std::slice::from_ref(&reading), 102);
+                let restore = boost.next(&settings, 2, std::slice::from_ref(&reading));
+                if case == 0 {
+                    let restore = restore.unwrap();
+                    assert_eq!(
+                        restore.action,
+                        ControlAction::ApplyIf {
+                            rate: rate(1000),
+                            expected: rate(4000)
+                        }
+                    );
+                    assert_eq!(restore.target.connection_stamp, ConnectionStamp::new(1));
+                } else {
+                    assert!(restore.is_none());
+                }
+            }
+        }
+    }
+    #[test]
+    fn desktop_transition_does_not_drop_an_inflight_boost_original() {
+        for case in 0..3 {
+            let verified = case == 0;
+            let now = Instant::now();
+            let (settings, readings) = fixture();
+            let mut boost = Boost::new(now);
+            settle(&mut boost, now, true);
+            let read = boost.next(&settings, 1, &readings).unwrap();
+            complete(&mut boost, &read, 1000);
+            let apply = boost.next(&settings, 1, &readings).unwrap();
+            settle(&mut boost, now + Duration::from_secs(30), false);
+            if verified {
+                complete(&mut boost, &apply, 2000);
+            } else {
+                if case == 2 {
+                    boost.settings_changed();
+                }
+                let mut outcome = ControlOutcome::failed(&apply, "SET acknowledgement is unknown");
+                outcome.may_have_changed = case == 1;
+                boost.complete(&outcome);
+            }
+            assert_eq!(
+                boost.owns(&readings[0].key),
+                verified,
+                "A desktop transition must wait for the pending SET's verified outcome"
+            );
+            let restore = boost.next(&settings, 1, &readings);
+            if verified {
+                assert_eq!(
+                    restore.unwrap().action,
+                    ControlAction::ApplyIf {
+                        rate: rate(1000),
+                        expected: rate(2000)
+                    }
+                );
+            } else {
+                assert!(restore.is_none());
+            }
+        }
+    }
+    #[test]
+    fn another_game_cannot_replace_an_owned_boost_waiting_for_the_mouse_to_wake() {
+        let now = Instant::now();
+        let (mut settings, mut readings) = fixture();
+        settings.device_mut(&readings[0].key).fullscreen_boost_rate = Some(rate(4000));
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        let apply = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &apply, 4000);
+        readings[0].connection = Connection::Sleeping;
+        settle(&mut boost, now + Duration::from_secs(30), false);
+        assert!(!boost.ready(&settings, |_| &readings));
+        settle(&mut boost, now + Duration::from_secs(60), true);
+        readings[0].connection = Connection::Online;
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!boost.ready(&settings, |_| &readings));
+                assert!(
+                    boost.next(&settings, 1, &readings).is_none(),
+                    "An owned 4000 Hz boost must not become a new preflight"
+                );
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        settle(&mut boost, now + Duration::from_secs(90), false);
+        let restore = boost.next(&settings, 1, &readings).unwrap();
+        assert_eq!(
+            restore.action,
+            ControlAction::ApplyIf {
+                rate: rate(1000),
+                expected: rate(4000)
+            }
+        );
+        complete(&mut boost, &restore, 1000);
+        // Completing the restore must not suppress the next game's boost.
+        settle(&mut boost, now + Duration::from_secs(120), true);
+        assert_eq!(
+            boost.next(&settings, 1, &readings).unwrap().action,
+            ControlAction::Read
+        );
+    }
+    fn pending_restore_fixture(now: Instant) -> (Boost, Settings, Vec<Reading>, ControlRequest) {
+        let (mut settings, readings) = fixture();
+        settings.device_mut(&readings[0].key).fullscreen_boost_rate = Some(rate(4000));
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let read = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &read, 1000);
+        let apply = boost.next(&settings, 1, &readings).unwrap();
+        complete(&mut boost, &apply, 4000);
+        settle(&mut boost, now + Duration::from_secs(30), false);
+        let restore = boost.next(&settings, 1, &readings).unwrap();
+        (boost, settings, readings, restore)
+    }
+    #[test]
+    fn failed_restore_backoff_is_bounded_and_waiting_does_not_allocate() {
+        let now = Instant::now();
+        let (mut boost, settings, readings, mut request) = pending_restore_fixture(now);
+        let mut seconds = 45;
+        for ticks in [6, 12, 24, 60, 60] {
+            assert!(boost.complete(&ControlOutcome::failed(
+                &request,
+                "GET timed out before SET"
+            )));
+            let (_, allocations) = crate::allocation_counter::measure(|| {
+                for _ in 0..1000 {
+                    assert!(!boost.ready(&settings, |_| &readings));
+                    assert!(boost.next(&settings, 1, &readings).is_none());
+                }
+            });
+            assert_eq!(allocations.calls, 0);
+            for tick in 1..=ticks {
+                seconds += 5;
+                boost.sample(now + Duration::from_secs(seconds), Some(false));
+                if tick < ticks {
+                    assert!(!boost.needs_inventory(&settings));
+                }
+            }
+            request = boost.next(&settings, 1, &readings).unwrap();
+            assert_eq!(
+                request.action,
+                ControlAction::ApplyIf {
+                    rate: rate(1000),
+                    expected: rate(4000)
+                }
+            );
+            assert_eq!(request.target.connection_stamp, ConnectionStamp::new(1));
+        }
+        complete(&mut boost, &request, 1000);
+    }
+    #[test]
+    fn uncertain_or_changed_restore_evidence_never_authorizes_retry() {
+        for case in 0..5 {
+            let now = Instant::now();
+            let (mut boost, settings, readings, request) = pending_restore_fixture(now);
+            let mut outcome = ControlOutcome::failed(&request, "Restore failed");
+            if case == 0 {
+                outcome.may_have_changed = true;
+            } else if case == 4 {
+                boost
+                    .entries
+                    .get_mut(&readings[0].key)
+                    .unwrap()
+                    .target
+                    .connection_stamp = None;
+            } else {
+                let mut target = request.target.clone();
+                if case == 1 {
+                    target.connection_stamp = ConnectionStamp::new(2);
+                }
+                if case == 2 {
+                    target.device.serial = Some("different-unit".into());
+                }
+                outcome.observation = Some(PollingObservation {
+                    target,
+                    supported: vec![rate(1000), rate(4000)],
+                    rate: Some(rate(if case == 3 { 1000 } else { 4000 })),
+                    timestamp: 0,
+                    evidence: "test".into(),
+                });
+            }
+            assert!(boost.complete(&outcome));
+            assert!(!boost.owns(&readings[0].key), "unsafe retry case {case}");
+            for tick in 1..=60 {
+                boost.sample(now + Duration::from_secs(45 + tick * 5), Some(false));
+            }
+            assert!(boost.next(&settings, 1, &readings).is_none());
+        }
+    }
+    #[test]
+    fn a_new_game_or_manual_choice_cannot_be_overridden_by_a_delayed_restore() {
+        for manual in [false, true] {
+            let now = Instant::now();
+            let (mut boost, settings, readings, restore) = pending_restore_fixture(now);
+            boost.complete(&ControlOutcome::failed(&restore, "GET failed before SET"));
+            if manual {
+                boost.manual(&readings[0].key);
+            }
+            for tick in 1..=6 {
+                boost.sample(now + Duration::from_secs(45 + tick * 5), Some(!manual));
+            }
+            assert!(boost.next(&settings, 1, &readings).is_none());
+            if !manual {
+                settle(&mut boost, now + Duration::from_secs(90), false);
+                assert_eq!(
+                    boost.next(&settings, 1, &readings).unwrap().action,
+                    restore.action
+                );
+            }
+        }
+    }
+    #[test]
     fn waiting_for_a_sleeping_restore_skips_inventory_allocations() {
         let now = Instant::now();
         let (settings, mut readings) = fixture();
@@ -1293,11 +1906,11 @@ mod tests {
             assert_eq!(after.calls, 0);
             assert_eq!(after.bytes, 0);
         }
-        assert!(boost.ready(&settings, |_| &[]));
+        assert!(!boost.ready(&settings, |_| &[]));
         readings[0].connection = Connection::Online;
         assert!(boost.ready(&settings, |_| &readings));
         readings[0].serial = Some("SYNTHETIC-REPLACEMENT".into());
-        assert!(boost.ready(&settings, |_| &readings));
+        assert!(!boost.ready(&settings, |_| &readings));
         readings[0].serial = None;
         let restore = boost.next(&settings, 1, &readings).unwrap();
         assert_eq!(restore.action.rate(), Some(rate(1000)));
@@ -1330,7 +1943,7 @@ mod tests {
         complete(&mut boost, &read, 1000);
         readings[0].connection = Connection::Stale;
         assert!(!boost.ready(&settings, |_| &readings));
-        assert!(boost.ready(&settings, |_| &[]));
+        assert!(!boost.ready(&settings, |_| &[]));
         readings[0].connection = Connection::Online;
         assert!(boost.ready(&settings, |_| &readings));
     }

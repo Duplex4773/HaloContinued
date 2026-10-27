@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 pub const REQUEST_BIT: u64 = 1 << 60;
@@ -23,6 +24,27 @@ enum WiredTransition {
     Awaiting(i64),
     Seen,
 }
+#[derive(Clone, Copy, Default)]
+struct RestoreRetry {
+    after: Option<Instant>,
+    failures: u8,
+    recovered: bool,
+}
+impl RestoreRetry {
+    fn ready(&self) -> bool {
+        self.after.is_none_or(|after| Instant::now() >= after)
+    }
+    fn defer(&mut self) {
+        self.failures = self.failures.saturating_add(1).min(4);
+        let seconds = match self.failures {
+            1 => 30,
+            2 => 60,
+            3 => 120,
+            _ => 300,
+        };
+        self.after = Some(Instant::now() + Duration::from_secs(seconds));
+    }
+}
 struct Entry {
     target: ControlTarget,
     choices: LowBatteryMode,
@@ -32,15 +54,19 @@ struct Entry {
     rate_stamp: Option<ConnectionStamp>,
     sleep_stamp: Option<ConnectionStamp>,
     wired_transition: Option<WiredTransition>,
+    restore_retry: [RestoreRetry; 2],
 }
 impl Entry {
     fn needs_action(&self) -> bool {
         self.wired_transition.is_none()
-            && [self.rate, self.sleep].into_iter().any(|s| match s {
-                Setting::New | Setting::Ready(_) => true,
-                Setting::Active { .. } => !self.low,
-                Setting::Done => false,
-            })
+            && [self.rate, self.sleep]
+                .into_iter()
+                .enumerate()
+                .any(|(index, s)| match s {
+                    Setting::New | Setting::Ready(_) => true,
+                    Setting::Active { .. } => !self.low && self.restore_retry[index].ready(),
+                    Setting::Done => false,
+                })
     }
     fn usable(&self, r: &Reading, now: i64) -> bool {
         self.wired_transition.is_none()
@@ -75,6 +101,7 @@ impl Entry {
         self.rate = Setting::Done;
         self.sleep = Setting::Done;
         self.wired_transition = None;
+        self.restore_retry = [RestoreRetry::default(); 2];
     }
 }
 #[derive(Clone)]
@@ -108,6 +135,14 @@ struct Pending {
     restoring: bool,
     cancel: Arc<AtomicBool>,
     settings_cancelled: bool,
+}
+struct Completion {
+    id: u64,
+    value: Option<u32>,
+    failed: bool,
+    may_have_changed: bool,
+    connection_stamp: Option<ConnectionStamp>,
+    matches_target: bool,
 }
 #[derive(Default)]
 pub struct BatterySaver {
@@ -168,6 +203,7 @@ impl BatterySaver {
                 rate_stamp: None,
                 sleep_stamp: None,
                 wired_transition: None,
+                restore_retry: [RestoreRetry::default(); 2],
             });
         if entry.target.device != record.device || entry.choices != choices {
             if !entry.target.device.matches_reading(reading)
@@ -190,6 +226,7 @@ impl BatterySaver {
             entry.rate_stamp = None;
             entry.sleep_stamp = None;
             entry.wired_transition = None;
+            entry.restore_retry = [RestoreRetry::default(); 2];
         }
         let (state, stamp) = if sleep {
             (&mut entry.sleep, &mut entry.sleep_stamp)
@@ -215,6 +252,10 @@ impl BatterySaver {
             applied: record.applied,
         };
         *stamp = Some(record.stamp);
+        entry.restore_retry[usize::from(sleep)] = RestoreRetry {
+            recovered: true,
+            ..Default::default()
+        };
         true
     }
 
@@ -275,6 +316,16 @@ impl BatterySaver {
             .filter(|p| p.action.id() == id)
             .map(|p| p.cancel.clone())
     }
+    /// Respect an external rate without discarding independent sleep ownership.
+    pub fn observe_external_rate(&mut self, device: &ConfigurationDevice, rate: PollingRate) {
+        let superseded = self.entries.get(&device.key).is_some_and(|entry| {
+            entry.target.device == *device
+                && matches!(entry.rate, Setting::Active { applied, .. } if applied != rate.hz())
+        });
+        if superseded {
+            self.manual(device, false);
+        }
+    }
     /// Manual changes take ownership of the affected setting for this low-battery episode.
     pub fn manual(&mut self, device: &ConfigurationDevice, sleep: bool) {
         // The alias can only cancel automation. It never authorizes a write to
@@ -295,6 +346,7 @@ impl BatterySaver {
                 } else {
                     entry.rate = Setting::Done;
                 }
+                entry.restore_retry[usize::from(sleep)] = RestoreRetry::default();
                 cancel |= self.pending.as_ref().is_some_and(|p| {
                     p.action.key() == entry.target.device.key
                         && matches!(p.action, Action::Sleep(_)) == sleep
@@ -317,6 +369,7 @@ impl BatterySaver {
         for e in self.entries.values_mut() {
             e.rate = Setting::Done;
             e.sleep = Setting::Done;
+            e.restore_retry = [RestoreRetry::default(); 2];
         }
     }
     /// Suspend performs no I/O. Retain only completed changes tied to their
@@ -365,8 +418,23 @@ impl BatterySaver {
                 }
                 possible_wired |= r.online() && r.wired_mouse();
             }
+            // A SET may have completed before its acknowledgement arrives.
+            // Preserve its already-read original only during a bounded,
+            // serial-proven charging transition; completion decides ownership.
+            let pending_original = self.pending.as_ref().is_some_and(|pending| {
+                pending.action.key() == entry.target.device.key
+                    && pending.action.target().connection_stamp.is_some()
+                    && matches!(pending.old, Setting::Ready(_))
+                    && if matches!(pending.action, Action::Sleep(_)) {
+                        entry.sleep == pending.old
+                            && entry.sleep_stamp == pending.action.target().connection_stamp
+                    } else {
+                        entry.rate == pending.old
+                            && entry.rate_stamp == pending.action.target().connection_stamp
+                    }
+            });
             let alias = (!entry.target.device.wired_mouse()
-                && entry.has_proven_original()
+                && (entry.has_proven_original() || pending_original)
                 && (!present || possible_wired || entry.wired_transition.is_some()))
             .then(|| entry.target.device.shared_preference_key())
             .flatten();
@@ -441,14 +509,25 @@ impl BatterySaver {
                         boost.hold_for_charging(&entry.target.device, stamp, saver_rate);
                     }
                     Some(WiredTransition::Seen) => {
-                        if let Some((boost_baseline, boosted)) =
+                        if let Some(handoff) =
                             boost.handoff_for_charging(&entry.target.device, stamp, saver_rate)
                         {
+                            // A new polling owner inherits the boost's startup
+                            // proof. A flattened saver+boost chain requires both
+                            // originals to come from restart recovery. Keep the
+                            // old stamp: every retry must still verify the journal.
+                            let recovered = handoff.recovered
+                                && (!matches!(entry.rate, Setting::Active { .. })
+                                    || entry.restore_retry[0].recovered);
                             entry.rate = Setting::Active {
-                                before: original.unwrap_or(boost_baseline.hz()),
-                                applied: boosted.hz(),
+                                before: original.unwrap_or(handoff.baseline.hz()),
+                                applied: handoff.applied.hz(),
                             };
                             entry.rate_stamp = Some(stamp);
+                            entry.restore_retry[0] = RestoreRetry {
+                                recovered,
+                                ..Default::default()
+                            };
                         }
                     }
                     None => {}
@@ -515,11 +594,20 @@ impl BatterySaver {
                         },
                         choices,
                         low: true,
-                        rate: Setting::New,
-                        sleep: Setting::New,
+                        rate: if choices.polling_rate.is_some() {
+                            Setting::New
+                        } else {
+                            Setting::Done
+                        },
+                        sleep: if choices.sleep_seconds.is_some() {
+                            Setting::New
+                        } else {
+                            Setting::Done
+                        },
                         rate_stamp: None,
                         sleep_stamp: None,
                         wired_transition: None,
+                        restore_retry: [RestoreRetry::default(); 2],
                     },
                 );
             }
@@ -572,7 +660,8 @@ impl BatterySaver {
                 if matches!(
                     (*state, e.low),
                     (Setting::Done, _) | (Setting::Active { .. }, true)
-                ) {
+                ) || !e.restore_retry[usize::from(sleep)].ready()
+                {
                     continue;
                 }
                 let (value, expected, restoring) = match (*state, e.low) {
@@ -658,14 +747,15 @@ impl BatterySaver {
             .retain(|_, e| e.low || e.rate != Setting::Done || e.sleep != Setting::Done);
         action
     }
-    fn finish(
-        &mut self,
-        id: u64,
-        value: Option<u32>,
-        failed: bool,
-        may_have_changed: bool,
-        connection_stamp: Option<ConnectionStamp>,
-    ) -> bool {
+    fn finish(&mut self, completion: Completion) -> bool {
+        let Completion {
+            id,
+            value,
+            failed,
+            may_have_changed,
+            connection_stamp,
+            matches_target,
+        } = completion;
         if !self.pending.as_ref().is_some_and(|p| p.action.id() == id) {
             return false;
         }
@@ -674,12 +764,48 @@ impl BatterySaver {
             return false;
         };
         let sleep = matches!(p.action, Action::Sleep(_));
+        let retry = &mut e.restore_retry[usize::from(sleep)];
+        let original_still_owned = matches_target
+            && connection_stamp.is_none_or(|stamp| {
+                Some(stamp) == p.action.target().connection_stamp
+                    || retry.recovered && crate::recovery::strong_identity(&e.target.device)
+            })
+            && matches!(p.old, Setting::Active { applied, .. } if value.is_none_or(|value| value == applied));
         if (p.action.target().generation != e.target.generation || p.settings_cancelled)
             && p.action.target().connection_stamp.is_some()
             && !may_have_changed
+            && (!p.restoring || original_still_owned)
         {
             // Refresh/settings before SET cannot have changed the owned setting.
             // Keep the original; the next request still checks its connection.
+            if !e.low && matches!(p.old, Setting::Ready(_)) {
+                // The episode ended without this SET. Retire its preflight
+                // now, instead of resolving inventory/Shell state just to do so.
+                if sleep {
+                    e.sleep = Setting::Done;
+                    e.sleep_stamp = None;
+                } else {
+                    e.rate = Setting::Done;
+                    e.rate_stamp = None;
+                }
+                *retry = RestoreRetry::default();
+            }
+            return true;
+        }
+        let state = if sleep { &mut e.sleep } else { &mut e.rate };
+        if p.restoring
+            && *state == p.old
+            && matches!(p.old, Setting::Active { .. })
+            && failed
+            && !may_have_changed
+            && p.action.target().connection_stamp.is_some()
+            && original_still_owned
+        {
+            // Only a definitely unwritten restore can retry. Keep the original
+            // journal connection proof; startup retries must repeat its probe.
+            // Check deadlines on existing engine wakes, without another timer.
+            // Polling and sleep pace independently so one cannot block the other.
+            retry.defer();
             return true;
         }
         let desired = if sleep {
@@ -688,6 +814,7 @@ impl BatterySaver {
             e.choices.polling_rate.map(PollingRate::hz)
         };
         let failed = failed
+            || !matches_target
             || (p.action.target().connection_stamp.is_some()
                 && connection_stamp != p.action.target().connection_stamp)
             || (sleep
@@ -695,8 +822,17 @@ impl BatterySaver {
                     !hb_providers::sleep_controls::model(&e.target.device)
                         .is_some_and(|m| m.supports(v as u16))
                 }));
-        let state = if sleep { &mut e.sleep } else { &mut e.rate };
-        *state = if failed || p.cancel.load(Ordering::Acquire) || p.restoring {
+        // Cancellation can arrive after SET and its successful readback. Keep
+        // that verified original only while the same pending setting is still
+        // owned; manual/disconnect revocation must never be resurrected.
+        let verified_apply = !failed
+            && matches!(p.old, Setting::Ready(_))
+            && *state == p.old
+            && p.action.target().connection_stamp.is_some()
+            && connection_stamp == p.action.target().connection_stamp
+            && desired.is_some()
+            && value == desired;
+        *state = if failed || p.cancel.load(Ordering::Acquire) && !verified_apply || p.restoring {
             Setting::Done
         } else {
             match (p.old, value, desired) {
@@ -722,16 +858,25 @@ impl BatterySaver {
         } else {
             connection_stamp
         };
+        *retry = RestoreRetry::default();
         true
     }
     pub fn polling_complete(&mut self, o: &ControlOutcome) -> bool {
-        self.finish(
-            o.request,
-            o.observation
+        let matches_target = self.pending.as_ref().is_some_and(|p| {
+            o.key == p.action.key()
+                && o.observation.as_ref().is_none_or(|observed| {
+                    observed.target.device == p.action.target().device
+                        && observed.target.generation == p.action.target().generation
+                })
+        });
+        self.finish(Completion {
+            id: o.request,
+            value: o
+                .observation
                 .as_ref()
                 .and_then(|v| v.rate)
                 .map(PollingRate::hz),
-            o.failure.is_some()
+            failed: o.failure.is_some()
                 || self.entries.get(&o.key).is_some_and(|e| {
                     e.choices.polling_rate.is_some_and(|wanted| {
                         o.observation
@@ -739,20 +884,26 @@ impl BatterySaver {
                             .is_some_and(|observed| !observed.supported.contains(&wanted))
                     })
                 }),
-            o.may_have_changed,
-            o.observation
+            may_have_changed: o.may_have_changed,
+            connection_stamp: o
+                .observation
                 .as_ref()
                 .and_then(|o| o.target.connection_stamp),
-        )
+            matches_target,
+        })
     }
     pub fn sleep_complete(&mut self, o: &SleepOutcome) -> bool {
-        self.finish(
-            o.request,
-            o.seconds.map(u32::from),
-            o.failure.is_some(),
-            o.may_have_changed,
-            o.connection_stamp,
-        )
+        let matches_target = self.pending.as_ref().is_some_and(|p| {
+            o.key == p.action.key() && o.generation == p.action.target().generation
+        });
+        self.finish(Completion {
+            id: o.request,
+            value: o.seconds.map(u32::from),
+            failed: o.failure.is_some(),
+            may_have_changed: o.may_have_changed,
+            connection_stamp: o.connection_stamp,
+            matches_target,
+        })
     }
 }
 
@@ -821,6 +972,68 @@ mod tests {
             complete(b, &a, value);
         }
         assert!(b.next(s, 1, r, 100, boost).is_none());
+    }
+    fn pending_restore(
+        sleep: bool,
+    ) -> (
+        BatterySaver,
+        Settings,
+        Vec<Reading>,
+        crate::boost::Boost,
+        Action,
+    ) {
+        let (mut saver, settings, mut readings, boost) = fixture();
+        activate(&mut saver, &settings, &readings, &boost);
+        readings[0].level = Some(25);
+        if sleep {
+            let polling = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            complete(&mut saver, &polling, 1000);
+        } else {
+            saver.manual(&ConfigurationDevice::from_reading(&readings[0]), true);
+        }
+        let action = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+        (saver, settings, readings, boost, action)
+    }
+    fn fail_restore(
+        saver: &mut BatterySaver,
+        action: &Action,
+        changed: bool,
+        value: Option<u32>,
+        stamp: Option<ConnectionStamp>,
+        valid_target: bool,
+    ) {
+        let owned = saver.pending.is_some();
+        match action {
+            Action::Polling(request) => {
+                let mut outcome = ControlOutcome::failed(request, "Restore stopped before SET");
+                outcome.may_have_changed = changed;
+                if value.is_some() || stamp.is_some() || !valid_target {
+                    let mut target = request.target.clone();
+                    target.connection_stamp = stamp;
+                    if !valid_target {
+                        target.device.serial = Some("different-unit".into());
+                    }
+                    outcome.observation = Some(PollingObservation {
+                        target,
+                        supported: vec![rate(125), rate(1000)],
+                        rate: value.map(rate),
+                        timestamp: 100,
+                        evidence: "test".into(),
+                    });
+                }
+                assert_eq!(saver.polling_complete(&outcome), owned);
+            }
+            Action::Sleep(request) => {
+                let mut outcome = SleepOutcome::failed(request, "Restore stopped before SET");
+                outcome.may_have_changed = changed;
+                outcome.seconds = value.map(|v| v as u16);
+                outcome.connection_stamp = stamp;
+                if !valid_target {
+                    outcome.key.push_str(":different-unit");
+                }
+                assert_eq!(saver.sleep_complete(&outcome), owned);
+            }
+        }
     }
     #[test]
     fn borrowed_preflight_defers_unusable_readings_without_resolving_inventory() {
@@ -1313,6 +1526,332 @@ mod tests {
         }
     }
     #[test]
+    fn verified_saver_apply_retains_its_original_after_cancellation() {
+        for sleep in [false, true] {
+            for refresh in [false, true] {
+                let (mut saver, mut settings, mut readings, boost) = fixture();
+                settings.device_mut(&readings[0].key).low_battery_mode = Some(LowBatteryMode {
+                    threshold: 20,
+                    polling_rate: (!sleep).then(|| rate(125)),
+                    sleep_seconds: sleep.then_some(60),
+                });
+                let read = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                complete(&mut saver, &read, if sleep { 300 } else { 1000 });
+                let apply = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                if refresh {
+                    saver.observe_generation(2);
+                } else {
+                    saver.settings_changed();
+                }
+                complete(&mut saver, &apply, if sleep { 60 } else { 125 });
+                let entry = &saver.entries[&readings[0].key];
+                assert!(
+                    matches!(
+                        if sleep { entry.sleep } else { entry.rate },
+                        Setting::Active { .. }
+                    ),
+                    "A verified SET must retain its original even if its completion was cancelled"
+                );
+                readings[0].level = Some(100);
+                let restore = saver
+                    .next(
+                        &settings,
+                        if refresh { 2 } else { 1 },
+                        &readings,
+                        100,
+                        &boost,
+                    )
+                    .unwrap();
+                assert_eq!(restore.target().connection_stamp, ConnectionStamp::new(1));
+                match restore {
+                    Action::Polling(request) => assert_eq!(
+                        request.action,
+                        ControlAction::ApplyIf {
+                            rate: rate(1000),
+                            expected: rate(125)
+                        }
+                    ),
+                    Action::Sleep(request) => {
+                        assert_eq!((request.seconds, request.expected), (Some(300), Some(60)))
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn charging_during_saver_apply_keeps_only_a_verified_original() {
+        for sleep in [false, true] {
+            for gap in [false, true] {
+                for case in 0..7 {
+                    let (mut saver, mut settings, mut readings, boost) = fixture();
+                    readings[0].serial = Some("TEST".into());
+                    settings.device_mut(&readings[0].key).low_battery_mode = Some(LowBatteryMode {
+                        threshold: 20,
+                        polling_rate: (!sleep).then(|| rate(125)),
+                        sleep_seconds: sleep.then_some(60),
+                    });
+                    let read = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                    complete(&mut saver, &read, if sleep { 300 } else { 1000 });
+                    let apply = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                    if gap || case == 6 {
+                        saver.observe_provider("razer", &[], 100);
+                    }
+                    let wired = wired_reading(&readings[0], 101);
+                    if case == 5 {
+                        let mut duplicate = wired.clone();
+                        duplicate.container = Some("DUPLICATE-COLLECTION".into());
+                        saver.observe_provider("razer", &[wired.clone(), duplicate], 101);
+                    } else if case != 6 {
+                        saver.observe_provider("razer", std::slice::from_ref(&wired), 101);
+                    }
+                    saver.observe_generation(2);
+                    if case == 3 {
+                        saver.manual(&ConfigurationDevice::from_reading(&readings[0]), sleep);
+                    }
+                    if case == 4 {
+                        match &apply {
+                            Action::Polling(request) => {
+                                saver.polling_complete(&ControlOutcome {
+                                    request: request.request,
+                                    key: request.target.device.key.clone(),
+                                    previous: Some(rate(1000)),
+                                    may_have_changed: true,
+                                    failure: None,
+                                    observation: Some(PollingObservation {
+                                        target: ControlTarget {
+                                            connection_stamp: ConnectionStamp::new(2),
+                                            ..request.target.clone()
+                                        },
+                                        rate: Some(rate(125)),
+                                        supported: vec![rate(125), rate(1000)],
+                                        timestamp: 101,
+                                        evidence: "test".into(),
+                                    }),
+                                });
+                            }
+                            Action::Sleep(request) => {
+                                saver.sleep_complete(&SleepOutcome {
+                                    request: request.request,
+                                    key: request.target.device.key.clone(),
+                                    generation: 1,
+                                    connection_stamp: ConnectionStamp::new(2),
+                                    seconds: Some(60),
+                                    may_have_changed: true,
+                                    failure: None,
+                                });
+                            }
+                        }
+                    } else if !matches!(case, 1 | 2) {
+                        complete(&mut saver, &apply, if sleep { 60 } else { 125 });
+                    } else {
+                        fail_restore(&mut saver, &apply, case == 1, None, None, true);
+                    }
+                    assert!(saver.next(&settings, 2, &[wired], 101, &boost).is_none());
+                    readings[0].timestamp = 102;
+                    readings[0].level = Some(100);
+                    saver.observe_provider("razer", &readings, 102);
+                    let restore = saver.next(&settings, 2, &readings, 102, &boost);
+                    if case == 0 {
+                        let restore =
+                            restore.expect("A confirmed saver SET must survive USB charging");
+                        assert_eq!(restore.target().connection_stamp, ConnectionStamp::new(1));
+                        match restore {
+                            Action::Polling(request) => assert_eq!(
+                                request.action,
+                                ControlAction::ApplyIf {
+                                    rate: rate(1000),
+                                    expected: rate(125)
+                                }
+                            ),
+                            Action::Sleep(request) => assert_eq!(
+                                (request.seconds, request.expected),
+                                (Some(300), Some(60))
+                            ),
+                        }
+                    } else {
+                        assert!(restore.is_none());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn ended_saver_episode_retires_a_cancelled_unwritten_apply_without_idle_work() {
+        for sleep in [false, true] {
+            let (mut saver, mut settings, mut readings, boost) = fixture();
+            settings.device_mut(&readings[0].key).low_battery_mode = Some(LowBatteryMode {
+                threshold: 20,
+                polling_rate: (!sleep).then(|| rate(125)),
+                sleep_seconds: sleep.then_some(60),
+            });
+            let read = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            complete(&mut saver, &read, if sleep { 300 } else { 1000 });
+            let apply = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            readings[0].level = Some(100);
+            saver.observe(&settings, 1, &readings, 100);
+            saver.settings_changed();
+            fail_restore(&mut saver, &apply, false, None, None, true);
+            assert!(!saver.ready(&boost, 100, |_| panic!(
+                "An unwritten ended episode needs no inventory"
+            )));
+        }
+    }
+    #[test]
+    fn recovered_boost_handoff_preserves_restart_proof_for_sleep_only_saver() {
+        let (mut saver, mut settings, mut readings, mut boost) = fixture();
+        let reading = &mut readings[0];
+        reading.serial = Some("TEST".into());
+        reading.container = Some("00112233445566778899aabbccddeeff".into());
+        let choices = LowBatteryMode {
+            polling_rate: None,
+            threshold: 20,
+            sleep_seconds: Some(60),
+        };
+        settings.device_mut(&reading.key).low_battery_mode = Some(choices);
+        settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(4000));
+        let sleep = crate::recovery::Record {
+            device: ConfigurationDevice::from_reading(reading),
+            stamp: ConnectionStamp::new(1).unwrap(),
+            rebound_stamp: None,
+            before: 300,
+            applied: 60,
+            layer: crate::recovery::Layer::SaverSleep(choices),
+            confirmed: true,
+            manual_pending: false,
+        };
+        let polling = crate::recovery::Record {
+            before: 1000,
+            applied: 4000,
+            layer: crate::recovery::Layer::BoostPolling,
+            ..sleep.clone()
+        };
+        assert!(saver.recover(&sleep, reading, &settings, 1));
+        assert!(boost.recover(&polling, reading, &settings, 1));
+        let wired = wired_reading(reading, 101);
+        saver.observe_provider("razer", &[wired], 101);
+        saver.coordinate_charging_boost("razer", &mut boost);
+        assert!(!boost.owns(&reading.key));
+        reading.timestamp = 102;
+        reading.level = Some(100);
+        saver.observe_provider("razer", &readings, 102);
+        let restore = saver.next(&settings, 1, &readings, 102, &boost).unwrap();
+        fail_restore(
+            &mut saver,
+            &restore,
+            false,
+            Some(4000),
+            ConnectionStamp::new(2),
+            true,
+        );
+        let entry = saver.entries.get_mut(&readings[0].key).unwrap();
+        assert_eq!(
+            entry.rate,
+            Setting::Active {
+                before: 1000,
+                applied: 4000
+            },
+            "A verified restart rebind must not lose the handed-off desktop original"
+        );
+        assert!(entry.restore_retry[0].after.is_some());
+        entry.restore_retry[0].after = Some(Instant::now() - Duration::from_secs(1));
+        let retry = saver.next(&settings, 1, &readings, 102, &boost).unwrap();
+        assert_eq!(retry.target().connection_stamp, ConnectionStamp::new(1));
+    }
+    #[test]
+    fn flattened_charging_recovery_requires_restart_proof_from_both_polling_layers() {
+        for saver_recovered in [false, true] {
+            for boost_recovered in [false, true] {
+                let (mut saver, mut settings, mut readings, mut boost) = fixture();
+                readings[0].serial = Some("TEST".into());
+                readings[0].container = Some("00112233445566778899aabbccddeeff".into());
+                let choices = settings
+                    .device(&readings[0].key)
+                    .unwrap()
+                    .low_battery_mode
+                    .unwrap();
+                settings.device_mut(&readings[0].key).fullscreen_boost_rate = Some(rate(4000));
+                let saver_record = crate::recovery::Record {
+                    device: ConfigurationDevice::from_reading(&readings[0]),
+                    stamp: ConnectionStamp::new(1).unwrap(),
+                    rebound_stamp: None,
+                    before: 1000,
+                    applied: 125,
+                    layer: crate::recovery::Layer::SaverPolling(choices),
+                    confirmed: true,
+                    manual_pending: false,
+                };
+                if saver_recovered {
+                    assert!(saver.recover(&saver_record, &readings[0], &settings, 1));
+                } else {
+                    activate(&mut saver, &settings, &readings, &boost);
+                }
+                if boost_recovered {
+                    let record = crate::recovery::Record {
+                        before: 125,
+                        applied: 4000,
+                        layer: crate::recovery::Layer::BoostPolling,
+                        ..saver_record
+                    };
+                    assert!(boost.recover(&record, &readings[0], &settings, 1));
+                } else {
+                    let now = Instant::now();
+                    boost.sample(now, Some(true));
+                    boost.sample(now + Duration::from_secs(10), Some(true));
+                    for value in [125, 4000] {
+                        let request = boost.next(&settings, 1, &readings).unwrap();
+                        assert!(boost.complete(&ControlOutcome {
+                            request: request.request,
+                            key: request.target.device.key.clone(),
+                            previous: Some(rate(125)),
+                            may_have_changed: request.action.rate().is_some(),
+                            failure: None,
+                            observation: Some(PollingObservation {
+                                target: ControlTarget {
+                                    connection_stamp: ConnectionStamp::new(1),
+                                    ..request.target
+                                },
+                                supported: vec![rate(125), rate(1000), rate(4000)],
+                                rate: Some(rate(value)),
+                                timestamp: 100,
+                                evidence: "test".into(),
+                            }),
+                        }));
+                    }
+                }
+                let wired = wired_reading(&readings[0], 101);
+                saver.observe_provider("razer", &[wired], 101);
+                saver.coordinate_charging_boost("razer", &mut boost);
+                readings[0].timestamp = 102;
+                readings[0].level = Some(100);
+                saver.observe_provider("razer", &readings, 102);
+                let restore = saver.next(&settings, 1, &readings, 102, &boost).unwrap();
+                fail_restore(
+                    &mut saver,
+                    &restore,
+                    false,
+                    Some(4000),
+                    ConnectionStamp::new(2),
+                    true,
+                );
+                let entry = &saver.entries[&readings[0].key];
+                assert_eq!(
+                    matches!(
+                        entry.rate,
+                        Setting::Active {
+                            before: 1000,
+                            applied: 4000
+                        }
+                    ),
+                    saver_recovered && boost_recovered
+                );
+                assert_eq!(
+                    entry.restore_retry[0].after.is_some(),
+                    saver_recovered && boost_recovered
+                );
+            }
+        }
+    }
+    #[test]
     fn sleep_only_saver_preserves_game_boost_restoration_during_usb_charging() {
         for scenario in 0..4 {
             let (mut saver, mut settings, mut readings, mut boost) = fixture();
@@ -1562,6 +2101,237 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+    #[test]
+    fn unwritten_restore_failures_keep_the_original_polling_rate_and_sleep_time() {
+        for sleep in [false, true] {
+            let (mut saver, settings, mut readings, boost) = fixture();
+            activate(&mut saver, &settings, &readings, &boost);
+            readings[0].level = Some(25);
+            if sleep {
+                let polling = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                complete(&mut saver, &polling, 1000);
+            }
+            let restore = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            match &restore {
+                Action::Polling(request) => {
+                    saver.polling_complete(&ControlOutcome::failed(
+                        request,
+                        "GET failed before SET",
+                    ));
+                }
+                Action::Sleep(request) => {
+                    saver
+                        .sleep_complete(&SleepOutcome::failed(request, "Recovery storage is busy"));
+                }
+            }
+            let entry = &saver.entries[&readings[0].key];
+            let (state, original, applied) = if sleep {
+                (entry.sleep, 300, 60)
+            } else {
+                (entry.rate, 1000, 125)
+            };
+            assert_eq!(
+                state,
+                Setting::Active {
+                    before: original,
+                    applied
+                },
+                "A pre-SET failure must not discard the original setting"
+            );
+            // A polling failure must still allow the independent sleep restore.
+            let next = saver.next(&settings, 1, &readings, 100, &boost);
+            if sleep {
+                assert!(next.is_none());
+            } else {
+                let next = next.unwrap();
+                assert!(matches!(next, Action::Sleep(_)));
+                complete(&mut saver, &next, 300);
+            }
+            assert!(!saver.ready(&boost, 100, |_| &readings));
+        }
+    }
+    #[test]
+    fn cancellation_does_not_hide_a_readback_that_revokes_ownership() {
+        for sleep in [false, true] {
+            let (mut saver, settings, readings, boost, action) = pending_restore(sleep);
+            saver.settings_changed();
+            fail_restore(
+                &mut saver,
+                &action,
+                false,
+                Some(if sleep { 300 } else { 1000 }),
+                ConnectionStamp::new(1),
+                true,
+            );
+            assert!(
+                !saver.needs_action(),
+                "A cancelled restore must respect a setting already restored elsewhere"
+            );
+            assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+        }
+    }
+    #[test]
+    fn restoration_backoff_is_bounded_monotonic_and_allocation_free_while_waiting() {
+        for sleep in [false, true] {
+            let (mut saver, settings, readings, boost, mut action) = pending_restore(sleep);
+            for (attempt, seconds) in [30, 60, 120, 300, 300].into_iter().enumerate() {
+                let started = Instant::now();
+                fail_restore(&mut saver, &action, false, None, None, true);
+                let retry = &saver.entries[&readings[0].key].restore_retry[usize::from(sleep)];
+                assert_eq!(retry.failures, (attempt as u8 + 1).min(4));
+                let deadline = retry.after.unwrap();
+                assert!(deadline >= started + Duration::from_secs(seconds));
+                assert!(deadline <= Instant::now() + Duration::from_secs(seconds));
+                let (_, allocations) = crate::allocation_counter::measure(|| {
+                    for now in [0, 100, 100_000, i64::MAX] {
+                        for _ in 0..250 {
+                            assert!(!saver.ready(&boost, now, |_| panic!(
+                                "Waiting must not resolve inventory"
+                            )));
+                        }
+                    }
+                });
+                assert_eq!(allocations.calls, 0);
+                assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+                saver
+                    .entries
+                    .get_mut(&readings[0].key)
+                    .unwrap()
+                    .restore_retry[usize::from(sleep)]
+                .after = Some(Instant::now() - Duration::from_secs(1));
+                action = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+                assert_eq!(action.target().connection_stamp, ConnectionStamp::new(1));
+                match &action {
+                    Action::Polling(request) => assert_eq!(
+                        request.action,
+                        ControlAction::ApplyIf {
+                            rate: rate(1000),
+                            expected: rate(125)
+                        }
+                    ),
+                    Action::Sleep(request) => {
+                        assert_eq!((request.seconds, request.expected), (Some(300), Some(60)))
+                    }
+                }
+            }
+            complete(&mut saver, &action, if sleep { 300 } else { 1000 });
+            assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+        }
+    }
+    #[test]
+    fn unsafe_restore_evidence_and_manual_changes_never_rearm_a_retry() {
+        for sleep in [false, true] {
+            for case in 0..6 {
+                let (mut saver, settings, readings, boost, action) = pending_restore(sleep);
+                if case == 3 {
+                    saver.manual(&ConfigurationDevice::from_reading(&readings[0]), sleep);
+                }
+                if case == 4 {
+                    saver.pending.as_mut().unwrap().action = match action.clone() {
+                        Action::Polling(mut request) => {
+                            request.target.connection_stamp = None;
+                            Action::Polling(request)
+                        }
+                        Action::Sleep(mut request) => {
+                            request.target.connection_stamp = None;
+                            Action::Sleep(request)
+                        }
+                    };
+                }
+                fail_restore(
+                    &mut saver,
+                    &action,
+                    case == 0,
+                    (case == 2).then_some(if sleep { 120 } else { 2000 }),
+                    ConnectionStamp::new(if case == 1 { 2 } else { 1 }),
+                    case != 5,
+                );
+                let entry = &saver.entries[&readings[0].key];
+                assert_eq!(
+                    if sleep { entry.sleep } else { entry.rate },
+                    Setting::Done,
+                    "unsafe restore case {case}"
+                );
+                assert!(!saver.needs_action());
+                assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+            }
+        }
+    }
+    #[test]
+    fn recovered_retry_keeps_the_original_connection_proof_after_a_verified_rebind() {
+        for sleep in [false, true] {
+            let (mut saver, settings, mut readings, boost) = fixture();
+            readings[0].serial = Some("TEST".into());
+            readings[0].container = Some("00112233445566778899aabbccddeeff".into());
+            readings[0].level = Some(100);
+            let choices = settings
+                .device(&readings[0].key)
+                .unwrap()
+                .low_battery_mode
+                .unwrap();
+            let record = crate::recovery::Record {
+                device: ConfigurationDevice::from_reading(&readings[0]),
+                stamp: ConnectionStamp::new(1).unwrap(),
+                rebound_stamp: None,
+                before: if sleep { 300 } else { 1000 },
+                applied: if sleep { 60 } else { 125 },
+                layer: if sleep {
+                    crate::recovery::Layer::SaverSleep(choices)
+                } else {
+                    crate::recovery::Layer::SaverPolling(choices)
+                },
+                confirmed: true,
+                manual_pending: false,
+            };
+            assert!(crate::recovery::strong_identity(&record.device));
+            assert!(saver.recover(&record, &readings[0], &settings, 1));
+            let action = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            fail_restore(
+                &mut saver,
+                &action,
+                false,
+                Some(if sleep { 60 } else { 125 }),
+                ConnectionStamp::new(2),
+                true,
+            );
+            let entry = saver.entries.get_mut(&readings[0].key).unwrap();
+            assert!(entry.restore_retry[usize::from(sleep)].after.is_some());
+            entry.restore_retry[usize::from(sleep)].after =
+                Some(Instant::now() - Duration::from_secs(1));
+            let retry = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+            assert_eq!(retry.target().connection_stamp, ConnectionStamp::new(1));
+        }
+    }
+    #[test]
+    fn waiting_restore_respects_new_games_reconnects_and_manual_choices() {
+        for case in 0..4 {
+            let (mut saver, mut settings, mut readings, mut boost, action) = pending_restore(false);
+            fail_restore(&mut saver, &action, false, None, None, true);
+            match case {
+                0 => saver.manual(&ConfigurationDevice::from_reading(&readings[0]), false),
+                1 => {
+                    readings[0].serial = Some("different-unit".into());
+                    saver.observe_provider("razer", &readings, 100);
+                }
+                2 => saver.observe_provider("razer", &[], 100),
+                _ => {
+                    settings.device_mut(&readings[0].key).fullscreen_boost_rate = Some(rate(2000));
+                    let now = Instant::now();
+                    boost.sample(now, Some(true));
+                    boost.sample(now + Duration::from_secs(10), Some(true));
+                    assert!(boost.next(&settings, 1, &readings).is_some());
+                }
+            }
+            saver
+                .entries
+                .get_mut(&readings[0].key)
+                .unwrap()
+                .restore_retry[0]
+                .after = Some(Instant::now() - Duration::from_secs(1));
+            assert!(!saver.ready(&boost, 100, |_| &readings));
+            assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
         }
     }
     #[test]

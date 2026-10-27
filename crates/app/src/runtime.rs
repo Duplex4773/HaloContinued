@@ -53,12 +53,14 @@ pub enum Command {
     Sleep(SleepRequest, u64, u64),
     Dpi(DpiRequest, u64, u64),
     DeviceInfo(Box<DeviceInfoRequest>, Arc<AtomicBool>, u64),
+    Hdr(Box<hb_windows::displays::HdrRequest>),
     SettingsChanged,
     EpochSuspend(u64),
     EpochResume(u64),
     Quit,
 }
 pub enum Event {
+    Hdr(Result<hb_windows::displays::HdrOutcome, ProviderError>),
     ConfigurationInventory {
         generation: u64,
         devices: Vec<ConfigurationDevice>,
@@ -146,6 +148,7 @@ fn battery_completion_current(
         && settings.enabled(completed.provider.id())
 }
 enum WorkerJob {
+    Hdr(Box<hb_windows::displays::HdrRequest>),
     DeviceInfo(Box<DeviceInfoRequest>, Arc<AtomicBool>, u64),
     Dpi(Box<DpiRequest>, Arc<AtomicBool>, u64, u64),
     Sleep(
@@ -167,6 +170,7 @@ enum WorkerJob {
     Configuration(Arc<ConfigurationWatch>, u64, u64),
 }
 enum WorkerCompleted {
+    Hdr(Result<hb_windows::displays::HdrOutcome, ProviderError>),
     DeviceInfo(Box<DeviceInfoOutcome>, u64),
     Dpi(Box<DpiOutcome>, u64, u64),
     Sleep(Box<SleepOutcome>, u64, u64, Option<Box<RecoveryReceipt>>),
@@ -749,11 +753,16 @@ fn gate_wait_cancelled(
     configuration: &ConfigurationWatch,
     permission: &ControlPermission,
 ) -> bool {
+    if matches!(job, WorkerJob::Hdr(_)) {
+        // Manual display controls are independent of battery monitoring/pause.
+        return shutdown.load(Ordering::Acquire);
+    }
     if shutdown.load(Ordering::Acquire) || permission.suspended.load(Ordering::Acquire) {
         return true;
     }
     let epoch = permission.epoch.load(Ordering::Acquire);
     match job {
+        WorkerJob::Hdr(_) => false,
         WorkerJob::Battery(job) => job.epoch != epoch,
         WorkerJob::DeviceInfo(_, cancel, visible) => {
             cancel.load(Ordering::Acquire) || !configuration.active(*visible)
@@ -781,6 +790,9 @@ fn gate_wait_cancelled(
 fn vendor_gate_busy(job: WorkerJob) -> WorkerCompleted {
     const MESSAGE: &str = "The device is busy. Try again shortly.";
     match job {
+        WorkerJob::Hdr(_) => WorkerCompleted::Hdr(Err(ProviderError::new(
+            "Display controls are busy. Try again shortly.",
+        ))),
         WorkerJob::Battery(job) => WorkerCompleted::BatteryGateBusy(job),
         WorkerJob::DeviceInfo(request, _, visible) => WorkerCompleted::DeviceInfo(
             Box::new(DeviceInfoOutcome::failed(&request, MESSAGE)),
@@ -949,6 +961,25 @@ impl Runtime {
                 Ordering::Acquire,
             );
         }
+    }
+    pub fn submit_hdr(
+        &self,
+        request: hb_windows::displays::HdrRequest,
+    ) -> Result<(), ProviderError> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(ProviderError::new(
+                "Halo Continued is closing. Restart it to change HDR.",
+            ));
+        }
+        self.commands
+            .try_send(Command::Hdr(Box::new(request)))
+            .map_err(|error| {
+                ProviderError::new(if matches!(error, TrySendError::Disconnected(_)) {
+                    "Display controls stopped. Restart Halo Continued."
+                } else {
+                    "Display controls are busy. Try again shortly."
+                })
+            })
     }
     pub fn configuration_visible(&self) -> bool {
         self.configuration.visible.load(Ordering::Acquire)
@@ -1277,6 +1308,7 @@ fn probe_polling_recovery(
     request: &mut ControlRequest,
     operation: &mut crate::recovery::Operation,
     access: &WorkerAccess,
+    evidence: &mut Option<PollingObservation>,
     read: impl FnOnce(&ControlRequest) -> ControlOutcome,
 ) -> Result<(), ProviderError> {
     if !needs_recovery_probe(operation) {
@@ -1305,6 +1337,9 @@ fn probe_polling_recovery(
     let rate = observation
         .rate
         .ok_or_else(|| ProviderError::new("The current polling rate could not be verified."))?;
+    // A mismatch deliberately aborts restoration. Preserve the verified GET
+    // even on that error so the owner can retire its original, not retry it.
+    *evidence = result.observation;
     reconcile_recovery_probe(access, operation, stamp, rate.hz())?;
     request.target.connection_stamp = Some(stamp);
     Ok(())
@@ -1314,6 +1349,7 @@ fn probe_sleep_recovery(
     request: &mut SleepRequest,
     operation: &mut crate::recovery::Operation,
     access: &WorkerAccess,
+    evidence: &mut Option<SleepOutcome>,
     read: impl FnOnce(&SleepRequest) -> SleepOutcome,
 ) -> Result<(), ProviderError> {
     if !needs_recovery_probe(operation) {
@@ -1339,6 +1375,7 @@ fn probe_sleep_recovery(
     let seconds = result
         .seconds
         .ok_or_else(|| ProviderError::new("The current sleep setting could not be verified."))?;
+    *evidence = Some(result);
     reconcile_recovery_probe(access, operation, stamp, u32::from(seconds))?;
     request.target.connection_stamp = Some(stamp);
     Ok(())
@@ -1595,6 +1632,7 @@ fn recover_available(
         // normal provider event is enough to retry; no recovery timer is added.
         return true;
     };
+    let mut adopted = false;
     for record in journal.pending_records(provider, readings, now) {
         let Some(reading) = readings
             .iter()
@@ -1614,9 +1652,23 @@ fn recover_available(
         };
         if accepted {
             journal.claimed(&record);
+            adopted = true;
         }
     }
-    journal.has_pending()
+    let pending = journal.has_pending();
+    drop(journal);
+    if adopted {
+        // These owners did not exist during the provider's first observation.
+        // Apply that same confirmed inventory before any control is scheduled,
+        // including charging and coordinated boost/saver ownership. This adds
+        // no discovery, timer or steady-state inventory pass.
+        context.saver.observe_provider(provider, readings, now);
+        context
+            .saver
+            .coordinate_charging_boost(provider, context.boost);
+        context.boost.observe_provider(provider, readings, now);
+    }
+    pending
 }
 
 fn rearm_recovery(
@@ -1710,6 +1762,7 @@ fn worker(
                 // It prevents interleaving shared-vendor protocols without locking
                 // individual opens (Logitech opens both long and short channels).
                 let vendors: BTreeSet<_> = match &job {
+                    WorkerJob::Hdr(_) => BTreeSet::new(),
                     WorkerJob::Battery(job) => hb_providers::catalog::DEVICES
                         .iter()
                         .filter(|d| d.provider == job.provider.id())
@@ -1763,6 +1816,12 @@ fn worker(
                     continue;
                 };
                 let completed = match job {
+                    WorkerJob::Hdr(request) => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            hb_windows::displays::set_hdr(&request, &cancel)
+                        })).unwrap_or_else(|_| Err(ProviderError::new("Windows couldn't finish the HDR change. Reopen Displays to check the setting.")));
+                        WorkerCompleted::Hdr(result)
+                    }
                     WorkerJob::DeviceInfo(request, request_cancel, visible) => {
                         let context = PollContext {
                             clock: &clock,
@@ -1867,9 +1926,10 @@ fn worker(
                         let allowed = recovery.as_ref()
                             .map(|op| recovery_operation(&access, op.clone()))
                             .unwrap_or(Ok(()));
+                        let mut recovery_evidence = None;
                         let allowed = allowed.and_then(|()| {
                             if let Some(operation) = recovery.as_mut() {
-                                probe_sleep_recovery(&mut request, operation, &access, |probe| {
+                                probe_sleep_recovery(&mut request, operation, &access, &mut recovery_evidence, |probe| {
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         hb_providers::sleep_controls::execute(probe, &transport, &context)
                                     })).unwrap_or_else(|_| SleepOutcome::failed(probe, "Sleep read failed."))
@@ -1896,6 +1956,13 @@ fn worker(
                                 o
                             })
                         };
+                        if !outcome.may_have_changed
+                            && outcome.seconds.is_none()
+                            && let Some(probe) = recovery_evidence
+                        {
+                            outcome.seconds = probe.seconds;
+                            outcome.connection_stamp = probe.connection_stamp;
+                        }
                         if let Some(finish) = recovery.as_ref()
                             .and_then(|op| finish_sleep_recovery(op, &outcome))
                         {
@@ -1926,9 +1993,10 @@ fn worker(
                         let allowed = recovery.as_ref()
                             .map(|op| recovery_operation(&access, op.clone()))
                             .unwrap_or(Ok(()));
+                        let mut recovery_evidence = None;
                         let allowed = allowed.and_then(|()| {
                             if let Some(operation) = recovery.as_mut() {
-                                probe_polling_recovery(&mut request, operation, &access, |probe| {
+                                probe_polling_recovery(&mut request, operation, &access, &mut recovery_evidence, |probe| {
                                     execute_control_inner(
                                         probe, &*hid, &clock, &cancel, &request_cancel,
                                         hb_windows::system::polling_apply_blocked(),
@@ -1962,6 +2030,9 @@ fn worker(
                                     .map(|epoch| (access.configuration.clone(), epoch)),
                             },
                         )};
+                        if !outcome.may_have_changed && outcome.observation.is_none() {
+                            outcome.observation = recovery_evidence;
+                        }
                         if let Some(finish) = recovery.as_ref()
                             .and_then(|op| finish_polling_recovery(op, &outcome))
                         {
@@ -3024,8 +3095,9 @@ fn finish_sleep_outcome(
     outcome.request & crate::battery_saver::REQUEST_BIT == 0 || owned
 }
 /// Revocation can arrive while the state owner is waiting for a completion,
-/// before its next settings acknowledgment. Preserve only pre-write ownership;
-/// the policy still requires its original connection proof before another SET.
+/// before its next settings acknowledgment. Cancel queued writes immediately;
+/// verified worker readbacks can still preserve originals. Any later SET must
+/// pass the current permission and original native connection checks.
 fn control_epoch_current(
     epoch: u64,
     current: u64,
@@ -3044,8 +3116,17 @@ fn finish_polling_outcome(
     saver: &mut crate::battery_saver::BatterySaver,
     outcome: &ControlOutcome,
 ) -> bool {
+    let external = boost.external_change(outcome);
     let boost_owned = boost.complete(outcome);
     let saver_owned = saver.polling_complete(outcome);
+    if let Some(observed) = external
+        && let Some(rate) = observed.rate
+    {
+        // A failed boost restore may reveal a manual rate that supersedes
+        // both polling layers. Keep independently owned sleep restoration.
+        // If the saver rate itself is still present, it keeps its original.
+        saver.observe_external_rate(&observed.target.device, rate);
+    }
     if outcome.request & crate::boost::REQUEST_BIT != 0 {
         boost_owned
     } else if outcome.request & crate::battery_saver::REQUEST_BIT != 0 {
@@ -3065,6 +3146,37 @@ fn validate_polling_completion(outcome: &mut ControlOutcome, generation: u64, pe
         outcome.failure =
             Some("Configuration permission or connection changed; refresh before retrying".into());
     }
+}
+fn finish_polling_completion(
+    boost: &mut crate::boost::Boost,
+    saver: &mut crate::battery_saver::BatterySaver,
+    outcome: &mut ControlOutcome,
+    generation: u64,
+    permitted: bool,
+) -> bool {
+    // Ownership uses the worker's exact, guarded readback. Clearing stale UI
+    // evidence first would hide a completed restore or discard a verified SET's
+    // original. Keeping ownership never authorizes a later write: that request
+    // must still pass current permission, native connection and value guards.
+    let publish = finish_polling_outcome(boost, saver, outcome);
+    validate_polling_completion(outcome, generation, permitted);
+    publish
+}
+fn finish_sleep_completion(
+    saver: &mut crate::battery_saver::BatterySaver,
+    outcome: &mut SleepOutcome,
+    generation: u64,
+    permitted: bool,
+) -> bool {
+    let publish = finish_sleep_outcome(saver, outcome);
+    if !permitted || outcome.generation != generation {
+        outcome.seconds = None;
+        outcome.failure = Some(
+            "Connection or permission changed; sleep setting is unknown. Refresh before retrying."
+                .into(),
+        );
+    }
+    publish
 }
 /// Session-scoped readback evidence, never restored from requested settings.
 struct UsageTracker {
@@ -3402,6 +3514,7 @@ fn run(
     providers.insert("bluetooth", Box::new(BluetoothProvider::default()));
     providers.insert("xinput", Box::new(ControllerProvider));
     let mut inflight = 0usize;
+    let mut hdr_busy = false;
     let mut due: BTreeMap<&str, Instant> =
         providers.keys().map(|id| (*id, Instant::now())).collect();
     let mut invalidated = BTreeSet::new();
@@ -3839,6 +3952,37 @@ fn run(
             estimator_dirty = true;
         }
         match work {
+            Work::Command(Ok(Command::Hdr(request))) => {
+                let failure = if simulate {
+                    Some("HDR changes are disabled in simulation.")
+                } else if stop || cancel.load(Ordering::Acquire) {
+                    Some("Halo Continued is closing.")
+                } else if hdr_busy {
+                    Some("An HDR change is already in progress.")
+                } else {
+                    None
+                };
+                if let Some(message) = failure {
+                    let _ = events.send(Event::Hdr(Err(ProviderError::new(message))));
+                } else {
+                    match jobs.try_send(WorkerJob::Hdr(request)) {
+                        Ok(()) => {
+                            hdr_busy = true;
+                            inflight += 1;
+                        }
+                        Err(_) => {
+                            let _ = events.send(Event::Hdr(Err(ProviderError::new(
+                                "Display controls are busy. Try again shortly.",
+                            ))));
+                        }
+                    }
+                }
+            }
+            Work::Completed(Ok(WorkerCompleted::Hdr(result))) => {
+                inflight = inflight.saturating_sub(1);
+                hdr_busy = false;
+                let _ = events.send(Event::Hdr(result));
+            }
             Work::Command(Ok(Command::ReleaseHistoryCache)) => {
                 // Preserve FIFO ordering behind any already accepted history
                 // query, including when the bounded storage queue is full.
@@ -4343,22 +4487,19 @@ fn run(
                     &mut saver,
                     &mut boost,
                 );
-                if !control_epoch_current(
+                let permitted = control_epoch_current(
                     epoch,
                     permission.epoch.load(Ordering::Acquire),
                     &mut boost,
                     &mut saver,
-                ) || !permission.enabled.load(Ordering::Acquire)
-                    || !permission.desired_enabled.load(Ordering::Acquire)
-                    || suspended
-                    || stop
-                    || (visible != crate::battery_saver::BACKGROUND
-                        && !configuration.active(visible))
-                    || outcome.generation != hid.generation()
-                {
-                    outcome.seconds = None;
-                    outcome.failure=Some("Connection or permission changed; sleep setting is unknown. Refresh before retrying.".into());
-                }
+                ) && permission.enabled.load(Ordering::Acquire)
+                    && permission.desired_enabled.load(Ordering::Acquire)
+                    && !suspended
+                    && !stop
+                    && (visible == crate::battery_saver::BACKGROUND
+                        || configuration.active(visible));
+                let publish =
+                    finish_sleep_completion(&mut saver, &mut outcome, hid.generation(), permitted);
                 if visible != crate::battery_saver::BACKGROUND
                     && outcome.failure.is_some()
                     && !outcome.may_have_changed
@@ -4371,7 +4512,6 @@ fn run(
                         &mut deferred_recovery_rearms,
                     );
                 }
-                let publish = finish_sleep_outcome(&mut saver, &outcome);
                 saver_dirty = true;
                 if publish {
                     let _ = events.send(Event::Sleep(outcome));
@@ -4585,7 +4725,13 @@ fn run(
                     && !suspended
                     && !stop
                     && configuration_epoch.is_none_or(|epoch| configuration.active(epoch));
-                validate_polling_completion(&mut outcome, hid.generation(), permitted);
+                let publish = finish_polling_completion(
+                    &mut boost,
+                    &mut saver,
+                    &mut outcome,
+                    hid.generation(),
+                    permitted,
+                );
                 if outcome.request
                     & ((1 << 63) | crate::boost::REQUEST_BIT | crate::battery_saver::REQUEST_BIT)
                     == 0
@@ -4625,7 +4771,6 @@ fn run(
                 if let Some(activity) = usage_tracker.take_activity(&outcome) {
                     let _ = storage.send(Storage::PollingActivity(activity));
                 }
-                let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                 saver_dirty = true;
                 startup_polling.reads.complete(&outcome, Instant::now());
                 if publish {
@@ -4753,6 +4898,489 @@ mod tests {
         (folder, reading, settings, record, journal)
     }
 
+    #[test]
+    fn restarted_boost_keeps_durable_original_after_unwritten_restore_failure() {
+        use crate::recovery::{Journal, Layer};
+        let (folder, reading, mut settings, record, journal) =
+            recovery_audit_fixture(Layer::BoostPolling, 1000, 4000);
+        settings.device_mut(&reading.key).fullscreen_boost_rate = PollingRate::try_from(4000).ok();
+        let now = Instant::now();
+        let mut boost = crate::boost::Boost::new(now);
+        let mut saver = crate::battery_saver::BatterySaver::default();
+        assert!(!recover_available(
+            &journal,
+            "razer",
+            std::slice::from_ref(&reading),
+            100,
+            RecoveryContext {
+                settings: &settings,
+                generation: 1,
+                saver: &mut saver,
+                boost: &mut boost
+            }
+        ));
+        boost.sample(now, Some(false));
+        boost.sample(now + Duration::from_secs(15), Some(false));
+        let restore = boost
+            .next(&settings, 1, std::slice::from_ref(&reading))
+            .unwrap();
+        assert!(finish_polling_outcome(
+            &mut boost,
+            &mut saver,
+            &ControlOutcome::failed(&restore, "Recovery storage is busy.")
+        ));
+        for tick in 1..=6 {
+            boost.sample(now + Duration::from_secs(15 + tick * 5), Some(false));
+        }
+        let retry = boost
+            .next(&settings, 1, std::slice::from_ref(&reading))
+            .unwrap();
+        assert_eq!(
+            retry.action,
+            ControlAction::ApplyIf {
+                rate: PollingRate::try_from(1000).unwrap(),
+                expected: PollingRate::try_from(4000).unwrap()
+            }
+        );
+        assert_eq!(retry.target.connection_stamp, Some(record.stamp));
+        // A restart can verify/rebind the receiver, then encounter a transient
+        // GET failure before SET. Retain the original journal authorization;
+        // the next worker must verify the current connection again.
+        journal
+            .lock()
+            .unwrap()
+            .execute(crate::recovery::Operation::Rebind {
+                device: record.device.clone(),
+                old_stamp: record.stamp,
+                new_stamp: ConnectionStamp::new(2).unwrap(),
+                kind: crate::recovery::SettingKind::Polling,
+                expected: 4000,
+                desired: 1000,
+            })
+            .unwrap();
+        let mut failed = ControlOutcome::failed(&retry, "GET failed before SET after restart");
+        failed.observation = Some(PollingObservation {
+            target: ControlTarget {
+                connection_stamp: ConnectionStamp::new(2),
+                ..retry.target.clone()
+            },
+            rate: PollingRate::try_from(4000).ok(),
+            supported: vec![
+                PollingRate::try_from(1000).unwrap(),
+                PollingRate::try_from(4000).unwrap(),
+            ],
+            timestamp: 100,
+            evidence: "test".into(),
+        });
+        assert!(finish_polling_outcome(&mut boost, &mut saver, &failed));
+        assert!(boost.owns(&reading.key));
+        for tick in 1..=12 {
+            boost.sample(now + Duration::from_secs(45 + tick * 5), Some(false));
+        }
+        let retried = boost
+            .next(&settings, 1, std::slice::from_ref(&reading))
+            .unwrap();
+        assert_eq!(retried.target.connection_stamp, Some(record.stamp));
+        assert_eq!(retried.action, retry.action);
+        let persisted = Journal::open(folder.path());
+        let original = persisted.pending_records("razer", std::slice::from_ref(&reading), 100);
+        assert_eq!(original.len(), 1);
+        assert_eq!((original[0].before, original[0].applied), (1000, 4000));
+    }
+    #[test]
+    fn an_external_boost_readback_reconciles_only_the_underlying_polling_owner() {
+        use crate::battery_saver::Action;
+        use hb_core::settings::LowBatteryMode;
+        for actual in [125, 1000, 2000] {
+            let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+            reading.kind = "mouse".into();
+            reading.via = "usb".into();
+            reading.level = Some(10);
+            reading.charging = Some(false);
+            let mut settings = Settings {
+                polling_controls: true,
+                ..Default::default()
+            };
+            let preference = settings.device_mut(&reading.key);
+            preference.low_battery_mode = Some(LowBatteryMode {
+                threshold: 20,
+                polling_rate: PollingRate::try_from(125).ok(),
+                sleep_seconds: Some(60),
+            });
+            preference.fullscreen_boost_rate = PollingRate::try_from(4000).ok();
+            let now = Instant::now();
+            let mut boost = crate::boost::Boost::new(now);
+            let mut saver = crate::battery_saver::BatterySaver::default();
+            let mut hardware = PollingRate::try_from(1000).unwrap();
+            for value in [1000, 125, 300, 60] {
+                match saver
+                    .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                    .unwrap()
+                {
+                    Action::Polling(request) => {
+                        assert!(saver.polling_complete(&simulate_control(
+                            &request,
+                            &mut hardware,
+                            1,
+                            100
+                        )));
+                    }
+                    Action::Sleep(request) => {
+                        assert!(saver.sleep_complete(&SleepOutcome {
+                            request: request.request,
+                            key: reading.key.clone(),
+                            generation: 1,
+                            connection_stamp: ConnectionStamp::new(1),
+                            seconds: Some(value),
+                            may_have_changed: request.seconds.is_some(),
+                            failure: None,
+                        }));
+                    }
+                }
+            }
+            boost.sample(now, Some(true));
+            boost.sample(now + Duration::from_secs(10), Some(true));
+            for _ in 0..2 {
+                let request = boost
+                    .next(&settings, 1, std::slice::from_ref(&reading))
+                    .unwrap();
+                assert!(boost.complete(&simulate_control(&request, &mut hardware, 1, 100)));
+            }
+            reading.level = Some(100);
+            saver.observe(&settings, 1, std::slice::from_ref(&reading), 100);
+            boost.sample(now + Duration::from_secs(30), Some(false));
+            boost.sample(now + Duration::from_secs(45), Some(false));
+            let restore = boost
+                .next(&settings, 1, std::slice::from_ref(&reading))
+                .unwrap();
+            let mut probe = restore.clone();
+            probe.action = ControlAction::Read;
+            hardware = PollingRate::try_from(actual).unwrap();
+            let mut outcome = simulate_control(&probe, &mut hardware, 1, 100);
+            outcome.failure = Some("The setting changed elsewhere".into());
+            assert!(finish_polling_outcome(&mut boost, &mut saver, &outcome));
+            assert!(!boost.owns(&reading.key));
+            let next = saver
+                .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                .unwrap();
+            let sleep = if actual == 125 {
+                let Action::Polling(request) = next else {
+                    panic!("The saver still owns 125 Hz")
+                };
+                assert_eq!(request.action.rate().unwrap().hz(), 1000);
+                assert!(saver.polling_complete(&simulate_control(&request, &mut hardware, 1, 100)));
+                saver
+                    .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                    .unwrap()
+            } else {
+                assert!(
+                    matches!(next, Action::Sleep(_)),
+                    "A manual rate must retire every superseded polling layer"
+                );
+                next
+            };
+            assert!(
+                matches!(sleep, Action::Sleep(ref request) if request.seconds == Some(300) && request.expected == Some(60))
+            );
+            assert_eq!(hardware.hz(), if actual == 125 { 1000 } else { actual });
+        }
+    }
+    #[test]
+    fn startup_recovery_honours_charging_in_its_first_inventory() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(125).ok(),
+            sleep_seconds: None,
+        };
+        for boosting in [false, true] {
+            let (layer, before, applied) = if boosting {
+                (Layer::BoostPolling, 1000, 4000)
+            } else {
+                (Layer::SaverPolling(mode), 1000, 125)
+            };
+            let (_folder, reading, settings, _record, journal) =
+                recovery_audit_fixture(layer, before, applied);
+            let mut wired = reading.clone();
+            wired.key = "razer:00be:AUDIT".into();
+            wired.container = Some("WIRED-COLLECTION".into());
+            wired.charging = Some(true);
+            let readings = [reading.clone(), wired];
+            let now = Instant::now();
+            let mut boost = crate::boost::Boost::new(now);
+            let mut saver = crate::battery_saver::BatterySaver::default();
+            assert!(!recover_available(
+                &journal,
+                "razer",
+                &readings,
+                100,
+                RecoveryContext {
+                    settings: &settings,
+                    generation: 1,
+                    saver: &mut saver,
+                    boost: &mut boost,
+                }
+            ));
+            boost.sample(now, Some(false));
+            boost.sample(now + Duration::from_secs(15), Some(false));
+            assert!(
+                !boost.ready(&settings, |_| &readings),
+                "A recovered boost must wait for wireless mode"
+            );
+            assert!(
+                !saver.ready(&boost, 100, |_| &readings),
+                "A recovered saver must wait for wireless mode"
+            );
+            assert!(boost.next(&settings, 1, &readings).is_none());
+            assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+            let mut returned = reading;
+            returned.timestamp = 102;
+            let wireless = std::slice::from_ref(&returned);
+            saver.observe_provider("razer", wireless, 102);
+            saver.coordinate_charging_boost("razer", &mut boost);
+            boost.observe_provider("razer", wireless, 102);
+            let target = if boosting {
+                boost.next(&settings, 1, wireless).unwrap().target
+            } else {
+                match saver.next(&settings, 1, wireless, 102, &boost).unwrap() {
+                    crate::battery_saver::Action::Polling(request) => request.target,
+                    _ => panic!("Expected polling restoration"),
+                }
+            };
+            assert_eq!(target.connection_stamp, ConnectionStamp::new(1));
+        }
+    }
+    #[test]
+    fn startup_recovery_does_not_confuse_another_mouse_with_its_charging_alias() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(125).ok(),
+            sleep_seconds: None,
+        };
+        for boosting in [false, true] {
+            let layer = if boosting {
+                Layer::BoostPolling
+            } else {
+                Layer::SaverPolling(mode)
+            };
+            let (_folder, reading, settings, _record, journal) =
+                recovery_audit_fixture(layer, 1000, if boosting { 4000 } else { 125 });
+            let mut other = reading.clone();
+            other.key = "razer:00be:OTHER".into();
+            other.serial = Some("OTHER".into());
+            other.container = Some("OTHER-COLLECTION".into());
+            other.charging = Some(true);
+            let readings = [reading.clone(), other];
+            let now = Instant::now();
+            let mut boost = crate::boost::Boost::new(now);
+            let mut saver = crate::battery_saver::BatterySaver::default();
+            assert!(!recover_available(
+                &journal,
+                "razer",
+                &readings,
+                100,
+                RecoveryContext {
+                    settings: &settings,
+                    generation: 1,
+                    saver: &mut saver,
+                    boost: &mut boost,
+                }
+            ));
+            boost.sample(now, Some(false));
+            boost.sample(now + Duration::from_secs(15), Some(false));
+            let target = if boosting {
+                boost.next(&settings, 1, &readings).unwrap().target
+            } else {
+                match saver.next(&settings, 1, &readings, 100, &boost).unwrap() {
+                    crate::battery_saver::Action::Polling(request) => request.target,
+                    _ => panic!("Expected polling restoration"),
+                }
+            };
+            assert_eq!(target.device.key, reading.key);
+            assert_eq!(target.connection_stamp, ConnectionStamp::new(1));
+        }
+    }
+    #[test]
+    fn stale_display_evidence_does_not_hide_an_already_restored_setting() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(125).ok(),
+            sleep_seconds: Some(60),
+        };
+        for kind in 0..3 {
+            let (layer, before, applied) = match kind {
+                0 => (Layer::BoostPolling, 1000, 4000),
+                1 => (Layer::SaverPolling(mode), 1000, 125),
+                _ => (Layer::SaverSleep(mode), 300, 60),
+            };
+            let (_folder, reading, settings, _record, journal) =
+                recovery_audit_fixture(layer, before, applied);
+            let now = Instant::now();
+            let mut boost = crate::boost::Boost::new(now);
+            let mut saver = crate::battery_saver::BatterySaver::default();
+            assert!(!recover_available(
+                &journal,
+                "razer",
+                std::slice::from_ref(&reading),
+                100,
+                RecoveryContext {
+                    settings: &settings,
+                    generation: 1,
+                    saver: &mut saver,
+                    boost: &mut boost,
+                }
+            ));
+            boost.sample(now, Some(false));
+            boost.sample(now + Duration::from_secs(15), Some(false));
+            if kind == 2 {
+                let crate::battery_saver::Action::Sleep(request) = saver
+                    .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                    .unwrap()
+                else {
+                    panic!("Expected sleep restore")
+                };
+                let mut outcome = SleepOutcome::failed(&request, "Already restored elsewhere");
+                outcome.seconds = Some(before as u16);
+                outcome.connection_stamp = ConnectionStamp::new(1);
+                assert!(!control_epoch_current(1, 2, &mut boost, &mut saver));
+                assert!(finish_sleep_completion(&mut saver, &mut outcome, 1, false));
+                assert!(outcome.seconds.is_none() && outcome.failure.is_some());
+            } else {
+                let request = if kind == 0 {
+                    boost
+                        .next(&settings, 1, std::slice::from_ref(&reading))
+                        .unwrap()
+                } else {
+                    match saver
+                        .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                        .unwrap()
+                    {
+                        crate::battery_saver::Action::Polling(request) => request,
+                        _ => panic!("Expected polling restore"),
+                    }
+                };
+                let mut probe = request.clone();
+                probe.action = ControlAction::Read;
+                let mut hardware = PollingRate::try_from(before).unwrap();
+                let mut outcome = simulate_control(&probe, &mut hardware, 1, 100);
+                outcome.failure = Some("Already restored elsewhere".into());
+                assert!(!control_epoch_current(1, 2, &mut boost, &mut saver));
+                assert!(finish_polling_completion(
+                    &mut boost,
+                    &mut saver,
+                    &mut outcome,
+                    1,
+                    false
+                ));
+                assert!(outcome.observation.is_none() && outcome.failure.is_some());
+            }
+            assert!(
+                !boost.owns(&reading.key),
+                "Stale UI evidence must not strand boost ownership"
+            );
+            assert!(
+                saver
+                    .next(&settings, 1, std::slice::from_ref(&reading), 100, &boost)
+                    .is_none(),
+                "An already restored setting must retire its old saver owner"
+            );
+        }
+    }
+    #[test]
+    fn verified_late_boost_original_survives_a_restart_before_restoration() {
+        use crate::recovery::{Journal, Operation};
+        let folder = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut reading = Reading::new("razer:00bf:TEST", "Mouse", "razer", 100);
+        reading.kind = "mouse".into();
+        reading.via = "usb".into();
+        reading.serial = Some("TEST".into());
+        reading.container = Some("00112233445566778899aabbccddeeff".into());
+        let mut settings = Settings {
+            polling_controls: true,
+            ..Default::default()
+        };
+        settings.device_mut(&reading.key).fullscreen_boost_rate = PollingRate::try_from(4000).ok();
+        let mut boost = crate::boost::Boost::new(now);
+        let mut saver = crate::battery_saver::BatterySaver::default();
+        let mut hardware = PollingRate::try_from(1000).unwrap();
+        boost.sample(now, Some(true));
+        boost.sample(now + Duration::from_secs(10), Some(true));
+        let read = boost
+            .next(&settings, 1, std::slice::from_ref(&reading))
+            .unwrap();
+        assert!(boost.complete(&simulate_control(&read, &mut hardware, 1, 100)));
+        let apply = boost
+            .next(&settings, 1, std::slice::from_ref(&reading))
+            .unwrap();
+        let operation =
+            polling_recovery_operation(&apply, boost.guard(apply.request).as_ref(), false, None)
+                .unwrap();
+        let mut journal = Journal::open(folder.path());
+        journal.execute(operation.clone()).unwrap();
+        let mut outcome = simulate_control(&apply, &mut hardware, 1, 100);
+        assert!(outcome.failure.is_none());
+        let confirm = finish_polling_recovery(&operation, &outcome).unwrap();
+        assert!(matches!(confirm, Operation::Confirm(_)));
+        journal.execute(confirm).unwrap();
+        boost.observe_generation(2);
+        assert!(!control_epoch_current(1, 2, &mut boost, &mut saver));
+        assert!(finish_polling_completion(
+            &mut boost,
+            &mut saver,
+            &mut outcome,
+            2,
+            false
+        ));
+        assert!(outcome.observation.is_none());
+        boost.sample(now + Duration::from_secs(30), Some(false));
+        boost.sample(now + Duration::from_secs(45), Some(false));
+        let planned = boost
+            .next(&settings, 2, std::slice::from_ref(&reading))
+            .unwrap();
+        drop(journal);
+        // Crash before sending restoration: a fresh process has only the file.
+        let journal = Arc::new(Mutex::new(Journal::open(folder.path())));
+        let mut boost = crate::boost::Boost::new(now + Duration::from_secs(60));
+        let mut saver = crate::battery_saver::BatterySaver::default();
+        assert!(!recover_available(
+            &journal,
+            "razer",
+            std::slice::from_ref(&reading),
+            100,
+            RecoveryContext {
+                settings: &settings,
+                generation: 3,
+                saver: &mut saver,
+                boost: &mut boost,
+            }
+        ));
+        boost.sample(now + Duration::from_secs(60), Some(false));
+        boost.sample(now + Duration::from_secs(75), Some(false));
+        let recovered = boost
+            .next(&settings, 3, std::slice::from_ref(&reading))
+            .unwrap();
+        assert_eq!(recovered.action, planned.action);
+        assert_eq!(recovered.action.rate().unwrap().hz(), 1000);
+        assert_eq!(recovered.action.expected().unwrap().hz(), 4000);
+        assert_eq!(recovered.target.connection_stamp, ConnectionStamp::new(1));
+        let validation = polling_recovery_operation(
+            &recovered,
+            boost.guard(recovered.request).as_ref(),
+            false,
+            None,
+        )
+        .unwrap();
+        journal.lock().unwrap().execute(validation.clone()).unwrap();
+        assert!(needs_recovery_probe(&validation));
+        assert_eq!(
+            hardware.hz(),
+            4000,
+            "Planning/recovery must not write hardware"
+        );
+    }
     #[test]
     fn rearmed_owned_recovery_settles_without_replacing_original_settings() {
         use crate::recovery::Layer;
@@ -5382,18 +6010,28 @@ mod tests {
             recovery_operation(&access, operation.clone()).unwrap();
             let mut hardware =
                 PollingRate::try_from(if changed_elsewhere { 2000 } else { 125 }).unwrap();
-            let result = probe_polling_recovery(&mut request, &mut operation, &access, |probe| {
-                assert_eq!(probe.action, ControlAction::Read);
-                assert!(probe.target.connection_stamp.is_none());
-                let mut outcome = simulate_control(probe, &mut hardware, 2, 100);
-                outcome
-                    .observation
-                    .as_mut()
-                    .unwrap()
-                    .target
-                    .connection_stamp = ConnectionStamp::new(2);
-                outcome
-            });
+            let mut evidence = None;
+            let result = probe_polling_recovery(
+                &mut request,
+                &mut operation,
+                &access,
+                &mut evidence,
+                |probe| {
+                    assert_eq!(probe.action, ControlAction::Read);
+                    assert!(probe.target.connection_stamp.is_none());
+                    let mut outcome = simulate_control(probe, &mut hardware, 2, 100);
+                    outcome
+                        .observation
+                        .as_mut()
+                        .unwrap()
+                        .target
+                        .connection_stamp = ConnectionStamp::new(2);
+                    outcome
+                },
+            );
+            let observed = evidence.unwrap();
+            assert_eq!(observed.rate, Some(hardware));
+            assert_eq!(observed.target.connection_stamp, ConnectionStamp::new(2));
             if changed_elsewhere {
                 assert!(result.is_err());
                 assert_eq!(hardware.hz(), 2000);
@@ -5476,19 +6114,29 @@ mod tests {
             let mut operation =
                 sleep_recovery_operation(&request, true, Some((true, mode))).unwrap();
             recovery_operation(&access, operation.clone()).unwrap();
-            let result = probe_sleep_recovery(&mut request, &mut operation, &access, |probe| {
-                assert!(probe.seconds.is_none() && probe.expected.is_none());
-                assert!(probe.target.connection_stamp.is_none());
-                SleepOutcome {
-                    request: probe.request,
-                    key: probe.target.device.key.clone(),
-                    generation: 2,
-                    connection_stamp: ConnectionStamp::new(2),
-                    seconds: Some(actual),
-                    may_have_changed: false,
-                    failure: None,
-                }
-            });
+            let mut evidence = None;
+            let result = probe_sleep_recovery(
+                &mut request,
+                &mut operation,
+                &access,
+                &mut evidence,
+                |probe| {
+                    assert!(probe.seconds.is_none() && probe.expected.is_none());
+                    assert!(probe.target.connection_stamp.is_none());
+                    SleepOutcome {
+                        request: probe.request,
+                        key: probe.target.device.key.clone(),
+                        generation: 2,
+                        connection_stamp: ConnectionStamp::new(2),
+                        seconds: Some(actual),
+                        may_have_changed: false,
+                        failure: None,
+                    }
+                },
+            );
+            let observed = evidence.unwrap();
+            assert_eq!(observed.seconds, Some(actual));
+            assert_eq!(observed.connection_stamp, ConnectionStamp::new(2));
             if actual == 60 {
                 result.unwrap();
                 assert_eq!(request.target.connection_stamp, ConnectionStamp::new(2));

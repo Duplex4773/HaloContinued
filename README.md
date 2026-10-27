@@ -31,6 +31,9 @@ reflect counter resolution or run-to-run variation; actual usage varies.
 Local build: **1.1.0**, with a native device overview, device cards, focused
 control tabs and a refreshed tray menu. The redesign adds no background timers
 or device queries. Device info reads firmware only when opened or refreshed.
+The tray menu also includes **Displays**, with a separate HDR switch for each
+supported monitor. Display state is read only when the menu opens; changes use
+Windows' own per-display HDR controls. No HDR setting is reapplied at startup.
 This build also preserves rapid history transitions, combines repeated graph
 requests, avoids connection checks for Bluetooth devices with no battery data,
 and records battery-saver changes separately in Insights. Short Time used graphs
@@ -72,12 +75,14 @@ and richer battery insights. It is maintained by
 
 The dashboard uses native Windows controls. The portable executable includes its
 runtime dependencies, and supported device controls work without installing a
-vendor suite. Hardware changes are optional and disabled by default.
+vendor suite. Mouse and keyboard hardware controls are optional and disabled by
+default. Display HDR changes are made only when you select them.
 
 ## What you can do
 
 | Feature | What it offers |
 | --- | --- |
+| Display HDR | Right-click any tray icon, choose **Displays**, then select a monitor to switch HDR on or off. Checkmarks show the current Windows HDR setting. Unsupported or duplicated displays are disabled; Windows must expose its HDR-specific controls. No background display polling. |
 | Battery monitoring | A tray icon for each battery-powered device, charging animation, warning colours, low-battery and full-charge notifications, and optional alert sounds. |
 | Disconnected devices | Optionally keep disconnected device icons greyed with their last battery level until the app exits. |
 | Polling rates | Read and change supported mouse and keyboard rates. Supported mice show the last confirmed rate on hover and offer rate selection in the tray menu. |

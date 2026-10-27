@@ -40,6 +40,8 @@ const PAGE_FOOTER: i32 = 62;
 mod device_information;
 #[path = "device_overview.rs"]
 mod device_overview;
+#[path = "display_menu.rs"]
+mod display_menu;
 use device_information::DeviceInfoUi;
 const ICON_CHOICES: &[&str] = &[
     "Automatic",
@@ -172,6 +174,9 @@ fn dpi_input(text: &str, limits: Option<&DpiLimits>) -> Result<DpiValue, String>
     Ok(DpiValue::uniform(value))
 }
 fn user_message(message: &str) -> &str {
+    if let Some(detail) = message.strip_prefix("HDR: ") {
+        return detail;
+    }
     if message.is_empty()
         || message.starts_with("Enter ")
         || message.starts_with("Low battery alert ")
@@ -1428,6 +1433,7 @@ struct State {
     history_resize: HistoryResize,
     request: u64,
     history_pending: Option<u64>,
+    hdr_pending: bool,
     history_cache_active: bool,
     history_queued: Option<Box<Command>>,
     taskbar: u32,
@@ -1641,6 +1647,7 @@ pub fn run(
                 history_resize: HistoryResize::default(),
                 request: 0,
                 history_pending: None,
+                hdr_pending: false,
                 history_cache_active: false,
                 history_queued: None,
                 taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
@@ -3018,6 +3025,16 @@ impl State {
             }
         }
     }
+    /// Rebuild a selected page in an existing dashboard. New dashboards are
+    /// already built by open(), so tray navigation must not build/query twice.
+    fn open_page(&mut self) -> bool {
+        let existing = self.dashboard.is_some_and(|h| self.owns_dashboard(h));
+        self.open();
+        if existing {
+            self.build();
+        }
+        existing
+    }
     fn build(&mut self) {
         let Some(hwnd) = self.dashboard else {
             return;
@@ -4384,13 +4401,11 @@ impl State {
                 self.keep_focus_visible();
             }
             503 => {
-                let was_open = self.dashboard.is_some();
                 self.page = 1;
                 self.device_section = 0;
                 self.page_scroll = 0;
                 self.configuration_visibility();
-                self.open();
-                self.build();
+                let was_open = self.open_page();
                 if was_open && self.polling.pending.is_none() {
                     self.read_polling();
                 }
@@ -4400,29 +4415,25 @@ impl State {
                 self.device_section = if id == 508 { 1 } else { 3 };
                 self.page_scroll = 0;
                 self.configuration_visibility();
-                self.open();
-                self.build();
+                self.open_page();
             }
             509 => {
                 self.page = 3;
                 self.page_scroll = 0;
                 self.configuration_visibility();
-                self.open();
-                self.build();
+                self.open_page();
             }
             506 => {
                 self.page = 6;
                 self.page_scroll = 0;
                 self.configuration_visibility();
-                self.open();
-                self.build();
+                self.open_page();
                 self.query_insights();
             }
             504 => {
                 self.page = 2;
                 self.configuration_visibility();
-                self.open();
-                self.build();
+                self.open_page();
             }
             505 => {
                 if let Some(d) = self.snapshot.devices.get(self.selected) {
@@ -4440,11 +4451,9 @@ impl State {
                     return;
                 };
                 self.select_tray_device(&key);
-                let was_open = self.dashboard.is_some();
                 self.page = 1;
                 self.configuration_visibility();
-                self.open();
-                self.build();
+                let was_open = self.open_page();
                 if was_open && self.polling.pending.is_none() {
                     self.read_polling();
                 }
@@ -5674,6 +5683,7 @@ impl State {
         let mut polling_selection_changed = false;
         while let Ok(e) = self.runtime.events.try_recv() {
             match e {
+                Event::Hdr(result) => self.hdr_outcome(result),
                 Event::Snapshot(s) => {
                     latest = Some(s);
                     heartbeat = None;
@@ -5925,6 +5935,16 @@ impl State {
                     }
                 }
             }
+            if self.dashboard.is_some()
+                && self.page == 2
+                && battery_identity_changed
+                && !identity_changed
+            {
+                // A physical replacement can reuse a key without changing the
+                // selector rows. Clear the old chart and retire its in-flight
+                // request just as a normal selection rebuild would.
+                self.query();
+            }
             if self.page == 6 && (battery_selection_changed || battery_identity_changed) {
                 self.render_insights();
                 self.query_insights();
@@ -6175,6 +6195,7 @@ impl State {
             }
             let boost_choices = self.prepare_overview_menu(menu.0, key.as_deref());
             let configuration_choices = self.append_configuration_menu(menu.0, key.as_deref());
+            let display_choices = self.append_display_menu(menu.0);
             let palette = Palette::new(
                 hb_windows::system::dashboard_dark_theme(),
                 hb_windows::system::high_contrast(),
@@ -6200,7 +6221,14 @@ impl State {
             // Destroy the native menu before releasing the brush it references.
             drop(menu);
             (*self.context).popup.take();
-            if let Some(choice) = choices
+            if let Some(choice) = display_choices
+                .iter()
+                .find(|choice| choice.id == chosen.0 as u16 && choice.enabled && choice.id != 0)
+            {
+                if let Some(request) = &choice.request {
+                    self.change_hdr(request.clone());
+                }
+            } else if let Some(choice) = choices
                 .iter()
                 .find(|choice| choice.id == chosen.0 as u16 && choice.enabled && choice.id != 0)
             {
@@ -9513,6 +9541,58 @@ mod dashboard_lifecycle_tests {
             exercise_native_dashboard(restore);
         }
     }
+    fn exercise_history_identity(state: &mut State) {
+        let snapshot = state.snapshot.clone();
+        let selected = state.selected;
+        let selected_device = state.selected_device.clone();
+        let mut reading = Reading::new("history:shared-key", "Test mouse", "simulation", 100);
+        reading.serial = Some("original-unit".into());
+        reading.level = Some(70);
+        state.snapshot.devices = vec![DeviceView {
+            reading: reading.clone(),
+            name: reading.name.clone(),
+            icon: "mouse".into(),
+            low_alert_at: 20,
+            seconds_left: None,
+            text: "Test mouse: 70%".into(),
+            hidden: false,
+        }];
+        state.selected = 0;
+        state.selected_device = Some(reading.key.clone());
+        state.page = 2;
+        state.build();
+        let old_request = state.request;
+        let original_chart = HistorySeries::calendar(vec![reading], 0, 100);
+        state.series = original_chart.clone();
+        // Keep a previous query pending while the same key changes physical unit.
+        state.history_pending = Some(old_request);
+        state.history_queued = None;
+        let mut replacement = state.snapshot.clone();
+        replacement.devices[0].reading.serial = Some("replacement-unit".into());
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let real_events = std::mem::replace(&mut state.runtime.events, receiver);
+        sender.send(Event::Snapshot(replacement)).unwrap();
+        state.drain();
+        state.runtime.events = real_events;
+        assert!(
+            state.series.samples.is_empty(),
+            "Replacement hardware retained the old chart"
+        );
+        assert_ne!(state.request, old_request);
+        assert!(
+            state.history_queued.is_some(),
+            "Replacement hardware needs a fresh history query"
+        );
+        state.history_outcome(old_request, Ok(original_chart));
+        assert!(
+            state.series.samples.is_empty(),
+            "Late history from the old unit was accepted"
+        );
+        state.snapshot = snapshot;
+        state.selected = selected;
+        state.selected_device = selected_device;
+        state.command(1, 0);
+    }
     unsafe fn exercise_overview_audit(context: &UiContext) {
         unsafe {
             let mut state = context.state.borrow_mut();
@@ -10038,6 +10118,7 @@ mod dashboard_lifecycle_tests {
                     history_resize: HistoryResize::default(),
                     request: 0,
                     history_pending: None,
+                    hdr_pending: false,
                     history_cache_active: false,
                     history_queued: None,
                     taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
@@ -10356,6 +10437,7 @@ mod dashboard_lifecycle_tests {
             exercise_overview_audit(&context);
             device_information::exercise_native_information(&mut context.state.borrow_mut());
             exercise_tray_selection(&context);
+            exercise_history_identity(&mut context.state.borrow_mut());
             {
                 let mut state = context.state.borrow_mut();
                 state.command(2, 0);
@@ -12262,6 +12344,46 @@ mod dashboard_lifecycle_tests {
             context.state.borrow_mut().close_dashboard(posted_open);
             dispatch_monitor(monitor);
             assert_eq!(context.deferred.0.get(), [None; 4]);
+            {
+                let mut state = context.state.borrow_mut();
+                assert!(state.dashboard.is_none());
+                let saved = state.snapshot.clone();
+                let saved_page = state.page;
+                state.page = 2;
+                let closed_request = state.request;
+                let mut replacement = state.snapshot.clone();
+                replacement.devices[0].reading.serial = Some("closed-dashboard-replacement".into());
+                let (sender, receiver) = crossbeam_channel::bounded(1);
+                let real_events = std::mem::replace(&mut state.runtime.events, receiver);
+                sender.send(Event::Snapshot(replacement)).unwrap();
+                state.drain();
+                state.runtime.events = real_events;
+                assert_eq!(
+                    state.request, closed_request,
+                    "Closed dashboards must not request replacement-device history"
+                );
+                assert!(state.history_queued.is_none());
+                state.snapshot = saved;
+                state.page = saved_page;
+            }
+            for existing in [false, true] {
+                let mut state = context.state.borrow_mut();
+                state.page = 1;
+                if existing {
+                    state.open();
+                }
+                let before = state.request;
+                state.command(504, 0);
+                assert_eq!(
+                    state.request,
+                    before.wrapping_add(1),
+                    "Opening History from the tray must build/query only once, existing={existing}"
+                );
+                let window = state.dashboard.unwrap();
+                state.close_dashboard(window);
+                drop(state);
+                dispatch_monitor(monitor);
+            }
             if !restore {
                 sample_closed_dashboard(&context, "after-40-cycles");
             }
