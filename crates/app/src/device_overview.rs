@@ -231,6 +231,7 @@ impl State {
         if self.page != 1 {
             return;
         }
+        self.overview_visibility = None;
         self.overview_keys.clear();
         for (index, (device, battery)) in self
             .device_rows()
@@ -452,15 +453,9 @@ impl State {
                         },
                     );
                 }
-                let _ = SetWindowPos(
-                    *h,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
+                if GetWindowLongW(*h, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+                    let _ = ShowWindow(*h, SW_SHOW);
+                }
                 let font = if matches!(id, 48 | 89 | 98 | 430 | 439 | 450 | 467 | 480 | 485 | 487) {
                     Some(self.section_font)
                 } else if id >= FIRST_CARD
@@ -470,7 +465,9 @@ impl State {
                 } else {
                     None
                 };
-                if let Some(font) = font {
+                if let Some(font) = font
+                    && send(*h, WM_GETFONT, WPARAM(0), LPARAM(0)).0 != font.0 as isize
+                {
                     send(*h, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(0));
                 }
             }
@@ -496,23 +493,35 @@ impl State {
         let width = right - 24;
         // Retain native fields and their unsaved contents, but display only the
         // selected task. No hardware operation runs when a tab is selected.
-        for (id, h) in &self.controls {
-            if !is_fixed_control(*id) {
-                unsafe {
-                    if matches!(*id, 460..=463) {
-                        SetWindowLongPtrW(*h, GWLP_USERDATA, 0);
+        let visibility = self.device_section
+            | (u16::from(self.control_details) << 4)
+            | (u16::from(self.sleep.details) << 5)
+            | (u16::from(self.sleep.saver_details) << 6)
+            | (u16::from(self.settings.notify) << 7);
+        if self.overview_visibility != Some(visibility) {
+            for (id, h) in &self.controls {
+                if !is_fixed_control(*id) && *id < FIRST_CARD {
+                    unsafe {
+                        if matches!(*id, 460..=463) {
+                            SetWindowLongPtrW(*h, GWLP_USERDATA, 0);
+                        }
+                        let _ = SetWindowPos(
+                            *h,
+                            None,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE
+                                | SWP_NOSIZE
+                                | SWP_NOZORDER
+                                | SWP_NOACTIVATE
+                                | SWP_HIDEWINDOW,
+                        );
                     }
-                    let _ = SetWindowPos(
-                        *h,
-                        None,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
-                    );
                 }
             }
+            self.overview_visibility = Some(visibility);
         }
         self.overview_place(90, 24, 82, width, 30, false);
         self.overview_place(464, 24, 118, width, 24, false);

@@ -62,8 +62,21 @@ fn providers() -> Vec<&'static str> {
     hb_providers::provider::FAMILIES
         .iter()
         .map(|p| p.0)
-        .chain(["bluetooth", "xinput"])
+        .chain(["xinput"])
         .collect()
+}
+fn dashboard_startup(enabled: bool) -> Result<(), ProviderError> {
+    #[cfg(not(test))]
+    {
+        hb_windows::system::startup(enabled)
+    }
+    #[cfg(test)]
+    {
+        // Native fixtures save real form data in an isolated profile, but must
+        // never register their temporary executable in the user's startup list.
+        let _ = enabled;
+        Ok(())
+    }
 }
 fn dpi_limits_text(limits: Option<&DpiLimits>) -> String {
     fn number(value: u16) -> String {
@@ -299,7 +312,7 @@ fn polling_unavailable(device: &ConfigurationDevice) -> &'static str {
     }
 }
 const CHECKS: &[(&str, &str)] = &[
-    ("notify", "Show low-battery notifications"),
+    ("notify", "Show battery notifications"),
     ("full_alert", "Alert when fully charged"),
     ("bluetooth", "Include Bluetooth devices"),
     ("animation", "Animate charging icons"),
@@ -326,6 +339,11 @@ const CHECKS: &[(&str, &str)] = &[
 fn setting_check_id(index: usize) -> u16 {
     // 112 and 113 belong to the separate polling permission controls.
     100 + index as u16 + if index >= 12 { 2 } else { 0 }
+}
+fn settings_provider_tail(provider_count: usize) -> i32 {
+    // The original tail followed eight rows. New provider rows must also move
+    // the PlayStation options, About section and the page's scroll extent.
+    provider_count.div_ceil(4).saturating_sub(8) as i32 * 28
 }
 #[cfg(test)]
 #[test]
@@ -1430,6 +1448,7 @@ struct State {
     device_section: u16,
     control_details: bool,
     overview_keys: Vec<String>,
+    overview_visibility: Option<u16>,
     polling: PollingUi,
     tray_polling: PollingUi,
     insights: InsightsUi,
@@ -1642,6 +1661,7 @@ pub fn run(
                 device_section: 0,
                 control_details: false,
                 overview_keys: Vec::new(),
+                overview_visibility: None,
                 polling: PollingUi::default(),
                 tray_polling: PollingUi::default(),
                 insights: InsightsUi::default(),
@@ -2349,7 +2369,7 @@ impl State {
             100,
         );
         self.page_height = match self.page {
-            3 if self.more_options => 1264,
+            3 if self.more_options => 1264 + settings_provider_tail(providers().len()),
             3 => 724,
             6 => 1430,
             _ => 708,
@@ -2391,7 +2411,11 @@ impl State {
                 }
             }
         }
-        self.page_height = if self.more_options { 1264 } else { 724 } - PAGE_TOP;
+        self.page_height = if self.more_options {
+            1264 + settings_provider_tail(providers().len())
+        } else {
+            724
+        } - PAGE_TOP;
         self.set_control_text(
             212,
             if self.more_options {
@@ -2905,9 +2929,17 @@ impl State {
         unsafe {
             if let Some(h) = self.dashboard {
                 if self.owns_dashboard(h) {
-                    let _ = ShowWindow(h, SW_RESTORE);
+                    // Restore only a minimized window. Reopening an already
+                    // visible dashboard must preserve its size/maximized state.
+                    if IsIconic(h).as_bool() {
+                        let _ = ShowWindow(h, SW_RESTORE);
+                    } else if !IsWindowVisible(h).as_bool() {
+                        let _ = ShowWindow(h, SW_SHOW);
+                    }
                     self.configuration_visibility();
-                    let _ = SetForegroundWindow(h);
+                    if GetForegroundWindow() != h {
+                        let _ = SetForegroundWindow(h);
+                    }
                     if self.page == 1 && self.device_section == 4 {
                         self.read_device_information(false);
                     }
@@ -2978,7 +3010,9 @@ impl State {
                     if self.page == 1 && self.device_section == 4 {
                         self.read_device_information(false);
                     }
-                    let _ = SetForegroundWindow(h);
+                    if GetForegroundWindow() != h {
+                        let _ = SetForegroundWindow(h);
+                    }
                 }
                 Err(e) => self.error = e.to_string(),
             }
@@ -3282,9 +3316,10 @@ impl State {
             3 => {
                 // Leave a dedicated Appearance row for disconnected icons.
                 let lower = |y| y + 34;
+                let advanced_y = |y| lower(y) + settings_provider_tail(providers().len());
                 let value = serde_json::to_value(&self.settings).unwrap_or_default();
                 self.heading(90, "Alerts and battery", 20, 70, 740);
-                self.heading(91, "Appearance", 20, 252, 740);
+                self.heading(91, "Icons and startup", 20, 252, 740);
                 self.heading(92, "Battery checks", 20, lower(412), 740);
                 self.heading(93, "Device controls", 20, lower(492), 740);
                 for (i, x, y, width) in [
@@ -3299,15 +3334,19 @@ impl State {
                     (13, 20, 392, 760),
                     (5, 400, 322, 380),
                     (2, 400, lower(448), 380),
-                    (9, 20, lower(938), 760),
-                    (10, 20, lower(972), 760),
-                    (11, 20, lower(1048), 760),
+                    (9, 20, advanced_y(938), 760),
+                    (10, 20, advanced_y(972), 760),
+                    (11, 20, advanced_y(1048), 760),
                 ] {
                     let (key, label) = CHECKS[i];
                     self.check(
                         setting_check_id(i),
                         label,
-                        value[key].as_bool().unwrap_or(false),
+                        if key == "bluetooth" {
+                            self.settings.enabled("bluetooth")
+                        } else {
+                            value[key].as_bool().unwrap_or(false)
+                        },
                         x,
                         y,
                         width,
@@ -3318,7 +3357,13 @@ impl State {
                 self.edit(203, &self.settings.low.to_string(), 210, 204, 80);
                 self.label(214, "Orange warning at (%)", 400, 208, 235);
                 self.edit(215, &self.settings.warning_level.to_string(), 650, 204, 80);
-                self.label(220, "Device-specific alert levels take priority. Check Devices if an alert is missing.",20,236,760);
+                self.label(
+                    220,
+                    "Set a level to 0 to turn it off. Per-device alert levels take priority.",
+                    20,
+                    236,
+                    760,
+                );
                 self.label(204, "Tray icon colour", 20, 362, 150);
                 let themes = THEME_CHOICES
                     .iter()
@@ -3392,19 +3437,19 @@ impl State {
                     "Extra PlayStation checks are optional and may affect other controller apps.",
                     WINDOW_STYLE::default(),
                     20,
-                    lower(1004),
+                    advanced_y(1004),
                     760,
                     40,
                 );
-                self.heading(208, "About Halo Continued", 20, lower(1070), 740);
+                self.heading(208, "About Halo Continued", 20, advanced_y(1070), 740);
                 self.label(
                     218,
                     concat!("Version ", env!("CARGO_PKG_VERSION"), " · Windows 11"),
                     20,
-                    lower(1105),
+                    advanced_y(1105),
                     440,
                 );
-                self.button(217, "Open data folder", 570, lower(1100), 210);
+                self.button(217, "Open data folder", 570, advanced_y(1100), 210);
                 self.edit(
                     209,
                     self.settings
@@ -3413,14 +3458,14 @@ impl State {
                         .as_deref()
                         .unwrap_or(""),
                     20,
-                    lower(1122),
+                    advanced_y(1122),
                     740,
                 );
                 self.label(
                     219,
                     "Closing this window keeps battery monitoring running. Use the tray menu to exit.",
                     20,
-                    lower(1156),
+                    advanced_y(1156),
                     760,
                 );
                 self.button(210, "&Save settings", 20, 682, 160);
@@ -3443,6 +3488,7 @@ impl State {
         }
         self.build_overview();
         self.restore_form(draft);
+        self.notification_controls();
         self.layout_page();
         drop(_redraw);
         if let Some(h) = focused.and_then(|id| self.controls.get(&id))
@@ -3501,7 +3547,7 @@ impl State {
         );
         self.widget(
             402,
-            "Known polling rate\n—\nOf recorded use in the last 7 days",
+            "Polling rate recorded\n—\nOf use recorded in the last 7 days",
             536,
             152,
             244,
@@ -3528,7 +3574,7 @@ impl State {
         );
         self.widget(
             411,
-            "Automatic boost · last 7 days\nWaiting for recorded changes",
+            "Polling changes · last 7 days\nWaiting for recorded changes",
             406,
             388,
             374,
@@ -3599,7 +3645,16 @@ impl State {
             .filter(|_| self.settings.polling_controls);
         let _redraw = DashboardRedraw::new(self.dashboard.unwrap());
         self.render_insight_cards(boost);
-        let prior_choices = [self.text(70), self.text(71)];
+        let prior_keys = [70, 71].map(|id| {
+            self.controls.get(&id).and_then(|h| unsafe {
+                let index = send(*h, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+                if index < 0 {
+                    return None;
+                }
+                let key = send(*h, CB_GETITEMDATA, WPARAM(index as usize), LPARAM(0)).0;
+                (key != CB_ERR as isize).then_some(key as i64)
+            })
+        });
         for id in [70, 71] {
             if let Some(h) = self.controls.get(&id) {
                 unsafe {
@@ -3611,7 +3666,10 @@ impl State {
             for (id, rows) in [
                 (
                     70,
-                    data.rates.iter().map(rate_insight_row).collect::<Vec<_>>(),
+                    data.rates
+                        .iter()
+                        .map(|r| (i64::from(r.hz), rate_insight_row(r)))
+                        .collect::<Vec<_>>(),
                 ),
                 (
                     71,
@@ -3619,24 +3677,29 @@ impl State {
                         .iter()
                         .rev()
                         .take(10)
-                        .map(charge_cycle_row)
+                        .map(|c| (c.start_timestamp, charge_cycle_row(c)))
                         .collect(),
                 ),
             ] {
                 if let Some(h) = self.controls.get(&id) {
-                    let prior = prior_choices[usize::from(id == 71)]
-                        .split('·')
-                        .next()
-                        .unwrap_or("")
-                        .trim();
+                    let prior = prior_keys[usize::from(id == 71)];
                     let selected = rows
                         .iter()
-                        .position(|row| row.split('·').next().unwrap_or("").trim() == prior)
+                        .position(|(key, _)| Some(*key) == prior)
                         .unwrap_or(0);
-                    for row in rows {
+                    for (key, row) in rows {
                         let text = wide(&row);
                         unsafe {
-                            send(*h, CB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
+                            let index =
+                                send(*h, CB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize)).0;
+                            if index >= 0 {
+                                send(
+                                    *h,
+                                    CB_SETITEMDATA,
+                                    WPARAM(index as usize),
+                                    LPARAM(key as isize),
+                                );
+                            }
                         }
                     }
                     unsafe {
@@ -3848,7 +3911,7 @@ impl State {
         self.set_control_text(
             402,
             &format!(
-                "Known polling rate\n{}\nOf recorded use in the last 7 days",
+                "Polling rate recorded\n{}\nOf use recorded in the last 7 days",
                 data.filter(|d| d.recent.total_seconds > 0)
                     .map(|_| format!("{}%", insight_coverage_percent(&prediction)))
                     .unwrap_or_else(|| "—".into())
@@ -3862,7 +3925,7 @@ impl State {
                 410,
                 "Polling-rate mix · last 7 days\nNo history loaded. Select Refresh to try again.",
             );
-            self.set_control_text(411, "Automatic boost · last 7 days\nNo history loaded.");
+            self.set_control_text(411, "Polling changes · last 7 days\nNo history loaded.");
             return;
         };
         let recent = &data.recent;
@@ -3902,8 +3965,8 @@ impl State {
             ),
             _ => "Fixed-rate comparison is still learning".into(),
         };
-        self.set_control_text(411,&format!("Automatic boost · last 7 days\nBoosts · {}    Restores · {}\n{} during confirmed boosts\nManual choices · {}\nBattery saver · {} changes / {} restores\n{} with battery saver\n{}\n{}\nRecorded use is not gaming time",recent.boost_sessions,recent.restores,insight_hours(recent.boost_seconds),recent.manual_changes,recent.saver_changes,recent.saver_restores,insight_hours(recent.saver_seconds),
-            boost.map(|r|format!("Boost setting · {} Hz",r.hz())).unwrap_or_else(||"Current setting · Off".into()),comparison));
+        self.set_control_text(411,&format!("Polling changes · last 7 days\nGame boosts · {}    Restored · {}\n{} during confirmed boosts\nManual choices · {}\nBattery saver · {} changes / {} restores\n{} with battery saver\n{}\n{}\nRecorded use is not gaming time",recent.boost_sessions,recent.restores,insight_hours(recent.boost_seconds),recent.manual_changes,recent.saver_changes,recent.saver_restores,insight_hours(recent.saver_seconds),
+            boost.map(|r|format!("Game boost setting · {} Hz",r.hz())).unwrap_or_else(||"Game boost setting · Off".into()),comparison));
     }
     fn save(&mut self) {
         self.runtime.send(Command::Settings(self.settings.clone()));
@@ -3911,6 +3974,9 @@ impl State {
     }
     fn command(&mut self, id: u16, notification: u16) {
         match id {
+            100 if self.page == 3 && notification == BN_CLICKED as u16 => {
+                self.notification_controls()
+            }
             1000..=32767 if self.page == 1 => self.overview_select((id - 1000) as usize),
             17..=19 | 22 | 24 if self.page == 1 => {
                 let section = match id {
@@ -4286,7 +4352,7 @@ impl State {
                     .filter(|(i, _)| !self.checked(300 + *i as u16))
                     .map(|(_, p)| p.to_string())
                     .collect();
-                self.error = match hb_windows::system::startup(self.checked(206)) {
+                self.error = match dashboard_startup(self.checked(206)) {
                     Ok(()) => "Settings saved".into(),
                     Err(e) => e.to_string(),
                 };
@@ -4526,10 +4592,16 @@ impl State {
             }
         }
     }
+    fn notification_controls(&self) {
+        if self.page == 3 {
+            self.enable_control(101, self.checked(100));
+        }
+    }
     fn polling_controls(&mut self) {
         if self.dashboard.is_none() || self.page != 1 {
             return;
         }
+        self.overview_visibility = None;
         let _redraw = DashboardRedraw::new(self.dashboard.unwrap());
         let focused = unsafe { GetFocus() };
         let focus_id = self
@@ -6756,7 +6828,8 @@ mod behaviour_tests {
     #[test]
     fn every_provider_has_a_unique_readable_settings_label() {
         let ids = providers();
-        assert_eq!(ids.len(), 41);
+        assert_eq!(ids.len(), hb_providers::provider::FAMILIES.len() + 1);
+        assert!(!ids.contains(&"bluetooth"));
         let labels = ids
             .iter()
             .map(|id| provider_label(id))
@@ -9245,6 +9318,65 @@ mod insights_tests {
 mod dashboard_lifecycle_tests {
     use super::*;
 
+    unsafe extern "system" fn count_layout_hides(
+        hwnd: HWND,
+        message: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+        _: usize,
+        data: usize,
+    ) -> LRESULT {
+        unsafe {
+            if message == WM_WINDOWPOSCHANGED
+                && lp.0 != 0
+                && (*(lp.0 as *const WINDOWPOS)).flags.0 & SWP_HIDEWINDOW.0 != 0
+            {
+                let count = &*(data as *const Cell<u32>);
+                count.set(count.get() + 1);
+            }
+            windows::Win32::UI::Shell::DefSubclassProc(hwnd, message, wp, lp)
+        }
+    }
+    unsafe fn assert_stable_overview_visibility(state: &mut State) {
+        const SPY: usize = 0x4842_5549;
+        struct Watch(HWND);
+        impl Drop for Watch {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = windows::Win32::UI::Shell::RemoveWindowSubclass(
+                        self.0,
+                        Some(count_layout_hides),
+                        SPY,
+                    );
+                }
+            }
+        }
+        unsafe {
+            for id in [1000, 43, 17] {
+                let count = Cell::new(0u32);
+                let watch = Watch(state.controls[&id]);
+                assert!(
+                    windows::Win32::UI::Shell::SetWindowSubclass(
+                        watch.0,
+                        Some(count_layout_hides),
+                        SPY,
+                        (&count as *const Cell<u32>) as usize
+                    )
+                    .as_bool()
+                );
+                for _ in 0..20 {
+                    state.layout_page();
+                }
+                drop(watch);
+                assert_eq!(
+                    count.get(),
+                    0,
+                    "Unchanged layout must not hide device control {id}"
+                );
+            }
+        }
+    }
+
     fn capture_directory() -> PathBuf {
         std::env::var_os("HALO_UI_CAPTURE_DIRECTORY")
             .map(PathBuf::from)
@@ -9349,27 +9481,29 @@ mod dashboard_lifecycle_tests {
         }
     }
 
-    unsafe fn dispatch_monitor(monitor: HWND) {
+    unsafe fn dispatch_monitor(monitor: HWND) -> [u32; 5] {
+        let mut dispatched = [0; 5];
         let mut message = MSG::default();
         unsafe {
             let context = GetWindowLongPtrW(monitor, GWLP_USERDATA) as *const UiContext;
             if !context.is_null() {
                 (*context).retry_deferred();
             }
-            // Scope pumping to this test's monitor. Do not consume another
-            // process/window's commands or depend on timer timing.
-            while PeekMessageW(
-                &mut message,
-                Some(monitor),
-                WM_APP + 8,
-                WM_APP + 12,
-                PM_REMOVE,
-            )
-            .as_bool()
-            {
+            // Native restoration can queue positioning work for the dashboard,
+            // not just our monitoring window. Match the production thread pump.
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                if message.hwnd == monitor && (WM_APP + 8..=WM_APP + 12).contains(&message.message)
+                {
+                    dispatched[(message.message - WM_APP - 8) as usize] += 1;
+                }
+                let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
+                if !context.is_null() {
+                    (*context).retry_deferred();
+                }
             }
         }
+        dispatched
     }
 
     #[test]
@@ -9510,6 +9644,7 @@ mod dashboard_lifecycle_tests {
                 state.control_details,
                 "Sleep details must not close performance details"
             );
+            assert_stable_overview_visibility(&mut state);
             let mut panel = RECT::default();
             let mut button = RECT::default();
             GetWindowRect(state.controls[&460], &mut panel).unwrap();
@@ -9923,6 +10058,7 @@ mod dashboard_lifecycle_tests {
                     device_section: 0,
                     control_details: false,
                     overview_keys: Vec::new(),
+                    overview_visibility: None,
                     polling: PollingUi::default(),
                     tray_polling: PollingUi::default(),
                     insights: InsightsUi::default(),
@@ -10380,11 +10516,18 @@ mod dashboard_lifecycle_tests {
                 state.settings.polling_controls = false;
                 state.build();
             }
-            for (mode, position_hide) in [(SW_MINIMIZE, false), (SW_HIDE, false), (SW_HIDE, true)] {
+            let repetitions = std::env::var("HALO_STRESS_DASHBOARD_VISIBILITY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(8);
+            for (mode, position_hide) in (0..repetitions)
+                .flat_map(|_| [(SW_MINIMIZE, false), (SW_HIDE, false), (SW_HIDE, true)])
+            {
                 assert_eq!(context.state.borrow().dashboard, Some(first));
+                let pending_before = context.deferred.0.get();
                 if position_hide {
-                    // Establish the hidden fixture state directly, independently
-                    // of an earlier native restore/activation transition.
+                    // Exercise SetWindowPos as well as ShowWindow. Complete the
+                    // thread's queued native work before inspecting visibility.
                     SetWindowPos(
                         first,
                         None,
@@ -10395,17 +10538,13 @@ mod dashboard_lifecycle_tests {
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW,
                     )
                     .unwrap();
-                    assert!(
-                        !IsWindowVisible(first).as_bool(),
-                        "Native fixture must be hidden before dispatch"
-                    );
                 } else {
                     let _ = ShowWindow(first, mode);
                 }
-                dispatch_monitor(monitor);
+                let dispatched = dispatch_monitor(monitor);
                 assert!(
                     !context.state.borrow().dashboard_visible(),
-                    "mode={mode:?}; visible={}, minimized={}",
+                    "mode={mode:?}; visible={}, minimized={}, pending={pending_before:?}, dispatched={dispatched:?}",
                     IsWindowVisible(first).as_bool(),
                     IsIconic(first).as_bool()
                 );
@@ -10417,6 +10556,23 @@ mod dashboard_lifecycle_tests {
                 assert!(context.state.borrow().dashboard_visible());
                 assert!(context.state.borrow().runtime.configuration_visible());
             }
+            // Reopening an existing visible/maximized dashboard must not trigger
+            // another restore or resize. This used to unmaximize it.
+            let _ = ShowWindow(first, SW_MAXIMIZE);
+            dispatch_monitor(monitor);
+            assert!(IsZoomed(first).as_bool());
+            let mut bounds = RECT::default();
+            GetWindowRect(first, &mut bounds).unwrap();
+            for _ in 0..8 {
+                send(monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
+                dispatch_monitor(monitor);
+                let mut after = RECT::default();
+                GetWindowRect(first, &mut after).unwrap();
+                assert!(IsZoomed(first).as_bool());
+                assert_eq!(bounds, after);
+            }
+            let _ = ShowWindow(first, SW_RESTORE);
+            dispatch_monitor(monitor);
             {
                 let mut state = context.state.borrow_mut();
                 DestroyWindow(first).unwrap();
@@ -10539,6 +10695,34 @@ mod dashboard_lifecycle_tests {
                 state.insights.status = insight_coverage_text(&insights);
                 state.insights.data = Some(insights);
                 state.insights.key = Some("synthetic-mouse".into());
+            }
+            {
+                let mut state = context.state.borrow_mut();
+                let saved = state.insights.data.clone();
+                let minute = (SystemClock::default().unix() - 7200) / 60 * 60;
+                let mut first = saved.as_ref().unwrap().cycles[0].clone();
+                first.start_timestamp = minute;
+                let mut second = first.clone();
+                second.start_timestamp += 30;
+                assert_eq!(
+                    charge_cycle_row(&first),
+                    charge_cycle_row(&second),
+                    "Fixture must reproduce identical displayed session labels"
+                );
+                state.insights.data.as_mut().unwrap().cycles = vec![first, second.clone()];
+                state.page = 6;
+                state.build();
+                send(state.controls[&71], CB_SETCURSEL, WPARAM(1), LPARAM(0));
+                second.start_timestamp = minute + 60;
+                state.insights.data.as_mut().unwrap().cycles.push(second);
+                state.render_insights();
+                assert_eq!(
+                    state.choice(71),
+                    2,
+                    "Refreshing must retain the exact selected battery session"
+                );
+                state.insights.data = saved;
+                state.render_insights();
             }
             {
                 let mut state = context.state.borrow_mut();
@@ -10891,6 +11075,7 @@ mod dashboard_lifecycle_tests {
                             for id in (0..CHECKS.len())
                                 .map(setting_check_id)
                                 .chain([112, 113, 206, 205])
+                                .chain((0..providers().len()).map(|i| 300 + i as u16))
                             {
                                 let hwnd = state.controls[&id];
                                 if IsWindowVisible(hwnd).as_bool() {
@@ -11400,6 +11585,39 @@ mod dashboard_lifecycle_tests {
                 let mut state = context.state.borrow_mut();
                 state.page = 3;
                 state.more_options = false;
+                let saved_settings = state.settings.clone();
+                for legacy_disabled in [false, true] {
+                    state.settings.bluetooth = legacy_disabled;
+                    if legacy_disabled {
+                        state.settings.disabled_providers.insert("bluetooth".into());
+                    } else {
+                        state.settings.disabled_providers.remove("bluetooth");
+                    }
+                    // Model a freshly loaded profile, rather than preserving
+                    // the checkbox draft from the previous fixture profile.
+                    if let Some(control) = state.controls.remove(&102) {
+                        DestroyWindow(control).unwrap();
+                    }
+                    state.build();
+                    assert!(!state.checked(102));
+                    assert!(
+                        !providers().contains(&"bluetooth"),
+                        "Bluetooth must have one switch"
+                    );
+                    send(state.controls[&102], BM_SETCHECK, WPARAM(1), LPARAM(0));
+                    state.command(210, 0);
+                    assert!(
+                        state.settings.enabled("bluetooth"),
+                        "Enabling Bluetooth must work without Advanced options"
+                    );
+                    send(state.controls[&102], BM_SETCHECK, WPARAM(0), LPARAM(0));
+                    state.command(210, 0);
+                    assert!(!state.settings.enabled("bluetooth"));
+                }
+                state.settings = saved_settings;
+                if let Some(control) = state.controls.remove(&102) {
+                    DestroyWindow(control).unwrap();
+                }
                 state.build();
                 let interval = state.controls[&201];
                 SetWindowTextW(interval, w!("1234")).unwrap();
@@ -11422,6 +11640,33 @@ mod dashboard_lifecycle_tests {
                 state.command(212, 0);
                 assert!(!IsWindowVisible(state.controls[&209]).as_bool());
                 assert_eq!(state.text(201), "1234");
+                let full_alert = state.checked(101);
+                send(state.controls[&100], BM_SETCHECK, WPARAM(0), LPARAM(0));
+                state.command(100, BN_CLICKED as u16);
+                assert!(
+                    !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.controls[&101]
+                    )
+                    .as_bool()
+                );
+                state.build();
+                assert!(!state.checked(100));
+                assert_eq!(state.checked(101), full_alert);
+                assert!(
+                    !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.controls[&101]
+                    )
+                    .as_bool()
+                );
+                send(state.controls[&100], BM_SETCHECK, WPARAM(1), LPARAM(0));
+                state.command(100, BN_CLICKED as u16);
+                assert!(
+                    windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.controls[&101]
+                    )
+                    .as_bool()
+                );
+                let interval = state.controls[&201];
                 state.set_control_text(201, "invalid");
                 state.command(210, 0);
                 assert_eq!(state.controls[&201], interval);
@@ -12002,6 +12247,21 @@ mod dashboard_lifecycle_tests {
                     }
                 }
             }
+            // Posted dashboard commands must run too, not just monitor commands.
+            // A monitor-only test pump leaves this close queued indefinitely.
+            context.state.borrow_mut().open();
+            let posted_close = context.state.borrow().dashboard.unwrap();
+            PostMessageW(Some(posted_close), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+            dispatch_monitor(monitor);
+            assert!(context.state.borrow().dashboard.is_none());
+            PostMessageW(Some(monitor), WM_APP + 8, WPARAM(0), LPARAM(0)).unwrap();
+            dispatch_monitor(monitor);
+            let posted_open = context.state.borrow().dashboard.unwrap();
+            assert!(context.state.borrow().owns_dashboard(posted_open));
+            assert!(context.state.borrow().dashboard_visible());
+            context.state.borrow_mut().close_dashboard(posted_open);
+            dispatch_monitor(monitor);
+            assert_eq!(context.deferred.0.get(), [None; 4]);
             if !restore {
                 sample_closed_dashboard(&context, "after-40-cycles");
             }

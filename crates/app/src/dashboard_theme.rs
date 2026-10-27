@@ -904,13 +904,15 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                     rounded_surface(
                         hdc,
                         &mark,
-                        if checked {
+                        if checked && enabled {
                             palette.accent
                         } else {
                             palette.surface
                         },
-                        if checked || active {
+                        if enabled && (checked || active) {
                             palette.accent
+                        } else if enabled {
+                            palette.disabled
                         } else {
                             palette.border
                         },
