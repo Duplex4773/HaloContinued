@@ -22,6 +22,23 @@ impl DisplayMenuChoice {
         }
     }
 }
+fn hdr_status(state: HdrState) -> (&'static str, bool) {
+    match state {
+        HdrState::Available {
+            enabled: true,
+            active: false,
+        } => ("HDR enabled · Currently inactive", true),
+        HdrState::Available {
+            enabled: false,
+            active: true,
+        } => ("HDR disabled · Currently active", false),
+        HdrState::Available { enabled, .. } => {
+            (if enabled { "HDR on" } else { "HDR off" }, enabled)
+        }
+        HdrState::Unsupported => ("HDR not supported", false),
+        HdrState::Unavailable(reason) => (reason, false),
+    }
+}
 fn choices(inventory: Result<Vec<Display>, ProviderError>) -> Vec<DisplayMenuChoice> {
     match inventory {
         Err(_) => vec![DisplayMenuChoice::information(
@@ -35,17 +52,11 @@ fn choices(inventory: Result<Vec<Display>, ProviderError>) -> Vec<DisplayMenuCho
             .take(hb_windows::displays::MAX_DISPLAYS)
             .enumerate()
             .map(|(index, display)| {
-                let (state, checked) = match display.hdr {
-                    HdrState::Available { enabled, .. } => {
-                        (if enabled { "HDR on" } else { "HDR off" }, enabled)
-                    }
-                    HdrState::Unsupported => ("HDR not supported", false),
-                    HdrState::Unavailable(reason) => (reason, false),
-                };
+                let (state, checked) = hdr_status(display.hdr);
                 let request = display.hdr_request();
                 DisplayMenuChoice {
                     id: FIRST_DISPLAY + index as u16,
-                    text: format!("{} · {state}", display.label()),
+                    text: format!("{}\n{state}", display.label()),
                     enabled: request.is_some(),
                     checked,
                     request,
@@ -128,27 +139,44 @@ impl State {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use windows::Win32::System::Threading::{GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources};
+    #[test]
+    fn hdr_menu_distinguishes_the_saved_choice_from_current_output() {
+        for (enabled, active, expected) in [
+            (true, true, "HDR on"),
+            (false, false, "HDR off"),
+            (true, false, "HDR enabled · Currently inactive"),
+            (false, true, "HDR disabled · Currently active"),
+        ] {
+            assert_eq!(
+                hdr_status(HdrState::Available { enabled, active }),
+                (expected, enabled)
+            );
+        }
+    }
     fn fixture() -> Vec<DisplayMenuChoice> {
         vec![
             DisplayMenuChoice {
                 id: FIRST_DISPLAY,
-                text: "Display 1 · Panel & A · HDR on".into(),
+                text: "Display 1 · Panel & A\nHDR on".into(),
                 enabled: true,
                 checked: true,
                 request: None,
             },
             DisplayMenuChoice {
                 id: FIRST_DISPLAY + 1,
-                text: "Display 2 · Panel A · HDR off".into(),
+                text: "Display 2 · Panel A\nHDR off".into(),
                 enabled: true,
                 checked: false,
                 request: None,
             },
-            DisplayMenuChoice::information("Display 3 · HDR not supported"),
+            DisplayMenuChoice::information("Display 3\nHDR not supported"),
         ]
+    }
+    pub(in crate::ui) fn append_fixture(menu: HMENU) {
+        append(menu, &fixture()).unwrap();
     }
     unsafe fn child(menu: HMENU) -> HMENU {
         unsafe {

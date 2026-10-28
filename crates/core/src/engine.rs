@@ -537,6 +537,11 @@ impl Engine {
             .any(|(provider, readings)| self.settings.enabled(provider) && !readings.is_empty())
     }
     pub fn readings(&self) -> Vec<Reading> {
+        self.resolved_readings().into_iter().cloned().collect()
+    }
+    // Resolve precedence once using borrowed rows. Snapshot construction can
+    // then own each selected reading directly, without an intermediate Vec<Reading>.
+    fn resolved_readings(&self) -> Vec<&Reading> {
         let all = enabled_readings(&self.by_provider, &self.settings);
         let mut kept: Vec<&Reading> = Vec::new();
         for r in all.clone() {
@@ -552,14 +557,14 @@ impl Engine {
             }
         }
         kept.sort_by(|a, b| a.key.cmp(&b.key));
-        kept.into_iter().cloned().collect()
+        kept
     }
     pub fn snapshot(&self, timestamp: i64) -> Snapshot {
         Snapshot {
             timestamp,
             errors: self.errors.clone(),
             devices: self
-                .readings()
+                .resolved_readings()
                 .into_iter()
                 .map(|r| {
                     let preferences = self.settings.device(&r.key).cloned().unwrap_or_default();
@@ -615,7 +620,7 @@ impl Engine {
                     }
                     DeviceView {
                         low_alert_at: self.settings.low_for(&r.key),
-                        reading: r,
+                        reading: r.clone(),
                         name,
                         icon,
                         seconds_left,

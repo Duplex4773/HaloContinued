@@ -14,6 +14,41 @@ fn reading(timestamp: i64, level: u8) -> Reading {
     r
 }
 #[test]
+fn insights_normal_rate_follows_manual_choices_and_survives_boosts_over_saver() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("history.db")).unwrap();
+    use PollingActivityKind::*;
+    for (timestamp, kind, hz, previous, normal, manual_changes) in [
+        (0, Manual, 1000, 500, 1000, 1),
+        (60, Saver, 125, 1000, 1000, 1),
+        (120, Boost, 4000, 125, 1000, 1),
+        (180, Restore, 125, 4000, 1000, 1),
+        (240, SaverRestore, 1000, 125, 1000, 1),
+        (300, Manual, 2000, 1000, 2000, 2),
+        // A same-rate manual choice takes ownership without a hardware change.
+        (360, Boost, 4000, 2000, 2000, 2),
+        (360, Manual, 4000, 4000, 4000, 2),
+    ] {
+        store
+            .record_polling_activity(&PollingActivity {
+                key: "synthetic:mouse".into(),
+                timestamp,
+                session: timestamp as u64,
+                kind,
+                rate: PollingRate::try_from(hz).unwrap(),
+                previous: PollingRate::try_from(previous).ok(),
+            })
+            .unwrap();
+        let insights = store.query_insights("synthetic:mouse", timestamp).unwrap();
+        assert_eq!(
+            insights.recent.normal_rate.map(PollingRate::hz),
+            Some(normal),
+            "{kind:?} at {timestamp}"
+        );
+        assert_eq!(insights.recent.manual_changes, manual_changes);
+    }
+}
+#[test]
 fn same_second_transitions_keep_their_own_rate_and_session_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.db");

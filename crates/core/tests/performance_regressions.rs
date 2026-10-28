@@ -8,6 +8,31 @@ use support::allocation_counter::{TrackingAllocator, measure};
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
 #[test]
+fn snapshot_allocation_budget_for_eight_devices() {
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    engine.apply(
+        "test",
+        Ok((0..8)
+            .map(|index| reading(&format!("invented-{index}"), 0, 80))
+            .collect()),
+        0.0,
+        false,
+    );
+    let (snapshot, allocations) = measure(|| engine.snapshot(1));
+    println!("Eight-device snapshot: {allocations:?}");
+    // Previously 5,504 bytes: avoid rebuilding an intermediate owned reading
+    // vector before constructing the views. Allow small layout changes.
+    assert!(allocations.bytes <= 4000, "{allocations:?}");
+    assert_eq!(snapshot.devices.len(), 8);
+    assert_eq!(snapshot.timestamp, 1);
+    let expected = engine.readings();
+    for (view, reading) in snapshot.devices.iter().zip(expected) {
+        assert_eq!(view.reading, reading);
+        assert_eq!(view.name, reading.name);
+    }
+}
+
+#[test]
 fn rejecting_obsolete_notifications_needs_no_identity_copies_or_queue_allocation() {
     let mut engine = Engine::new(Settings::default(), Estimator::default());
     let first = reading("invented", 0, 19);

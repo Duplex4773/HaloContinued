@@ -383,6 +383,11 @@ pub(crate) fn draw_symbol(dc: HDC, rect: RECT, kind: &str, color: COLORREF) {
                 line(1, 8, 23, 8);
                 line(8, 8, 8, 21);
             }
+            "display" => {
+                let _ = RoundRect(dc, x(1), y(3), x(23), y(18), w / 5, h / 5);
+                line(7, 23, 17, 23);
+                line(12, 18, 12, 23);
+            }
             "devices" => {
                 let _ = RoundRect(dc, x(2), y(2), x(19), y(16), w / 5, h / 5);
                 line(7, 21, 13, 21);

@@ -2,7 +2,7 @@
 use crate::{
     chart::Chart,
     dashboard_theme::{DashboardTheme, Palette, color_brush, rounded_surface},
-    icons::{self, Icon},
+    icons::{self, Frames},
     runtime::{Command, Event, Runtime},
 };
 use hb_core::*;
@@ -36,6 +36,8 @@ use windows::{
 const TRAY: u32 = WM_APP + 1;
 const PAGE_TOP: i32 = 60;
 const PAGE_FOOTER: i32 = 62;
+#[path = "dashboard_settings.rs"]
+mod dashboard_settings;
 #[path = "device_information.rs"]
 mod device_information;
 #[path = "device_overview.rs"]
@@ -323,11 +325,11 @@ const CHECKS: &[(&str, &str)] = &[
     ("animation", "Animate charging icons"),
     ("badges", "Show a charging symbol"),
     ("fluent_menu", "Show devices in the tray menu"),
-    ("time_left", "Show estimated battery time left"),
+    ("time_left", "Show estimated time left"),
     ("percent_in_icon", "Show battery percentage in icons"),
     (
         "quiet_fullscreen",
-        "Pause popups during games and presentations",
+        "Pause alerts in games and presentations",
     ),
     ("status_file", "Save battery information for other apps"),
     (
@@ -500,7 +502,7 @@ fn shell_notify(command: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
 struct Tray {
     registration: TrayRegistration,
     data: NOTIFYICONDATAW,
-    frames: Vec<Icon>,
+    frames: Frames,
     signature: IconSignature,
     frame: usize,
 }
@@ -2376,8 +2378,10 @@ impl State {
             100,
         );
         self.page_height = match self.page {
-            3 if self.more_options => 1264 + settings_provider_tail(providers().len()),
-            3 => 724,
+            3 if self.more_options => {
+                dashboard_settings::ADVANCED_HEIGHT + settings_provider_tail(providers().len())
+            }
+            3 => dashboard_settings::SETTINGS_HEIGHT,
             6 => 1430,
             _ => 708,
         } - PAGE_TOP;
@@ -2419,9 +2423,9 @@ impl State {
             }
         }
         self.page_height = if self.more_options {
-            1264 + settings_provider_tail(providers().len())
+            dashboard_settings::ADVANCED_HEIGHT + settings_provider_tail(providers().len())
         } else {
-            724
+            dashboard_settings::SETTINGS_HEIGHT
         } - PAGE_TOP;
         self.set_control_text(
             212,
@@ -2476,10 +2480,20 @@ impl State {
             3 => {
                 self.position_control(210, 20, height - 46, 160, 30);
                 self.position_control(5, 194, height - 46, 205, 30);
-                self.position_control(95, 415, height - 49, 365, 46);
+                self.position_control(95, 415, height - 49, (width - 435).max(1), 46);
             }
-            2 => self.position_control(97, 20, height - 36, 760, 24),
-            6 => self.position_control(78, 20, height - 52, 760, 46),
+            2 => {
+                self.position_control(90, 20, 68, width - 40, 28);
+                self.position_control(92, 20, 106, width - 440, 24);
+                self.position_control(93, width - 380, 106, 160, 24);
+                self.position_control(94, width - 200, 106, 180, 24);
+                self.position_control(10, 20, 132, width - 420, 280);
+                self.position_control(21, width - 380, 132, 160, 280);
+                self.position_control(20, width - 200, 132, 180, 280);
+                self.position_control(96, 20, 176, width - 40, 24);
+                self.position_control(97, 20, height - 36, width - 40, 24);
+            }
+            6 => self.position_control(78, 20, height - 52, (width - 40).max(1), 46),
             _ => {}
         }
     }
@@ -2722,14 +2736,10 @@ impl State {
                 PCWSTR(text.as_ptr()),
                 WS_CHILD | WS_VISIBLE | style,
                 f(x),
-                f((if !is_fixed_control(id) && self.page_host.is_some() {
+                f(if !is_fixed_control(id) && self.page_host.is_some() {
                     y - PAGE_TOP - self.page_scroll
                 } else {
                     y
-                }) + if self.page == 3 && !is_fixed_control(id) && y >= 252 {
-                    24
-                } else {
-                    0
                 }),
                 f(width),
                 f(height),
@@ -3296,7 +3306,7 @@ impl State {
                     535,
                     46,
                 );
-                self.button(5, "Export support report", 20, footer_y + 45, 205);
+                self.button(5, "Save support report", 20, footer_y + 45, 205);
             }
             2 => {
                 self.heading(90, "Battery history", 20, 68, 740);
@@ -3330,176 +3340,7 @@ impl State {
                 );
                 self.query();
             }
-            3 => {
-                // Leave a dedicated Appearance row for disconnected icons.
-                let lower = |y| y + 34;
-                let advanced_y = |y| lower(y) + settings_provider_tail(providers().len());
-                let value = serde_json::to_value(&self.settings).unwrap_or_default();
-                self.heading(90, "Alerts and battery", 20, 70, 740);
-                self.heading(91, "Icons and startup", 20, 252, 740);
-                self.heading(92, "Battery checks", 20, lower(412), 740);
-                self.heading(93, "Device controls", 20, lower(492), 740);
-                for (i, x, y, width) in [
-                    (0, 20, 104, 360),
-                    (1, 400, 104, 380),
-                    (6, 20, 138, 360),
-                    (8, 400, 138, 380),
-                    (12, 20, 170, 760),
-                    (3, 20, 288, 360),
-                    (4, 400, 288, 380),
-                    (7, 20, 322, 370),
-                    (13, 20, 392, 760),
-                    (5, 400, 322, 380),
-                    (2, 400, lower(448), 380),
-                    (9, 20, advanced_y(938), 760),
-                    (10, 20, advanced_y(972), 760),
-                    (11, 20, advanced_y(1048), 760),
-                ] {
-                    let (key, label) = CHECKS[i];
-                    self.check(
-                        setting_check_id(i),
-                        label,
-                        if key == "bluetooth" {
-                            self.settings.enabled("bluetooth")
-                        } else {
-                            value[key].as_bool().unwrap_or(false)
-                        },
-                        x,
-                        y,
-                        width,
-                    );
-                }
-                self.enable_control(111, false);
-                self.label(202, "Default low alert (%)", 20, 208, 180);
-                self.edit(203, &self.settings.low.to_string(), 210, 204, 80);
-                self.label(214, "Orange warning at (%)", 400, 208, 235);
-                self.edit(215, &self.settings.warning_level.to_string(), 650, 204, 80);
-                self.label(
-                    220,
-                    "Set a level to 0 to turn it off. Per-device alert levels take priority.",
-                    20,
-                    236,
-                    760,
-                );
-                self.label(204, "Tray icon colour", 20, 362, 150);
-                let themes = THEME_CHOICES
-                    .iter()
-                    .map(|s| (*s).to_owned())
-                    .collect::<Vec<_>>();
-                let chosen = ["auto", "white", "black", "windows", "topbar"]
-                    .iter()
-                    .position(|s| *s == self.settings.icon_theme)
-                    .unwrap_or(0);
-                self.combo(205, &themes, chosen, 170, 358, 215);
-                self.check(
-                    206,
-                    "Start at sign-in",
-                    hb_windows::system::is_startup(),
-                    400,
-                    358,
-                    380,
-                );
-                self.label(200, "Battery check interval (seconds)", 20, lower(452), 240);
-                self.edit(
-                    201,
-                    &self.settings.interval.to_string(),
-                    270,
-                    lower(448),
-                    100,
-                );
-                self.check(
-                    112,
-                    "Allow device settings changes",
-                    self.settings.polling_controls,
-                    20,
-                    lower(528),
-                    360,
-                );
-                self.check(
-                    113,
-                    "Restore saved rates when the app starts",
-                    self.settings.restore_polling_on_startup,
-                    400,
-                    lower(528),
-                    380,
-                );
-                self.control(216, w!("STATIC"),
-                    "Enable this to change supported devices' polling rate, sensitivity (DPI) and sleep time on Devices.",
-                    WINDOW_STYLE::default(), 20, lower(566), 760, 46);
-                self.heading(207, "Device brands to monitor", 20, lower(674), 740);
-                for (i, p) in providers().iter().enumerate() {
-                    self.check(
-                        300 + i as u16,
-                        provider_label(p),
-                        self.settings.enabled(p),
-                        20 + (i as i32 % 4) * 190,
-                        lower(708) + (i as i32 / 4) * 28,
-                        180,
-                    );
-                }
-                self.button(
-                    212,
-                    if self.more_options {
-                        "Hide advanced options"
-                    } else {
-                        "Advanced options"
-                    },
-                    20,
-                    lower(622),
-                    200,
-                );
-                self.control(
-                    213,
-                    w!("STATIC"),
-                    "Extra PlayStation checks are optional and may affect other controller apps.",
-                    WINDOW_STYLE::default(),
-                    20,
-                    advanced_y(1004),
-                    760,
-                    40,
-                );
-                self.heading(208, "About Halo Continued", 20, advanced_y(1070), 740);
-                self.label(
-                    218,
-                    concat!("Version ", env!("CARGO_PKG_VERSION"), " · Windows 11"),
-                    20,
-                    advanced_y(1105),
-                    440,
-                );
-                self.button(217, "Open data folder", 570, advanced_y(1100), 210);
-                self.edit(
-                    209,
-                    self.settings
-                        .release_repository
-                        .clone()
-                        .as_deref()
-                        .unwrap_or(""),
-                    20,
-                    advanced_y(1122),
-                    740,
-                );
-                self.label(
-                    219,
-                    "Closing this window keeps battery monitoring running. Use the tray menu to exit.",
-                    20,
-                    advanced_y(1156),
-                    760,
-                );
-                self.button(210, "&Save settings", 20, 682, 160);
-                self.button(5, "Export support report", 194, 682, 205);
-                let message = user_message(&self.error).to_owned();
-                self.control(
-                    95,
-                    w!("STATIC"),
-                    &message,
-                    WINDOW_STYLE::default(),
-                    415,
-                    732,
-                    365,
-                    46,
-                );
-                self.update_more_options();
-            }
+            3 => self.build_settings(),
             6 => self.build_insights(&names),
             _ => {}
         }
@@ -3580,7 +3421,7 @@ impl State {
             760,
             46,
         );
-        self.heading(73, "Your polling habits", 20, 348, 760);
+        self.heading(73, "How you use your battery", 20, 348, 760);
         self.widget(
             410,
             "Polling-rate mix · last 7 days\nWaiting for confirmed readings",
@@ -3591,7 +3432,7 @@ impl State {
         );
         self.widget(
             411,
-            "Polling changes · last 7 days\nWaiting for recorded changes",
+            "Activity · last 7 days\nWaiting for recorded changes",
             406,
             388,
             374,
@@ -3942,7 +3783,7 @@ impl State {
                 410,
                 "Polling-rate mix · last 7 days\nNo history loaded. Select Refresh to try again.",
             );
-            self.set_control_text(411, "Polling changes · last 7 days\nNo history loaded.");
+            self.set_control_text(411, "Activity · last 7 days\nNo history loaded.");
             return;
         };
         let recent = &data.recent;
@@ -3982,8 +3823,23 @@ impl State {
             ),
             _ => "Fixed-rate comparison is still learning".into(),
         };
-        self.set_control_text(411,&format!("Polling changes · last 7 days\nGame boosts · {}    Restored · {}\n{} during confirmed boosts\nManual choices · {}\nBattery saver · {} changes / {} restores\n{} with battery saver\n{}\n{}\nRecorded use is not gaming time",recent.boost_sessions,recent.restores,insight_hours(recent.boost_seconds),recent.manual_changes,recent.saver_changes,recent.saver_restores,insight_hours(recent.saver_seconds),
-            boost.map(|r|format!("Game boost setting · {} Hz",r.hz())).unwrap_or_else(||"Game boost setting · Off".into()),comparison));
+        let mut activity = format!(
+            "Activity · last 7 days\nGame boost · {} starts / {} restores\nConfirmed boost use · {}\nManual rate changes · {}\nBattery saver · {} changes / {} restores",
+            recent.boost_sessions,
+            recent.restores,
+            insight_hours(recent.boost_seconds),
+            recent.manual_changes,
+            recent.saver_changes,
+            recent.saver_restores,
+        );
+        if recent.saver_seconds > 0 {
+            activity.push_str(&format!(
+                "\nBattery saver use · {}",
+                insight_hours(recent.saver_seconds)
+            ));
+        }
+        activity.push_str(&format!("\n{comparison}"));
+        self.set_control_text(411, &activity);
     }
     fn save(&mut self) {
         self.runtime.send(Command::Settings(self.settings.clone()));
@@ -6129,7 +5985,11 @@ impl State {
         for t in self.trays.values_mut().filter(|t| {
             t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
         }) {
+            let previous = t.frames[t.frame].0;
             t.frame = (t.frame + 1) % t.frames.len();
+            if t.frames[t.frame].0 == previous {
+                continue;
+            }
             let mut data = t.data;
             data.uFlags = NIF_GUID | NIF_ICON;
             data.hIcon = t.frames[t.frame].0;
@@ -7005,6 +6865,8 @@ struct PopupItem {
     enabled: bool,
     command: u32,
     header: bool,
+    width: u32,
+    value_width: i32,
 }
 struct PopupAppearance {
     menu: HMENU,
@@ -7140,14 +7002,53 @@ impl PopupAppearance {
                     let length =
                         GetMenuStringW(menu, index, Some(&mut text), MF_BYPOSITION).max(0) as usize;
                     let text = text[..length].to_vec();
-                    let mut rect = RECT::default();
-                    let mut measure = text.clone();
-                    if !measure.is_empty() {
-                        DrawTextW(hdc, &mut measure, &mut rect, DT_SINGLELINE | DT_CALCRECT);
-                    }
-                    appearance.width = appearance
-                        .width
-                        .max((rect.right - rect.left).max(0) as u32 + (padding * 2) as u32);
+                    let header = menu == appearance.menu
+                        && index == 0
+                        && info.wID == 0
+                        && info.fType.0 & MFT_SEPARATOR.0 == 0;
+                    let multiline = text.contains(&10);
+                    SelectObject(
+                        hdc,
+                        if header || multiline {
+                            appearance.heading_font
+                        } else {
+                            font
+                        }
+                        .into(),
+                    );
+                    // Measure lines separately: a device heading and its status
+                    // occupy the same width. Tabs need room for both columns.
+                    let width = text
+                        .split(|unit| *unit == 10)
+                        .filter(|line| !line.is_empty())
+                        .map(|line| {
+                            let mut rect = RECT::default();
+                            let mut line = line.to_vec();
+                            for unit in &mut line {
+                                if *unit == 9 {
+                                    *unit = 32;
+                                }
+                            }
+                            DrawTextW(hdc, &mut line, &mut rect, DT_SINGLELINE | DT_CALCRECT);
+                            (rect.right - rect.left).max(0) as u32
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let value_width = text
+                        .iter()
+                        .position(|unit| *unit == 9)
+                        .filter(|index| index + 1 < text.len())
+                        .map_or(0, |index| {
+                            let mut value = text[index + 1..].to_vec();
+                            let mut bounds = RECT::default();
+                            DrawTextW(hdc, &mut value, &mut bounds, DT_SINGLELINE | DT_CALCRECT);
+                            (bounds.right - bounds.left).max(0)
+                        });
+                    let gutters = if menu == appearance.menu && !header {
+                        5
+                    } else {
+                        3
+                    };
                     appearance.items.push(PopupItem {
                         menu,
                         position: index,
@@ -7158,10 +7059,9 @@ impl PopupAppearance {
                         separator: info.fType.0 & MFT_SEPARATOR.0 != 0,
                         enabled: info.fState.0 & (MFS_DISABLED.0 | MFS_GRAYED.0) == 0,
                         command: info.wID,
-                        header: menu == appearance.menu
-                            && index == 0
-                            && info.wID == 0
-                            && info.fType.0 & MFT_SEPARATOR.0 == 0,
+                        header,
+                        width: width + (padding * gutters) as u32,
+                        value_width,
                     });
                     if !info.hSubMenu.is_invalid() && !pending_menus.contains(&info.hSubMenu) {
                         pending_menus.push(info.hSubMenu);
@@ -7170,7 +7070,28 @@ impl PopupAppearance {
             }
             let _ = RestoreDC(hdc, saved);
             ReleaseDC(Some(owner), hdc);
-            appearance.width = appearance.width.clamp(260 * dpi / 96, 340 * dpi / 96);
+            for (menu, _) in &appearance.menus {
+                let root = *menu == appearance.menu;
+                let width = appearance
+                    .items
+                    .iter()
+                    .filter(|item| item.menu == *menu)
+                    .map(|item| item.width)
+                    .max()
+                    .unwrap_or(0)
+                    .clamp(
+                        (if root { 280 } else { 190 }) * dpi / 96,
+                        (if root { 380 } else { 440 }) * dpi / 96,
+                    );
+                for item in &mut appearance.items {
+                    if item.menu == *menu {
+                        item.width = width;
+                    }
+                }
+                if root {
+                    appearance.width = width;
+                }
+            }
             // Strings remain MIIM_STRING data for accessibility and inspection.
             for (index, item) in appearance.items.iter().enumerate() {
                 let info = MENUITEMINFOW {
@@ -7283,10 +7204,10 @@ impl PopupAppearance {
                     return None;
                 }
                 let entry = self.items.get(item.itemData.checked_sub(1)?)?;
-                item.itemWidth = self.width;
+                item.itemWidth = entry.width;
                 item.itemHeight = if entry.separator {
                     (self.row_height / 3).max(1)
-                } else if entry.header {
+                } else if entry.header || entry.text.contains(&10) {
                     self.row_height * 2
                 } else {
                     self.row_height
@@ -7349,13 +7270,20 @@ impl PopupAppearance {
                 if item.itemState.0 & ODS_NOACCEL.0 != 0 {
                     flags |= DT_HIDEPREFIX;
                 }
-                if entry.header {
+                if entry.header || text.contains(&10) {
                     SelectObject(item.hDC, self.heading_font.into());
                     let split = text.iter().position(|unit| *unit == 10);
                     let title_end = split.unwrap_or(text.len());
                     let mut title_rect = rect;
                     title_rect.bottom = rect.top + self.row_height as i32;
-                    SetTextColor(item.hDC, self.palette.text);
+                    SetTextColor(
+                        item.hDC,
+                        if disabled && !entry.header {
+                            self.palette.disabled
+                        } else {
+                            self.palette.text
+                        },
+                    );
                     DrawTextW(item.hDC, &mut text[..title_end], &mut title_rect, flags);
                     if let Some(split) = split {
                         SelectObject(item.hDC, self.font.into());
@@ -7382,6 +7310,8 @@ impl PopupAppearance {
                                     "boost"
                                 } else if label.contains("Battery") {
                                     "battery"
+                                } else if label.contains("Displays") {
+                                    "display"
                                 } else if label.contains("Other") {
                                     "devices"
                                 } else {
@@ -7408,11 +7338,35 @@ impl PopupAppearance {
                         );
                         rect.left += size + self.padding / 2;
                     }
-                    if let Some(tab) = text.iter().position(|unit| *unit == 9) {
+                    if let Some(tab) = text
+                        .iter()
+                        .position(|unit| *unit == 9)
+                        .filter(|index| index + 1 < text.len())
+                    {
                         let mut right = rect;
+                        let suffix_width = entry.value_width.min((rect.right - rect.left) / 2);
+                        right.left = right.right - suffix_width;
+                        SetTextColor(
+                            item.hDC,
+                            if selected {
+                                self.palette.selection_text
+                            } else {
+                                self.palette.disabled
+                            },
+                        );
                         DrawTextW(item.hDC, &mut text[tab + 1..], &mut right, flags | DT_RIGHT);
                         text.truncate(tab);
-                        rect.right -= self.padding * 5;
+                        rect.right = right.left - self.padding;
+                        SetTextColor(
+                            item.hDC,
+                            if disabled {
+                                self.palette.disabled
+                            } else if selected {
+                                self.palette.selection_text
+                            } else {
+                                self.palette.text
+                            },
+                        );
                     }
                     DrawTextW(item.hDC, &mut text, &mut rect, flags);
                 }
@@ -8063,6 +8017,51 @@ mod popup_theme_tests {
             }
             drop(menu);
             drop(appearance);
+        }
+    }
+    #[test]
+    fn multiline_menu_rows_and_submenu_widths_keep_status_readable() {
+        let _guard = NATIVE_TEST_LOCK.lock().unwrap();
+        unsafe {
+            let menu = Popup(CreatePopupMenu().unwrap());
+            AppendMenuW(
+                menu.0,
+                MF_STRING | MF_GRAYED,
+                0,
+                w!("A long device heading for a wireless mouse\nBattery 62%"),
+            )
+            .unwrap();
+            let submenu = Popup(CreatePopupMenu().unwrap());
+            AppendMenuW(submenu.0, MF_STRING, 520, w!("1000 Hz")).unwrap();
+            AppendMenuW(menu.0, MF_POPUP, submenu.0.0 as usize, w!("Polling rate")).unwrap();
+            std::mem::forget(submenu);
+            AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()).unwrap();
+            let appearance =
+                PopupAppearance::new(menu.0, HWND::default(), Palette::new(true, false)).unwrap();
+            let rate = appearance
+                .items
+                .iter()
+                .find(|entry| entry.command == 520)
+                .unwrap();
+            assert!(
+                rate.width < appearance.width,
+                "Short submenus must not inherit the root menu's width"
+            );
+            let mut measured = MEASUREITEMSTRUCT {
+                CtlType: ODT_MENU,
+                itemData: 1,
+                ..Default::default()
+            };
+            appearance
+                .message(
+                    WM_MEASUREITEM,
+                    WPARAM(0),
+                    LPARAM(&mut measured as *mut _ as isize),
+                )
+                .unwrap();
+            assert_eq!(measured.itemHeight, appearance.row_height * 2);
+            assert_eq!(measured.itemWidth, appearance.width);
+            appearance.restore_native();
         }
     }
     #[test]
@@ -9423,6 +9422,28 @@ mod dashboard_lifecycle_tests {
         if requested != "1" && requested != phase {
             return;
         }
+        if std::env::var_os("HALO_COMPARE_CHARGING").is_some() {
+            // Same process, hardware-free workload and warmed runtime. Alternate
+            // only icon ownership/update behaviour, two minutes per variant.
+            sample_dashboard_window(context, "shared", true, false, 120);
+            sample_dashboard_window(context, "unshared", true, true, 120);
+        } else {
+            sample_dashboard_window(
+                context,
+                phase,
+                std::env::var_os("HALO_MEASURE_CHARGING").is_some(),
+                false,
+                180,
+            );
+        }
+    }
+    fn sample_dashboard_window(
+        context: &UiContext,
+        phase: &str,
+        charging: bool,
+        unshared: bool,
+        seconds: u64,
+    ) {
         use windows::Win32::System::{
             ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX},
             Threading::{GetCurrentProcess, GetProcessTimes},
@@ -9449,16 +9470,65 @@ mod dashboard_lifecycle_tests {
                 .runtime
                 .attach_window(monitor.0 as usize);
             context.state.borrow_mut().drain();
+            if charging {
+                context.state.borrow().runtime.send(Command::Refresh);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    dispatch_monitor(monitor);
+                    context.state.borrow_mut().drain();
+                    if context
+                        .state
+                        .borrow()
+                        .snapshot
+                        .devices
+                        .iter()
+                        .any(|device| {
+                            device.reading.source == "simulation"
+                                && device.reading.level == Some(73)
+                                && device.reading.charging == Some(true)
+                        })
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Simulated charging fixture did not arrive"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             {
                 let mut state = context.state.borrow_mut();
-                state.settings.animation = false;
+                state.settings.animation = charging;
                 state.sync_trays(TrayUpdate::Changed);
+                if unshared {
+                    let settings = state.settings.clone();
+                    let device = state
+                        .snapshot
+                        .devices
+                        .iter()
+                        .find(|d| d.reading.key == "simulated:mouse")
+                        .unwrap()
+                        .clone();
+                    let tray = state.trays.get_mut("simulated:mouse").unwrap();
+                    tray.frames =
+                        icons::unshared_frames(&device, &settings, tray.signature.dark, 32)
+                            .unwrap();
+                    tray.frame = 0;
+                    tray.data.hIcon = tray.frames[0].0;
+                    tray.registration.update_with(
+                        &tray.data,
+                        TrayUpdate::Redraw,
+                        true,
+                        &mut shell_notify,
+                    );
+                }
             }
             let start = Instant::now();
             let start_cpu = cpu();
             let (mut total, mut count, mut peak, mut last) = (0u64, 0u64, 0usize, 0usize);
-            eprintln!("Starting three-minute UI resource sample: {phase}");
-            while start.elapsed() < Duration::from_secs(180) {
+            eprintln!("Starting {seconds}-second UI resource sample: {phase}");
+            while start.elapsed() < Duration::from_secs(seconds) {
                 MsgWaitForMultipleObjectsEx(None, 1000, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 // The fixture also owns native framework windows. Drain the whole
                 // thread queue so an unrelated paint cannot leave the wait signalled.
@@ -9486,11 +9556,25 @@ mod dashboard_lifecycle_tests {
                 assert!(context.state.borrow().dashboard.is_none());
             }
             let elapsed = start.elapsed().as_secs_f64();
-            let report = serde_json::json!({"phase": phase, "seconds": elapsed,
+            let icon_count: usize = context
+                .state
+                .borrow()
+                .trays
+                .values()
+                .map(|tray| tray.frames.unique_len())
+                .sum();
+            if charging {
+                assert_eq!(
+                    icon_count,
+                    if unshared { 30 } else { 14 },
+                    "The benchmark must keep its selected frame strategy throughout"
+                );
+            }
+            let report = serde_json::json!({"native_icon_count": icon_count, "phase": phase, "seconds": elapsed,
                 "cpu_percent_one_core": (cpu() - start_cpu) as f64 / 10_000_000. / elapsed * 100.,
                 "private_mean_mib": total as f64 / count as f64 / 1048576.,
                 "private_peak_mib": peak as f64 / 1048576., "private_end_mib": last as f64 / 1048576.,
-                "workload": "Optimized native test fixture, simulated mouse, dashboard closed, no charging animation"});
+                "workload": if charging { "Optimized native test fixture, simulated mouse at 73%, dashboard closed, charging animation enabled" } else { "Optimized native test fixture, simulated mouse, dashboard closed, no charging animation" }});
             // An isolated destination keeps benchmark runs from replacing
             // earlier measurements. This path exists only in test builds.
             let output = std::env::var_os("HALO_UI_RESOURCE_DIRECTORY")
@@ -9954,115 +10038,141 @@ mod dashboard_lifecycle_tests {
                 assert!(state.configuration_devices.iter().any(|d| d.key == key));
                 assert!(id >= 33000);
             }
+            display_menu::tests::append_fixture(menu.0);
             let palette = Palette::new(dark, false);
             let appearance = PopupAppearance::new(menu.0, state.monitor, palette).unwrap();
-            let entries = appearance
+            let display = appearance
                 .items
                 .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.menu == menu.0)
-                .collect::<Vec<_>>();
-            let mut heights = Vec::new();
-            for (i, _) in &entries {
-                let mut measured = MEASUREITEMSTRUCT {
-                    CtlType: ODT_MENU,
-                    itemData: i + 1,
-                    ..Default::default()
-                };
-                appearance
-                    .message(
-                        WM_MEASUREITEM,
-                        WPARAM(0),
-                        LPARAM(&mut measured as *mut _ as isize),
+                .find(|entry| entry.command == 24000)
+                .unwrap()
+                .menu;
+            for (captured_menu, capture_name) in
+                [(menu.0, "overview-menu"), (display, "displays-menu")]
+            {
+                let entries = appearance
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.menu == captured_menu)
+                    .collect::<Vec<_>>();
+                let mut heights = Vec::new();
+                for (i, _) in &entries {
+                    let mut measured = MEASUREITEMSTRUCT {
+                        CtlType: ODT_MENU,
+                        itemData: i + 1,
+                        ..Default::default()
+                    };
+                    appearance
+                        .message(
+                            WM_MEASUREITEM,
+                            WPARAM(0),
+                            LPARAM(&mut measured as *mut _ as isize),
+                        )
+                        .unwrap();
+                    heights.push(measured.itemHeight as i32);
+                }
+                if captured_menu == menu.0 {
+                    assert!(heights[0] > heights[1], "device heading needs two lines");
+                } else {
+                    assert!(
+                        heights
+                            .iter()
+                            .all(|h| *h == appearance.row_height as i32 * 2),
+                        "HDR names and states need separate lines"
+                    );
+                }
+                let width = entries[0].1.width as i32;
+                let height = heights.iter().sum::<i32>();
+                let source = GetDC(Some(state.monitor));
+                let dc = CreateCompatibleDC(Some(source));
+                let bitmap = CreateCompatibleBitmap(source, width, height);
+                let old = SelectObject(dc, bitmap.into());
+                let mut top = 0;
+                for ((i, entry), h) in entries.iter().zip(&heights) {
+                    let item = DRAWITEMSTRUCT {
+                        CtlType: ODT_MENU,
+                        hwndItem: HWND(captured_menu.0),
+                        hDC: dc,
+                        itemData: i + 1,
+                        rcItem: RECT {
+                            left: 0,
+                            top,
+                            right: width,
+                            bottom: top + h,
+                        },
+                        itemState: windows::Win32::UI::Controls::ODS_FLAGS(
+                            (if entry.enabled { 0 } else { ODS_DISABLED.0 })
+                                | if GetMenuState(entry.menu, entry.position, MF_BYPOSITION)
+                                    & MF_CHECKED.0
+                                    != 0
+                                {
+                                    ODS_CHECKED.0
+                                } else {
+                                    0
+                                },
+                        ),
+                        ..Default::default()
+                    };
+                    appearance
+                        .message(WM_DRAWITEM, WPARAM(0), LPARAM(&item as *const _ as isize))
+                        .unwrap();
+                    top += h;
+                }
+                SelectObject(dc, old);
+                if std::env::var_os("HALO_CAPTURE_DASHBOARD_TEST").is_some() {
+                    let mut info = BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: width,
+                            biHeight: -height,
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut pixels = vec![0u8; (width * height * 4) as usize];
+                    assert_eq!(
+                        GetDIBits(
+                            dc,
+                            bitmap,
+                            0,
+                            height as u32,
+                            Some(pixels.as_mut_ptr().cast()),
+                            &mut info,
+                            DIB_RGB_COLORS
+                        ),
+                        height
+                    );
+                    let mut file = Vec::with_capacity(54 + pixels.len());
+                    file.extend_from_slice(b"BM");
+                    file.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+                    file.extend_from_slice(&[0; 4]);
+                    file.extend_from_slice(&54u32.to_le_bytes());
+                    file.extend_from_slice(&40u32.to_le_bytes());
+                    file.extend_from_slice(&width.to_le_bytes());
+                    file.extend_from_slice(&(-height).to_le_bytes());
+                    file.extend_from_slice(&1u16.to_le_bytes());
+                    file.extend_from_slice(&32u16.to_le_bytes());
+                    file.extend_from_slice(&[0; 24]);
+                    file.extend_from_slice(&pixels);
+                    let output = capture_directory();
+                    std::fs::create_dir_all(&output).unwrap();
+                    std::fs::write(
+                        output.join(format!(
+                            "{capture_name}-{}.bmp",
+                            if dark { "dark" } else { "light" }
+                        )),
+                        file,
                     )
                     .unwrap();
-                heights.push(measured.itemHeight as i32);
+                }
+                let _ = DeleteObject(bitmap.into());
+                let _ = DeleteDC(dc);
+                ReleaseDC(Some(state.monitor), source);
             }
-            assert!(heights[0] > heights[1], "device heading needs two lines");
-            let width = appearance.width as i32;
-            let height = heights.iter().sum::<i32>();
-            let source = GetDC(Some(state.monitor));
-            let dc = CreateCompatibleDC(Some(source));
-            let bitmap = CreateCompatibleBitmap(source, width, height);
-            let old = SelectObject(dc, bitmap.into());
-            let mut top = 0;
-            for ((i, entry), h) in entries.iter().zip(&heights) {
-                let item = DRAWITEMSTRUCT {
-                    CtlType: ODT_MENU,
-                    hwndItem: HWND(menu.0.0),
-                    hDC: dc,
-                    itemData: i + 1,
-                    rcItem: RECT {
-                        left: 0,
-                        top,
-                        right: width,
-                        bottom: top + h,
-                    },
-                    itemState: if entry.enabled {
-                        Default::default()
-                    } else {
-                        ODS_DISABLED
-                    },
-                    ..Default::default()
-                };
-                appearance
-                    .message(WM_DRAWITEM, WPARAM(0), LPARAM(&item as *const _ as isize))
-                    .unwrap();
-                top += h;
-            }
-            SelectObject(dc, old);
-            if std::env::var_os("HALO_CAPTURE_DASHBOARD_TEST").is_some() {
-                let mut info = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: width,
-                        biHeight: -height,
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB.0,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                let mut pixels = vec![0u8; (width * height * 4) as usize];
-                assert_eq!(
-                    GetDIBits(
-                        dc,
-                        bitmap,
-                        0,
-                        height as u32,
-                        Some(pixels.as_mut_ptr().cast()),
-                        &mut info,
-                        DIB_RGB_COLORS
-                    ),
-                    height
-                );
-                let mut file = Vec::with_capacity(54 + pixels.len());
-                file.extend_from_slice(b"BM");
-                file.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
-                file.extend_from_slice(&[0; 4]);
-                file.extend_from_slice(&54u32.to_le_bytes());
-                file.extend_from_slice(&40u32.to_le_bytes());
-                file.extend_from_slice(&width.to_le_bytes());
-                file.extend_from_slice(&(-height).to_le_bytes());
-                file.extend_from_slice(&1u16.to_le_bytes());
-                file.extend_from_slice(&32u16.to_le_bytes());
-                file.extend_from_slice(&[0; 24]);
-                file.extend_from_slice(&pixels);
-                let output = capture_directory();
-                std::fs::create_dir_all(&output).unwrap();
-                std::fs::write(
-                    output.join(format!(
-                        "overview-menu-{}.bmp",
-                        if dark { "dark" } else { "light" }
-                    )),
-                    file,
-                )
-                .unwrap();
-            }
-            let _ = DeleteObject(bitmap.into());
-            let _ = DeleteDC(dc);
-            ReleaseDC(Some(state.monitor), source);
             drop(menu);
             drop(appearance);
         }
@@ -10192,6 +10302,25 @@ mod dashboard_lifecycle_tests {
                 assert!(state.tooltip_rates.contains_key("simulated:mouse"));
                 assert!(state.dashboard.is_none());
                 assert!(state.controls.is_empty());
+                // Rendering-only transitions: preserve hardware/state settings
+                // while proving that a full charge stops the animation timer
+                // and a subsequent drop restarts the same thirty-step cycle.
+                let original_snapshot = state.snapshot.clone();
+                let animation = state.settings.animation;
+                state.settings.animation = true;
+                for (level, animated) in [(73, true), (100, false), (99, true)] {
+                    state.snapshot.devices[0].reading.level = Some(level);
+                    state.snapshot.devices[0].reading.charging = Some(true);
+                    state.sync_trays(TrayUpdate::Changed);
+                    assert_eq!(state.animating, animated);
+                    assert_eq!(
+                        state.trays["simulated:mouse"].frames.len(),
+                        if animated { 30 } else { 1 }
+                    );
+                }
+                state.snapshot = original_snapshot;
+                state.settings.animation = animation;
+                state.sync_trays(TrayUpdate::Changed);
                 let hz = if restore { 2000 } else { 1000 };
                 let expected_tip = format!("Polling: {hz} Hz (last confirmed)");
                 assert_eq!(
@@ -10632,6 +10761,9 @@ mod dashboard_lifecycle_tests {
                 );
                 assert!(!context.state.borrow().runtime.configuration_visible());
                 send(monitor, WM_APP + 8, WPARAM(0), LPARAM(0));
+                // Restore can finish through queued native positioning/visibility
+                // messages. Match the production pump, as for hiding above.
+                dispatch_monitor(monitor);
                 assert_eq!(context.state.borrow().dashboard, Some(first));
                 assert!(IsWindowVisible(first).as_bool());
                 assert!(!IsIconic(first).as_bool());
@@ -11176,6 +11308,30 @@ mod dashboard_lifecycle_tests {
                                         "Settings controls {id} and {other} overlap"
                                     );
                                 }
+                            }
+                            // Surface markers must not leave a child painted
+                            // across the card edge, including at scaled DPI.
+                            let mut panels = Vec::new();
+                            for id in 460..=463 {
+                                let mut rect = RECT::default();
+                                GetWindowRect(state.controls[&id], &mut rect).unwrap();
+                                panels.push(rect);
+                            }
+                            for (id, child) in &state.controls {
+                                if GetWindowLongPtrW(*child, GWLP_USERDATA)
+                                    != crate::dashboard_theme::PANEL_MARKER
+                                {
+                                    continue;
+                                }
+                                let mut bounds = RECT::default();
+                                GetWindowRect(*child, &mut bounds).unwrap();
+                                assert!(
+                                    panels.iter().any(|panel| bounds.left >= panel.left
+                                        && bounds.right <= panel.right
+                                        && bounds.top >= panel.top
+                                        && bounds.bottom <= panel.bottom),
+                                    "Settings control {id} extends outside its card"
+                                );
                             }
                             let retained_id = setting_check_id(
                                 CHECKS

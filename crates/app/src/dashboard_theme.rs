@@ -863,7 +863,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                     && SendMessageW(hwnd, BM_GETCHECK, None, None).0 == BST_CHECKED.0 as isize;
                 let enabled = IsWindowEnabled(hwnd).as_bool();
                 let id = GetDlgCtrlID(hwnd);
-                let navigation = matches!(id, 1..=4 | 6 | 17..=19 | 22 | 24);
+                let navigation = matches!(id, 1..=3 | 6 | 17..=19 | 22 | 24);
                 let primary = matches!(id, 15 | 40 | 210 | 433 | 453) && !check;
                 let active = enabled && (appearance.hovered || state & BST_PUSHED != 0);
                 let background = if check {
@@ -871,7 +871,11 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                 } else if primary && enabled {
                     palette.accent
                 } else if navigation {
-                    palette.background
+                    if active {
+                        palette.selection
+                    } else {
+                        palette.background
+                    }
                 } else if selected || active {
                     palette.selection
                 } else {
@@ -952,7 +956,9 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                         },
                         10 * dpi / 96,
                     );
-                    if selected && !navigation {
+                    // A persistent underline identifies the current page even
+                    // without colour. It uses the same paint pass as the label.
+                    if selected {
                         let rail = RECT {
                             left: rect.left + 14 * dpi / 96,
                             right: rect.right - 14 * dpi / 96,
@@ -989,7 +995,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                 );
                 SetBkMode(hdc, TRANSPARENT);
                 let ui = SendMessageW(hwnd, WM_QUERYUISTATE, None, None).0 as u32;
-                let mut flags = DT_SINGLELINE | DT_VCENTER;
+                let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
                 if !check {
                     flags |= DT_CENTER;
                 }

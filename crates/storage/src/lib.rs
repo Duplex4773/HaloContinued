@@ -556,14 +556,15 @@ impl Store {
             let sql = if self.has_usage_metadata
                 && result.recent.since > until.saturating_sub(7 * 86400)
             {
-                "SELECT kind,rate,previous_rate FROM polling_events e WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?2 OR EXISTS(SELECT 1 FROM usage_metadata m WHERE m.device=e.device AND m.ts BETWEEN ?2 AND ?3 AND m.session=e.session)) ORDER BY ts"
+                "SELECT kind,rate,previous_rate FROM polling_events e WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?2 OR EXISTS(SELECT 1 FROM usage_metadata m WHERE m.device=e.device AND m.ts BETWEEN ?2 AND ?3 AND m.session=e.session)) ORDER BY ts,rowid"
             } else {
-                "SELECT kind,rate,previous_rate FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts"
+                "SELECT kind,rate,previous_rate FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid"
             };
             let mut query = self.db.prepare(sql).map_err(sql_error)?;
             let mut rows = query
                 .query(params![key, result.recent.since, until])
                 .map_err(sql_error)?;
+            let mut saver_rate = None;
             while let Some(row) = rows.next().map_err(sql_error)? {
                 // One malformed event must not prevent the rest of the user's
                 // valid battery history from loading, or inflate activity counts.
@@ -582,6 +583,32 @@ impl Store {
                 if previous.is_some_and(|hz| PollingRate::try_from(hz).is_err()) {
                     continue;
                 }
+                // Follow confirmed ownership in event order. A boost can start
+                // above Battery saver's temporary rate; that is not the user's
+                // normal rate. Manual confirmations establish a new baseline
+                // even when no SET was necessary.
+                let normal = match kind {
+                    "manual" | "saver_restore" => {
+                        saver_rate = None;
+                        Some(rate)
+                    }
+                    "saver" => {
+                        saver_rate = Some(rate);
+                        previous.filter(|previous| *previous > rate)
+                    }
+                    "boost" if previous != saver_rate => {
+                        saver_rate = None;
+                        previous.filter(|previous| *previous < rate)
+                    }
+                    "restore" if Some(rate) != saver_rate => {
+                        saver_rate = None;
+                        Some(rate)
+                    }
+                    _ => None,
+                };
+                if let Some(normal) = normal {
+                    result.recent.normal_rate = PollingRate::try_from(normal).ok();
+                }
                 // Same-rate confirmations can transfer ownership from an
                 // automatic boost to a manual choice. Keep those events for
                 // interval classification, but do not count a hardware change.
@@ -591,9 +618,6 @@ impl Store {
                 match kind {
                     "boost" => {
                         result.recent.boost_sessions += 1;
-                        result.recent.normal_rate = previous
-                            .filter(|previous| *previous < rate)
-                            .and_then(|hz| PollingRate::try_from(hz).ok());
                     }
                     "restore" => result.recent.restores += 1,
                     "manual" => result.recent.manual_changes += 1,

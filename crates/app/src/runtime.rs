@@ -585,7 +585,7 @@ impl SnapshotPublisher {
         if !self.changed && now < self.next {
             return;
         }
-        if self.changed || self.unpublished || engine.settings.status_file {
+        if self.changed || self.unpublished {
             let snapshot = engine.snapshot(timestamp);
             self.unpublished = if engine.settings.status_file {
                 let rejected = events.try_send(Event::Snapshot(snapshot.clone())).is_err();
@@ -598,6 +598,12 @@ impl SnapshotPublisher {
             // Freshness labels and theme recovery keep the same cadence without
             // rebuilding readings, estimates, strings and inventory every tick.
             let _ = events.try_send(Event::Heartbeat(timestamp));
+            // Export freshness does not imply a device change. Keep the status
+            // file current without cloning its inventory for the UI or making
+            // the UI repeat identity checks and tray synchronization.
+            if engine.settings.status_file {
+                let _ = storage.send(Storage::Status(engine.snapshot(timestamp), true));
+            }
         }
         self.changed = false;
         self.next = now + Duration::from_secs(5);
@@ -6876,11 +6882,11 @@ mod tests {
         );
         // Heartbeats use monotonic time, including after a wall-clock correction.
         publisher.publish(&engine, 90, start + Duration::from_secs(5), &sink, &storage);
-        let Event::Snapshot(snapshot) = events.try_recv().unwrap() else {
-            panic!("missing heartbeat")
+        assert!(matches!(events.try_recv(), Ok(Event::Heartbeat(90))));
+        let Storage::Status(snapshot, true) = statuses.try_recv().unwrap() else {
+            panic!("missing export heartbeat")
         };
         assert_eq!(snapshot.timestamp, 90);
-        assert!(matches!(statuses.try_recv(), Ok(Storage::Status(_, true))));
         let mut reading = Reading::new("mouse", "Mouse", "razer", 91);
         reading.level = Some(70);
         let result = Ok(vec![reading]);
@@ -6946,6 +6952,75 @@ mod tests {
         assert!(statuses.is_empty());
     }
 
+    #[test]
+    fn export_heartbeats_only_allocate_the_export_and_retry_missing_device_updates() {
+        let (tx, events) = bounded(1);
+        let sink = Events {
+            tx,
+            window: Arc::new(AtomicUsize::new(0)),
+        };
+        let (storage, statuses) = bounded(1);
+        let mut engine = Engine::new(
+            Settings {
+                status_file: true,
+                ..Default::default()
+            },
+            Estimator::default(),
+        );
+        let mut reading = Reading::new("synthetic:mouse", "Test mouse", "razer", 100);
+        reading.level = Some(80);
+        engine.apply("razer", Ok(vec![reading.clone()]), 0.0, false);
+        let start = Instant::now();
+        let mut publisher = SnapshotPublisher::new(start);
+        publisher.publish(&engine, 100, start, &sink, &storage);
+        assert!(matches!(events.try_recv(), Ok(Event::Snapshot(_))));
+        assert!(matches!(statuses.try_recv(), Ok(Storage::Status(_, true))));
+        let (_, export_allocations) = crate::allocation_counter::measure(|| engine.snapshot(105));
+        let (_, heartbeat_allocations) = crate::allocation_counter::measure(|| {
+            publisher.publish(
+                &engine,
+                105,
+                start + Duration::from_secs(5),
+                &sink,
+                &storage,
+            );
+        });
+        assert_eq!(heartbeat_allocations.calls, export_allocations.calls);
+        assert_eq!(heartbeat_allocations.bytes, export_allocations.bytes);
+        println!("Export heartbeat (one device): {heartbeat_allocations:?}");
+        // Leave the heartbeat queued: a changed reading must be retried as a
+        // full snapshot when UI delivery fails, even though export succeeded.
+        assert!(matches!(statuses.try_recv(), Ok(Storage::Status(_, true))));
+        reading.level = Some(70);
+        engine.apply("razer", Ok(vec![reading]), 6.0, false);
+        publisher.changed = true;
+        publisher.publish(
+            &engine,
+            106,
+            start + Duration::from_secs(6),
+            &sink,
+            &storage,
+        );
+        assert!(publisher.unpublished);
+        let Storage::Status(export, true) = statuses.try_recv().unwrap() else {
+            panic!("missing changed export")
+        };
+        assert_eq!(export.devices[0].reading.level, Some(70));
+        assert!(matches!(events.try_recv(), Ok(Event::Heartbeat(105))));
+        publisher.publish(
+            &engine,
+            111,
+            start + Duration::from_secs(11),
+            &sink,
+            &storage,
+        );
+        let Event::Snapshot(snapshot) = events.try_recv().unwrap() else {
+            panic!("missing retry")
+        };
+        assert_eq!(snapshot.devices[0].reading.level, Some(70));
+        assert!(!publisher.unpublished);
+        assert!(matches!(statuses.try_recv(), Ok(Storage::Status(_, true))));
+    }
     #[test]
     fn identical_cached_readings_and_repeated_errors_do_not_republish_snapshots() {
         let mut engine = Engine::new(Settings::default(), Estimator::default());

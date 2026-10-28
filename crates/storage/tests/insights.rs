@@ -603,7 +603,7 @@ fn confirmed_events_are_scoped_idempotent_and_not_inferred_for_old_data() {
     assert_eq!(data.recent.restores, 0);
     assert_eq!(data.recent.boost_seconds, 60);
     assert_eq!(data.recent.total_seconds, 240);
-    assert_eq!(data.recent.normal_rate, PollingRate::try_from(1000).ok());
+    assert_eq!(data.recent.normal_rate, PollingRate::try_from(2000).ok());
     assert_eq!(
         store
             .query_insights("other", 300)

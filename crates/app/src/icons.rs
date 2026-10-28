@@ -9,17 +9,99 @@ impl Drop for Icon {
         }
     }
 }
+/// Own each distinct native icon once, while retaining every animation step.
+/// The fixed index table needs no allocation or reference counting and cannot
+/// outlive the handles it indexes. Everything is released with the tray icon.
+pub struct Frames {
+    icons: Vec<Icon>,
+    order: [u8; 30],
+    count: usize,
+}
+impl Frames {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    #[cfg(test)]
+    pub(super) fn unique_len(&self) -> usize {
+        self.icons.len()
+    }
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &Icon> {
+        (0..self.count).map(|frame| &self[frame])
+    }
+}
+/// Test-only control for matched charging benchmarks in the same process.
+#[cfg(test)]
+pub(super) fn unshared_frames(
+    device: &DeviceView,
+    settings: &Settings,
+    dark: bool,
+    size: usize,
+) -> windows::core::Result<Frames> {
+    let animated =
+        settings.animation && device.reading.charging == Some(true) && device.reading.online();
+    let count = if animated { 30 } else { 1 };
+    let mut result = Frames {
+        icons: Vec::with_capacity(count),
+        order: [0; 30],
+        count,
+    };
+    for frame in 0..count {
+        result
+            .icons
+            .push(render(device, settings, dark, size, frame, animated)?);
+        result.order[frame] = frame as u8;
+    }
+    Ok(result)
+}
+impl std::ops::Index<usize> for Frames {
+    type Output = Icon;
+    fn index(&self, frame: usize) -> &Icon {
+        assert!(frame < self.count);
+        &self.icons[usize::from(self.order[frame])]
+    }
+}
 pub fn frames(
     device: &DeviceView,
     settings: &Settings,
     dark: bool,
     size: usize,
-) -> windows::core::Result<Vec<Icon>> {
-    let animated =
-        settings.animation && device.reading.charging == Some(true) && device.reading.online();
-    (0..if animated { 30 } else { 1 })
-        .map(|frame| render(device, settings, dark, size, frame, animated))
-        .collect()
+) -> windows::core::Result<Frames> {
+    let animated = settings.animation
+        && device.reading.charging == Some(true)
+        && device.reading.online()
+        && device.reading.level != Some(100);
+    let count = if animated { 30 } else { 1 };
+    let mut result = Frames {
+        icons: Vec::with_capacity(count),
+        order: [0; 30],
+        count,
+    };
+    let mut filled_ring = None;
+    for frame in 0..count {
+        // A wave wholly inside the filled ring changes no pixels. Share that
+        // image, but keep the step in the sequence so timing never changes.
+        // Strict comparison leaves the floating-point boundary unoptimised.
+        let covered = animated
+            && device
+                .reading
+                .level
+                .is_some_and(|level| frame as f64 / 30. + 0.18 < f64::from(level) / 100.);
+        let index = if let Some(index) = filled_ring.filter(|_| covered) {
+            index
+        } else {
+            let index = result.icons.len() as u8;
+            result
+                .icons
+                .push(render(device, settings, dark, size, frame, animated)?);
+            if covered {
+                filled_ring = Some(index);
+            }
+            index
+        };
+        result.order[frame] = index;
+    }
+    Ok(result)
 }
 fn render(
     d: &DeviceView,
@@ -74,13 +156,16 @@ fn render(
             let px = (x as f64 + 0.5) * 32. / n as f64 - 16.;
             let py = (y as f64 + 0.5) * 32. / n as f64 - 16.;
             let radius = px.hypot(py);
-            let angle = (py.atan2(px) + std::f64::consts::FRAC_PI_2)
-                .rem_euclid(std::f64::consts::TAU)
-                / std::f64::consts::TAU;
             let ring = radius > 12. && radius < 15.;
-            let wave = animated && (angle - frame as f64 / 30.).rem_euclid(1.) < 0.18;
-            let active = angle < level || wave;
-            let symbol = if percent {
+            // Angles affect only the ring; its pixels do not need a pictogram
+            // calculation. Neither shortcut changes the resulting colours.
+            let active = ring && {
+                let angle = (py.atan2(px) + std::f64::consts::FRAC_PI_2)
+                    .rem_euclid(std::f64::consts::TAU)
+                    / std::f64::consts::TAU;
+                angle < level || (animated && (angle - frame as f64 / 30.).rem_euclid(1.) < 0.18)
+            };
+            let symbol = if ring || percent {
                 false
             } else {
                 match d.icon.as_str() {
@@ -226,6 +311,80 @@ mod tests {
     use windows::Win32::System::Threading::{
         GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
     };
+    #[test]
+    fn shared_frames_match_every_uncached_frame_and_preserve_timing() {
+        let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
+        let mut reading = Reading::new("test:animation", "Animation", "test", 0);
+        reading.charging = Some(true);
+        let mut device = DeviceView {
+            reading,
+            name: "Animation".into(),
+            icon: "mouse".into(),
+            low_alert_at: 20,
+            seconds_left: None,
+            text: String::new(),
+            hidden: false,
+        };
+        let mut settings = Settings::default();
+        // Every integer percentage, including unknown and wave boundaries.
+        for level in (0..=100).map(Some).chain([None]) {
+            device.reading.level = level;
+            let cached = frames(&device, &settings, true, 32).unwrap();
+            assert_eq!(cached.len(), if level == Some(100) { 1 } else { 30 });
+            for frame in 0..30 {
+                let original = render(&device, &settings, true, 32, frame, true).unwrap();
+                assert_eq!(
+                    native_pixels(&cached[frame % cached.len()]),
+                    native_pixels(&original),
+                    "level={level:?}, frame={frame}"
+                );
+            }
+        }
+        for kind in ["mouse", "keyboard", "headset", "gamepad", "bluetooth"] {
+            device.icon = kind.into();
+            for dark in [false, true] {
+                for percent in [false, true] {
+                    settings.percent_in_icon = percent;
+                    settings.badges = percent;
+                    for level in [73, 100] {
+                        device.reading.level = Some(level);
+                        let cached = frames(&device, &settings, dark, 32).unwrap();
+                        for frame in 0..30 {
+                            let original =
+                                render(&device, &settings, dark, 32, frame, true).unwrap();
+                            assert_eq!(
+                                native_pixels(&cached[frame % cached.len()]),
+                                native_pixels(&original),
+                                "{kind}, dark={dark}, percent={percent}, level={level}, frame={frame}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        device.reading.level = Some(73);
+        let cached = frames(&device, &settings, true, 32).unwrap();
+        assert_eq!(
+            cached.icons.len(),
+            14,
+            "73% charge needs only fourteen unique native icons"
+        );
+        let updates = (0..cached.len())
+            .filter(|frame| cached[*frame].0 != cached[(*frame + 1) % cached.len()].0)
+            .count();
+        assert_eq!(
+            updates, 14,
+            "Keep all thirty time steps, but notify Windows only when the image changes"
+        );
+        device.reading.level = Some(100);
+        let full = frames(&device, &settings, true, 32).unwrap();
+        assert_eq!(
+            full.len(),
+            1,
+            "A static full ring must not start the animation timer"
+        );
+        assert_eq!(full.icons.len(), 1);
+    }
     #[test]
     fn cached_animation_frames_release_all_native_handles() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
@@ -447,7 +606,7 @@ mod warning_tests {
         d.reading.charging = Some(true);
         let icons = frames(&d, &s, true, 32).unwrap();
         assert_eq!(icons.len(), 30);
-        for icon in &icons {
+        for icon in icons.iter() {
             let pixels = native_pixels(icon);
             assert!(contains_color(&pixels, [75, 199, 133], 255));
             assert!(!contains_color(&pixels, [245, 166, 35], 255));
@@ -534,7 +693,7 @@ mod number_tests {
         let icons = frames(&d, &s, true, 32).unwrap();
         assert_eq!(icons.len(), 30);
         let first = native_pixels(&icons[0]);
-        for icon in &icons[1..] {
+        for icon in icons.iter().skip(1) {
             let pixels = native_pixels(icon);
             for y in 8..24 {
                 for x in 8..24 {
