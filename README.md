@@ -28,40 +28,43 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Local build: **1.1.0**, with a native device overview, device cards, focused
-control tabs and a refreshed tray menu. The redesign adds no background timers
-or device queries. Device info reads firmware only when opened or refreshed.
-The tray menu also includes **Displays**, with a separate HDR switch for each
-supported monitor. Display state is read only when the menu opens; changes use
-Windows' own per-display HDR controls. No HDR setting is reapplied at startup.
-This build also preserves rapid history transitions, combines repeated graph
-requests, avoids connection checks for Bluetooth devices with no battery data,
-and records battery-saver changes separately in Insights. Short Time used graphs
-reuse a bounded timing index, released when History closes. Existing history is
-upgraded automatically without changing its recorded timestamps. This build has
-not been published yet. Rapid readings remain ordered on the graph, same-second
-rate changes retain their battery session, and selected device cards respect
-Windows high-contrast colours.
-
-Latest published release: **1.0.10** for Windows 11 x64, available as an unsigned per-user
+Latest release: **1.1.0** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.0.10 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.10/HaloContinued-1.0.10-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.0.10 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.10/HaloContinued-1.0.10-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.0 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.0/HaloContinued-1.1.0-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.0 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.0/HaloContinued-1.1.0-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.0.10/HaloContinued-1.0.10-SHA256SUMS.txt)
-· [Release notes](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.10)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.0/HaloContinued-1.1.0-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.0)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
-**New in 1.0.10:** Waiting battery alerts avoid repeated memory allocations while
-a device is unavailable, and battery-life learning avoids creating empty records
-from unusable first readings. Tray menus now display device names containing `&`
-correctly, including renamed devices. These changes add no background workers,
-timers or battery checks.
-[Full changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.0.10).
+**New in 1.1.0:**
+
+- **Device overview:** native device cards, focused control tabs, clearer Settings
+  groups and refreshed tray menus that follow Windows' appearance. Reopening,
+  resizing, selection and high-contrast handling have also been improved.
+- **HDR per monitor:** right-click a tray icon and choose **Displays** to toggle
+  HDR independently on supported monitors. Display state is read when the menu
+  opens; changes use Windows' own controls, with no background display polling
+  or automatic HDR changes at startup.
+- **Device information:** see connection details, supported controls and
+  verification status. Supported Razer firmware is read only when requested.
+- **Safer automatic restoration:** Battery saver and fullscreen boost preserve
+  original settings across charging, reconnects and app restarts when identity
+  and readback checks permit. Manual changes take priority; uncertain devices
+  and settings are left untouched.
+- **History and Insights fixes:** preserve rapid and same-second transitions,
+  distinguish Battery saver from normal polling rates, and keep selections tied
+  to the intended device. Existing history is upgraded without changing timestamps.
+- **Less unnecessary work:** reuse identical charging frames, skip unchanged tray
+  updates, reduce temporary snapshot allocations and combine repeated graph
+  requests. The bounded Time used index is released when History closes.
+
+[Full 1.1.0 changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.0)
+· [Latest simulated resource check](#110-resource-check-28-october-2026)
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -101,7 +104,8 @@ history or battery-life estimates.
 
 ## Screenshots
 
-The actual V1.0.0 interface, captured with simulated devices and example history.
+These earlier V1.0.0 screenshots use simulated devices and example history;
+the device overview and Settings layout were redesigned in V1.1.0.
 Images follow your preferred light or dark theme; no personal device data is shown.
 
 <table>
@@ -337,7 +341,25 @@ HID discovery and tray graphics, event-driven waits and batched SQLite writes
 limit background work. Charging frames are pre-rendered; the animation timer
 stops when no icons need it. Dashboard graphics are released when it closes,
 and hovering an icon does not query hardware. The standard executable is about
-**3.32 MiB**, including HIDAPI, SQLite and the MSVC runtime.
+**3.71 MiB** in 1.1.0, including HIDAPI, SQLite and the MSVC runtime.
+
+### 1.1.0 resource check, 28 October 2026
+
+After 40 dashboard open/close cycles, one three-minute sample of the optimized
+native test fixture recorded **0.035% of one logical core**, **6.27 MiB mean
+private memory** and **6.38 MiB peak**. The fixture used a simulated mouse with
+the dashboard closed and charging animation off. This is a separate lifecycle
+check, not a matched comparison with upstream or the older releases below.
+It is not a live-hardware benchmark and does not measure game performance.
+
+Targeted regression tests also verify reduced work: an eight-device snapshot
+requests **3,840 bytes instead of 5,504** of temporary allocations (about 30%
+less), and the 73%-charging icon fixture uses **14 distinct frames instead of
+30**, preserving all 30 animation steps. Full batteries use a static icon.
+These are savings in particular paths, not equivalent reductions in total RAM
+or guarantees of a fixed CPU improvement. No new background worker or timer
+was added for these optimisations. Formatting, strict Clippy and **976 workspace
+tests** passed; five optional tests were skipped.
 
 ### Matched version comparison, 18 October 2026
 
