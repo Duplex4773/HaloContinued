@@ -502,5 +502,53 @@
     ],
     "pull_request": 216,
     "revision": "60b3d3902488a4e0c49757bb399b36c7ece13a74"
+  },
+  {
+    "device": [
+      "pulsar",
+      14139,
+      4297,
+      "ATK A9 SE (2.4 GHz)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 347,
+    "revision": "4508741af18b0e8a622197d6c7cf49cbd1d76adc"
+  },
+  {
+    "device": [
+      "lamzu",
+      13652,
+      62736,
+      "LAMZU Thorn (4K receiver)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 348,
+    "revision": "af4df49a42fc38804ea60a45c28213b3790a7875"
+  },
+  {
+    "device": [
+      "lamzu",
+      13652,
+      62735,
+      "LAMZU Thorn (wired)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 348,
+    "revision": "af4df49a42fc38804ea60a45c28213b3790a7875"
+  },
+  {
+    "device": [
+      "pulsar",
+      14139,
+      4630,
+      "ATK VXE NK mouse (2.4 GHz)",
+      "pr:bitmouse",
+      0
+    ],
+    "pull_request": 350,
+    "revision": "926bfc0affaf293d0c7af0bc949929568281d68f"
   }
 ]

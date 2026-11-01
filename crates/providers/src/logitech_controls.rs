@@ -122,10 +122,7 @@ impl Exchange<'_, '_, '_> {
     }
     fn identity(&mut self, slot: u8, index: u8) -> Result<(String, u16, u16), ProtocolFailure> {
         let r = self.request(slot, index, 0, &[])?;
-        let unit = r[1..5]
-            .iter()
-            .map(|v| format!("{v:02X}"))
-            .collect::<String>();
+        let unit = crate::hex::encode(&r[1..5], true, false);
         if r[1..5].iter().all(|v| *v == 0) {
             return Err(ProtocolFailure::IdentityMismatch);
         }

@@ -28,20 +28,37 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Latest release: **1.1.0** for Windows 11 x64, available as an unsigned per-user
+Latest release: **1.1.1** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.1.0 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.0/HaloContinued-1.1.0-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.1.0 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.0/HaloContinued-1.1.0-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.1 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.1/HaloContinued-1.1.1-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.1 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.1/HaloContinued-1.1.1-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.0/HaloContinued-1.1.0-SHA256SUMS.txt)
-· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.0)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.1/HaloContinued-1.1.1-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.1)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
-**New in 1.1.0:**
+**New in 1.1.1:**
+
+- **Smoother battery history:** discharge is drawn as a smooth trend, with charge
+  jumps kept sharp and unavailable periods holding the last known level. Stored
+  readings and Insights calculations are unchanged. No background timer is added.
+- **Dashboard reopening fix:** reconcile visibility after Windows restores or
+  resizes the dashboard, including events received during another UI operation.
+- **Less temporary work:** faster exact device-catalog lookups, fewer temporary
+  allocations in device polling and byte formatting, and allocation-free FlyDigi
+  collection selection. Polling intervals and protocol retry limits are unchanged.
+- **Additional battery support:** ATK A9 SE, LAMZU Thorn (receiver and cable),
+  and ATK/VXE NK receiver, based on hardware reports in reviewed HaloBattery PRs.
+  These additions do not enable new device-configuration commands.
+
+[Full 1.1.1 changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.1)
+· [Latest simulated resource check](#111-pre-release-resource-check-1-november-2026)
+
+**Also included from 1.1.0:**
 
 - **Device overview:** native device cards, focused control tabs, clearer Settings
   groups and refreshed tray menus that follow Windows' appearance. Reopening,
@@ -64,7 +81,6 @@ Both downloads are unsigned. Windows may show an unrecognised-app warning.
   requests. The bounded Time used index is released when History closes.
 
 [Full 1.1.0 changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.0)
-· [Latest simulated resource check](#110-resource-check-28-october-2026)
 
 **Personal project:** I build Halo Continued for my own use. It is shared
 publicly, but whether others use it is not a priority.
@@ -191,9 +207,18 @@ and working without vendor suites originate in HaloBattery too.
 
 ## Device support and limitations
 
-Battery monitoring covers **41 provider families and 368 hardware IDs** across supported mice,
+Battery monitoring covers **41 provider families and 372 hardware IDs** across supported mice,
 keyboards, headsets and controllers. Configuration support is narrower than
 battery support, and depends on the exact model, firmware and connection.
+
+Added in 1.1.1: ATK A9 SE receiver (`373B:10C9`, parent PR
+[#347](https://github.com/HeyOkay/HaloBattery/pull/347)), LAMZU Thorn receiver
+and cable (`3554:F510` / `F50F`, [#348](https://github.com/HeyOkay/HaloBattery/pull/348)),
+and ATK/VXE NK receiver (`373B:1216`, [#350](https://github.com/HeyOkay/HaloBattery/pull/350)).
+These have hardware reports in the parent PRs; local validation uses simulated
+transports. The NK receiver uses its dedicated battery protocol and collection;
+unknown charging replies remain unknown. These additions do not enable hardware
+configuration commands.
 
 | Control | Enabled support |
 | --- | --- |
@@ -341,7 +366,25 @@ HID discovery and tray graphics, event-driven waits and batched SQLite writes
 limit background work. Charging frames are pre-rendered; the animation timer
 stops when no icons need it. Dashboard graphics are released when it closes,
 and hovering an icon does not query hardware. The standard executable is about
-**3.71 MiB** in 1.1.0, including HIDAPI, SQLite and the MSVC runtime.
+**3.72 MiB** in 1.1.1, including HIDAPI, SQLite and the MSVC runtime.
+
+### 1.1.1 pre-release resource check, 1 November 2026
+
+The performance audit ran separate three-minute samples of the optimized native
+test fixture after 40 dashboard open/close cycles, with one simulated mouse and
+the dashboard closed:
+
+| Workload | Mean CPU, one logical core | Mean private memory | Peak private memory |
+| --- | ---: | ---: | ---: |
+| Monitoring, no animation | 0.052% | 6.53 MiB | 6.76 MiB |
+| Charging animation | 0.104% | 6.84 MiB | 6.96 MiB |
+
+These source-harness measurements preceded the graph-rendering change and final
+version stamping. They are not measurements of the distributed executable or
+live hardware, nor a matched comparison with upstream or earlier releases.
+The graph changes affect visible-page rendering only. Small CPU differences
+between runs can be noise; these results do not establish a particular speedup
+or predict game performance.
 
 ### 1.1.0 resource check, 28 October 2026
 
@@ -533,11 +576,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.1.0
+.\tools\package-rust.ps1 -Version 1.1.1
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.1.0-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.1.1-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -547,13 +590,13 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.1.0
+.\tools\package-installer.ps1 -Version 1.1.1
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.1.0-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.1.0-windows-x64.exe` and
-`dist/HaloContinued-1.1.0-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.1.1-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.1.1-windows-x64.exe` and
+`dist/HaloContinued-1.1.1-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with

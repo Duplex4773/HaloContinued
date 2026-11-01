@@ -1,5 +1,5 @@
 use crate::{
-    catalog::{AUDEZE_REQUESTS, DEVICES, Device},
+    catalog::{AUDEZE_REQUESTS, DEVICES, Device, find_device},
     protocols::{self as p, Battery},
 };
 use hb_core::*;
@@ -162,9 +162,7 @@ impl HidProvider {
         let selected: Vec<_> = infos
             .iter()
             .filter_map(|i| {
-                DEVICES
-                    .iter()
-                    .find(|d| d.provider == "jbl" && d.vid == i.vendor_id && d.pid == i.product_id)
+                find_device("jbl", i.vendor_id, i.product_id)
                     .filter(|d| candidate_group("jbl", d, i, infos))
                     .map(|d| (*d, i))
             })
@@ -260,11 +258,7 @@ impl HidProvider {
         let live: BTreeSet<_> = infos
             .iter()
             .filter_map(|i| {
-                DEVICES
-                    .iter()
-                    .find(|d| {
-                        d.provider == self.id && d.vid == i.vendor_id && d.pid == i.product_id
-                    })
+                find_device(self.id, i.vendor_id, i.product_id)
                     .map(|d| reading_key(self.id, d, i))
                     .or_else(|| {
                         (self.id == "mchose" && [0x5253, 0x3837].contains(&i.vendor_id))
@@ -515,19 +509,18 @@ impl HidProvider {
         c: &PollContext<'_>,
     ) -> Result<Option<Battery>, ProviderError> {
         let cache_key = format!("{:04x}:{}", d.pid, trusted_identity(info));
-        let cached = self.razer_cache.get(&cache_key).cloned();
-        let mut tids = vec![
-            cached
-                .as_ref()
-                .filter(|(path, _)| path == &info.path)
-                .map_or(d.parameter, |(_, tid)| *tid),
-        ];
-        for tid in [0x1f, 0x3f, 0xff, 0x9f, 8] {
-            if !tids.contains(&tid) {
-                tids.push(tid)
+        let cached_tid = self
+            .razer_cache
+            .get(&cache_key)
+            .filter(|(path, _)| path == &info.path)
+            .map(|(_, tid)| *tid);
+        // Copy only the transaction byte; keep fallback order without allocating
+        // a temporary vector or cloning the cached HID path on every poll.
+        let tids = [cached_tid.unwrap_or(d.parameter), 0x1f, 0x3f, 0xff, 0x9f, 8];
+        for (index, tid) in tids.into_iter().enumerate() {
+            if tids[..index].contains(&tid) {
+                continue;
             }
-        }
-        for tid in tids {
             if !c.active() {
                 break;
             }
@@ -546,10 +539,7 @@ impl HidProvider {
                     charging,
                 ));
             }
-            if self.razer_status == 0x100
-                || self.razer_status == 4
-                    && cached.as_ref().is_some_and(|(path, _)| path == &info.path)
-            {
+            if self.razer_status == 0x100 || self.razer_status == 4 && cached_tid.is_some() {
                 break;
             }
         }
@@ -624,10 +614,10 @@ impl HidProvider {
                         break;
                     }
                     c.sleep(Duration::from_millis(50));
-                    for length in if self.id == "wlmouse" {
-                        vec![65, 64]
+                    for &length in if self.id == "wlmouse" {
+                        &[65, 64][..]
                     } else {
-                        vec![65]
+                        &[65][..]
                     } {
                         if let Ok(reply) = s.feature(0, length)
                             && let Some(b) = if old {
@@ -1048,12 +1038,7 @@ impl HidProvider {
                     self.log(format!(
                         "report {id:#04x} len={}, no level in byte 14: {}",
                         reply.len(),
-                        reply
-                            .iter()
-                            .take(32)
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
+                        crate::hex::encode(&reply[..reply.len().min(32)], false, true)
                     ));
                 }
                 Ok(None)
@@ -1478,7 +1463,7 @@ impl HidProvider {
             && let Some(r) = self.logitech_request(long, short, c, slot, feature, 0, &[])?
             && r[1..5].iter().any(|b| *b != 0)
         {
-            unit = r[1..5].iter().map(|b| format!("{b:02X}")).collect();
+            unit = crate::hex::encode(&r[1..5], true, false);
         }
         Ok((name, kind, unit))
     }
@@ -1547,11 +1532,7 @@ impl HidProvider {
                 .any(|d| d.provider == "logitech" && d.pid == *pid && d.variant == "receiver")
                 || long_info.product.to_lowercase().contains("receiver");
             let result: Result<(), ProviderError> = (|| {
-                for slot in if receiver {
-                    vec![1, 2, 3, 4, 5, 6]
-                } else {
-                    vec![255]
-                } {
+                for slot in if receiver { 1..=6 } else { 255..=255 } {
                     if !c.active() {
                         break;
                     }
@@ -2071,12 +2052,8 @@ impl BatteryProvider for HidProvider {
         let mut community_result = Ok(Vec::new());
         let community_queryable = self.community_enabled
             && infos.iter().any(|i| {
-                DEVICES.iter().any(|d| {
-                    d.provider == self.id
-                        && d.vid == i.vendor_id
-                        && d.pid == i.product_id
-                        && crate::community::queryable(d, i, &infos)
-                })
+                find_device(self.id, i.vendor_id, i.product_id)
+                    .is_some_and(|d| crate::community::queryable(d, i, &infos))
             });
         if self.community_enabled && (community_queryable || self.community.is_some()) {
             let state = self.community.get_or_insert_with(Default::default);
@@ -2115,9 +2092,7 @@ impl BatteryProvider for HidProvider {
         }
         if self.id == "pulsar" {
             for info in &infos {
-                if DEVICES.iter().any(|d| {
-                    d.provider == self.id && d.vid == info.vendor_id && d.pid == info.product_id
-                }) {
+                if find_device(self.id, info.vendor_id, info.product_id).is_some() {
                     self.log(format!("{:04x}:{:04x} output={}{}", info.usage_page, info.usage,
                         info.output_length.map_or_else(|| "unknown".into(), |n| n.to_string()),
                         if info.output_length.is_some_and(|n| n != 17) { " cannot take a 17-byte frame; skipped when a compatible collection exists" } else { "" }));
@@ -2150,11 +2125,7 @@ impl BatteryProvider for HidProvider {
         let mut selected: Vec<_> = infos
             .iter()
             .filter_map(|i| {
-                DEVICES
-                    .iter()
-                    .find(|d| {
-                        d.provider == self.id && d.vid == i.vendor_id && d.pid == i.product_id
-                    })
+                find_device(self.id, i.vendor_id, i.product_id)
                     .copied()
                     .or_else(|| {
                         if self.id == "mchose" && [0x5253, 0x3837].contains(&i.vendor_id) {
@@ -2228,9 +2199,7 @@ impl BatteryProvider for HidProvider {
         let mut answered_bragi = BTreeSet::new();
         if self.id == "audeze" {
             for info in &infos {
-                if !DEVICES.iter().any(|d| {
-                    d.provider == self.id && d.vid == info.vendor_id && d.pid == info.product_id
-                }) {
+                if find_device(self.id, info.vendor_id, info.product_id).is_none() {
                     continue;
                 }
                 let identity = trusted_identity(info);
@@ -2677,9 +2646,8 @@ impl BatteryProvider for HidProvider {
             // Failed/bounded-suppressed exchanges may not reach Ok(None). Only
             // enumerated allowlisted collections can retain a known mouse.
             for info in &infos {
-                if let Some(device) = DEVICES.iter().find(|d| {
-                    d.provider == "razer" && d.vid == info.vendor_id && d.pid == info.product_id
-                }) && candidate_group("razer", device, info, &infos)
+                if let Some(device) = find_device("razer", info.vendor_id, info.product_id)
+                    && candidate_group("razer", device, info, &infos)
                 {
                     let key = format!("razer:{:04x}:{}", device.pid, trusted_identity(info));
                     if (errors.is_empty() || !output.is_empty())

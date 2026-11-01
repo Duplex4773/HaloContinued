@@ -18,10 +18,10 @@ struct HistoryVertex {
     measured: bool,
 }
 
-/// Display a last-known-value step trace, without turning missing readings into
-/// measurements. A predecessor can seed the left boundary; no value is invented
-/// before the first available percentage. Cached sleeping levels seed an empty
-/// trace but cannot replace a level already observed in this interval.
+/// Trend anchors, with explicit holds across unavailable readings and charge
+/// jumps. Repeated percentages need no extra vertices. Remember their timestamps
+/// nevertheless, so a later sleeping interval starts at the last observation.
+/// No history or estimator data is modified by this display-only iterator.
 fn history_trace(
     points: &[HistorySample],
     since: i64,
@@ -30,6 +30,7 @@ fn history_trace(
     let mut samples = points.iter();
     let mut previous: Option<HistoryVertex> = None;
     let mut pending = None;
+    let mut held = false;
     let mut finished = until < since;
     std::iter::from_fn(move || {
         if finished {
@@ -45,12 +46,15 @@ fn history_trace(
                 continue;
             }
             let timestamp = sample.position.max(since);
-            if previous.is_some_and(|p| timestamp < p.timestamp)
-                || previous.is_some() && !reading.online()
-            {
+            if previous.is_some_and(|p| timestamp < p.timestamp) {
+                continue;
+            }
+            if previous.is_some() && !reading.online() {
+                held = true;
                 continue;
             }
             let Some(level) = reading.level.filter(|level| *level <= 100) else {
+                held = true;
                 continue;
             };
             let point = HistoryVertex {
@@ -59,13 +63,22 @@ fn history_trace(
                 measured: reading.online() && sample.position >= since,
             };
             if let Some(p) = previous {
-                pending = Some(point);
-                return Some(HistoryVertex {
-                    timestamp,
-                    measured: false,
-                    ..p
-                });
+                if held || !p.measured || !point.measured || level > p.level {
+                    held = false;
+                    pending = Some(point);
+                    return Some(HistoryVertex {
+                        timestamp,
+                        measured: false,
+                        ..p
+                    });
+                }
+                previous = Some(point);
+                if level == p.level {
+                    continue;
+                }
+                return Some(point);
             }
+            held = false;
             previous = Some(point);
             return Some(point);
         }
@@ -76,6 +89,33 @@ fn history_trace(
             ..p
         })
     })
+}
+
+/// Monotone cubic handles in battery-percent coordinates. Harmonic-mean slopes
+/// keep each handle inside its endpoints: no overshoot, invented recharge or
+/// values outside 0–100%. Only four neighbouring anchors are needed, no buffer.
+fn smooth_levels(
+    previous: Option<HistoryVertex>,
+    from: HistoryVertex,
+    to: HistoryVertex,
+    next: Option<HistoryVertex>,
+) -> Option<[f32; 2]> {
+    let slope = |a: HistoryVertex, b: HistoryVertex| {
+        (a.measured && b.measured && b.timestamp > a.timestamp && b.level < a.level).then(|| {
+            (f64::from(b.level) - f64::from(a.level))
+                / b.timestamp.saturating_sub(a.timestamp) as f64
+        })
+    };
+    let rate = slope(from, to)?;
+    let tangent =
+        |neighbor: Option<f64>| neighbor.map_or(0., |other| 2. * rate * other / (rate + other));
+    let start = previous.map_or(rate, |p| tangent(slope(p, from)));
+    let end = next.map_or(rate, |n| tangent(slope(to, n)));
+    let third = to.timestamp.saturating_sub(from.timestamp) as f64 / 3.;
+    Some([
+        (f64::from(from.level) + start * third) as f32,
+        (f64::from(to.level) - end * third) as f32,
+    ])
 }
 
 fn duration_label(seconds: i64, use_days: bool) -> String {
@@ -239,27 +279,48 @@ impl Chart {
             } else {
                 let path = self.factory.CreatePathGeometry()?;
                 let sink = path.Open()?;
-                let mut started = false;
-                let mut previous = None;
-                for point in trace {
+                let mut previous: Option<HistoryVertex> = None;
+                let mut before_previous = None;
+                let mut previous_position = None;
+                while let Some(point) = trace.next() {
                     let p = Vector2 {
                         X: left
                             + (right - left) * point.timestamp.saturating_sub(since) as f32
                                 / until.saturating_sub(since).max(1) as f32,
                         Y: bottom - (bottom - top) * point.level as f32 / 100.,
                     };
-                    if previous == Some((p.X, p.Y)) {
-                        continue;
-                    }
-                    if started {
-                        sink.AddLine(p);
-                        isolated_point = None;
+                    if let Some(from) = previous {
+                        if previous_position != Some((p.X, p.Y)) {
+                            if let Some(levels) =
+                                smooth_levels(before_previous, from, point, trace.peek().copied())
+                            {
+                                let start_x = left
+                                    + (right - left) * from.timestamp.saturating_sub(since) as f32
+                                        / until.saturating_sub(since).max(1) as f32;
+                                let third = (p.X - start_x) / 3.;
+                                sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                                    point1: Vector2 {
+                                        X: start_x + third,
+                                        Y: bottom - (bottom - top) * levels[0] / 100.,
+                                    },
+                                    point2: Vector2 {
+                                        X: p.X - third,
+                                        Y: bottom - (bottom - top) * levels[1] / 100.,
+                                    },
+                                    point3: p,
+                                });
+                            } else {
+                                sink.AddLine(p);
+                            }
+                            isolated_point = None;
+                        }
                     } else {
                         sink.BeginFigure(p, D2D1_FIGURE_BEGIN_HOLLOW);
-                        started = true;
                         isolated_point = Some(p);
                     }
-                    previous = Some((p.X, p.Y));
+                    before_previous = previous;
+                    previous = Some(point);
+                    previous_position = Some((p.X, p.Y));
                 }
                 sink.EndFigure(D2D1_FIGURE_END_OPEN);
                 sink.Close()?;
@@ -464,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn charging_and_discharge_changes_are_steps_at_actual_reading_times() {
+    fn charging_stays_sharp_while_discharge_uses_real_trend_anchors() {
         let rows = [
             sample(0, Some(25), Connection::Online),
             sample(20, Some(100), Connection::Online),
@@ -476,9 +537,111 @@ mod tests {
                 .iter()
                 .map(|p| (p.timestamp, p.level))
                 .collect::<Vec<_>>(),
-            [(0, 25), (20, 25), (20, 100), (40, 100), (40, 99), (50, 99)]
+            [(0, 25), (20, 25), (20, 100), (40, 99), (50, 99)]
         );
         assert_eq!(trace.iter().filter(|p| p.measured).count(), 3);
+    }
+
+    #[test]
+    fn repeated_percentages_do_not_make_stairs_or_change_input_readings() {
+        let rows: Vec<_> = (0..=100)
+            .map(|i| sample(i * 60, Some(90 - (i / 10) as u8), Connection::Online))
+            .collect();
+        let saved = rows.clone();
+        let trace = calendar_trace(&rows, 0, 6060);
+        assert_eq!(rows, saved);
+        assert_eq!(trace.len(), 12); // Eleven distinct levels and the held tail.
+        for (i, point) in trace[..11].iter().enumerate() {
+            assert_eq!(point.timestamp, i as i64 * 600);
+            assert_eq!(point.level, 90 - i as u8);
+            assert!(point.measured);
+        }
+        assert_eq!(
+            (trace[11].timestamp, trace[11].level, trace[11].measured),
+            (6060, 80, false)
+        );
+    }
+
+    #[test]
+    fn smooth_curve_stays_monotone_and_inside_observed_levels() {
+        // Irregular timing and uneven drops must never create loops, peaks or
+        // overshoot. Check the actual cubic, including nearly vertical segments.
+        for times in [
+            [0, 1, 2, 3],
+            [0, 1, 10000, 10001],
+            [0, 10000, 10001, i64::MAX],
+        ] {
+            for levels in [[100, 99, 1, 0], [100, 75, 50, 25], [3, 2, 1, 0]] {
+                let vertices: [_; 4] = std::array::from_fn(|i| HistoryVertex {
+                    timestamp: times[i],
+                    level: levels[i],
+                    measured: true,
+                });
+                let [a, b] = smooth_levels(
+                    Some(vertices[0]),
+                    vertices[1],
+                    vertices[2],
+                    Some(vertices[3]),
+                )
+                .unwrap();
+                let high = f64::from(levels[1]);
+                let low = f64::from(levels[2]);
+                let mut previous = high;
+                for i in 0..=1000 {
+                    let t = f64::from(i) / 1000.;
+                    let u = 1. - t;
+                    let value = u.powi(3) * high
+                        + 3. * u.powi(2) * t * f64::from(a)
+                        + 3. * u * t.powi(2) * f64::from(b)
+                        + t.powi(3) * low;
+                    assert!(value >= low - 1e-6 && value <= high + 1e-6);
+                    assert!(value <= previous + 1e-6);
+                    previous = value;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn smooth_curve_never_interpolates_charge_jumps_gaps_or_duplicate_times() {
+        let a = HistoryVertex {
+            timestamp: 10,
+            level: 80,
+            measured: true,
+        };
+        for b in [
+            HistoryVertex {
+                timestamp: 20,
+                level: 100,
+                ..a
+            },
+            HistoryVertex {
+                timestamp: 20,
+                level: 70,
+                measured: false,
+            },
+            HistoryVertex {
+                timestamp: 10,
+                level: 70,
+                ..a
+            },
+        ] {
+            assert!(smooth_levels(None, a, b, None).is_none());
+        }
+        let rows = [
+            sample(0, Some(80), Connection::Online),
+            sample(10, None, Connection::Online),
+            sample(20, Some(70), Connection::Online),
+        ];
+        let trace = calendar_trace(&rows, 0, 30);
+        assert_eq!(
+            trace
+                .iter()
+                .map(|p| (p.timestamp, p.level))
+                .collect::<Vec<_>>(),
+            [(0, 80), (20, 80), (20, 70), (30, 70)]
+        );
+        assert!(smooth_levels(None, trace[0], trace[1], Some(trace[2])).is_none());
     }
 
     #[test]

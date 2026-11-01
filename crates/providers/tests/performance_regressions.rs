@@ -7,6 +7,71 @@ use hb_providers::sleep_controls::{MODELS, model};
 #[global_allocator]
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
+#[path = "../src/hex.rs"]
+mod hex;
+
+#[test]
+fn catalog_lookup_preserves_the_exact_allowlist_without_an_allocated_index() {
+    use hb_providers::catalog::{DEVICES, find_device};
+    let key = |d: &hb_providers::catalog::Device| (d.provider, d.vid, d.pid);
+    assert!(
+        DEVICES.windows(2).all(|w| key(&w[0]) < key(&w[1])),
+        "Catalog keys must remain unique and sorted by provider, vendor and product"
+    );
+    let (_, allocations) = measure(|| {
+        for d in DEVICES {
+            for provider in [d.provider, "", "unsupported-provider"] {
+                for vid in [d.vid, d.vid.wrapping_sub(1), d.vid.wrapping_add(1)] {
+                    for pid in [d.pid, d.pid.wrapping_sub(1), d.pid.wrapping_add(1)] {
+                        let expected = DEVICES
+                            .iter()
+                            .find(|entry| key(entry) == (provider, vid, pid));
+                        let actual = find_device(provider, vid, pid);
+                        let fields = |d: &hb_providers::catalog::Device| {
+                            (d.provider, d.vid, d.pid, d.name, d.variant, d.parameter)
+                        };
+                        assert_eq!(actual.map(fields), expected.map(fields));
+                    }
+                }
+            }
+        }
+    });
+    assert_eq!(allocations.calls, 0);
+    assert_eq!(allocations.bytes, 0);
+}
+
+#[test]
+fn hexadecimal_identity_and_diagnostics_preserve_every_byte_with_one_allocation() {
+    let bytes: Vec<u8> = (0..=255).collect();
+    for length in [0, 1, 4, 14, 32, 256] {
+        for uppercase in [false, true] {
+            for spaced in [false, true] {
+                let source = &bytes[..length];
+                let (expected, before) = measure(|| {
+                    source
+                        .iter()
+                        .map(|b| {
+                            if uppercase {
+                                format!("{b:02X}")
+                            } else {
+                                format!("{b:02x}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(if spaced { " " } else { "" })
+                });
+                let (actual, after) = measure(|| hex::encode(source, uppercase, spaced));
+                assert_eq!(actual, expected);
+                assert_eq!(after.calls, usize::from(length != 0));
+                assert_eq!(after.bytes, actual.len());
+                if length == 32 && !uppercase && spaced {
+                    println!("32-byte diagnostic: before {before:?}; after {after:?}");
+                }
+            }
+        }
+    }
+}
+
 fn device(m: &hb_providers::sleep_controls::SleepModel) -> ConfigurationDevice {
     ConfigurationDevice {
         key: if m.source == "asus" {

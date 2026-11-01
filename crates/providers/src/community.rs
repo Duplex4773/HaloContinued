@@ -5,7 +5,7 @@
 //! HyperHeadset, Headroom, MousePower, XPanel/voiddog30 and vendor captures.
 //! This module performs battery/identity queries only, never configuration writes.
 use crate::{
-    catalog::{DEVICES, Device},
+    catalog::{Device, find_device},
     protocols::{self as p, Battery},
     provider::{is_bluetooth, trusted_identity},
 };
@@ -106,6 +106,7 @@ fn candidate(d: &Device, i: &HidInfo) -> bool {
     let out = |length| i.output_length.is_none_or(|n| n == length);
     match protocol(d) {
         "flow" | "compx" => usage == (0xff02, 2) && out(17),
+        "bitmouse" => usage == (0xff05, 1) && out(64),
         "kingston" | "turtle" | "skullcandy" => usage == (0xff13, 1),
         "k65" => usage == (0xff42, 1),
         "strix" => i.feature_length.is_some_and(|n| n >= 64),
@@ -141,7 +142,10 @@ pub(crate) fn queryable(d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool {
         }
 }
 fn retain_level(d: &Device) -> bool {
-    matches!(protocol(d), "compx" | "sonix" | "dareu" | "nearlink")
+    matches!(
+        protocol(d),
+        "compx" | "sonix" | "dareu" | "nearlink" | "bitmouse"
+    )
 }
 fn keep_sleeping(d: &Device) -> bool {
     !matches!(
@@ -180,9 +184,7 @@ impl Community {
         }
         let mut groups: BTreeMap<Endpoint, (Device, Vec<&HidInfo>)> = BTreeMap::new();
         for i in infos {
-            if let Some(d) = DEVICES
-                .iter()
-                .find(|d| d.provider == source && d.vid == i.vendor_id && d.pid == i.product_id)
+            if let Some(d) = find_device(source, i.vendor_id, i.product_id)
                 && queryable(d, i, infos)
                 && protocol(d) != "omni"
             {
@@ -210,9 +212,7 @@ impl Community {
                 continue;
             }
             let device = infos.iter().find_map(|i| {
-                DEVICES
-                    .iter()
-                    .find(|d| d.provider == source && d.vid == i.vendor_id && d.pid == i.product_id)
+                find_device(source, i.vendor_id, i.product_id)
                     .filter(|d| {
                         d.variant.starts_with("pr:")
                             || d.provider == "gwolves"
@@ -353,6 +353,43 @@ impl Community {
         }
         let s = &mut *s;
         let b = match protocol(d) {
+            "bitmouse" => {
+                if !drain(s, c, 64, 4)? {
+                    return Ok(None);
+                }
+                let mut values = [None; 2];
+                for (index, command) in [7, 15].into_iter().enumerate() {
+                    if !c.active() {
+                        return Ok(None);
+                    }
+                    let mut packet = p::padded(&[8, 0, 0x72, 2, 0, 1, command, 1], 64);
+                    packet[1] = packet[2..].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+                    s.write(&packet)?;
+                    values[index] = receive(s, c, 7, 100, 64, |r| {
+                        (r.len() >= 8
+                            && r[0] == 8
+                            && r[1] == 0x72
+                            && r[2] != 0xff
+                            && r[5] == command
+                            && r[6] >= 1
+                            && usize::from(r[6]) <= r.len() - 7)
+                            .then(|| r[7])
+                    })?;
+                    if index == 0 && !values[0].is_some_and(|level| (1..=100).contains(&level)) {
+                        return Ok(None);
+                    }
+                }
+                values[0].and_then(|level| {
+                    p::battery(
+                        level,
+                        values[1].and_then(|v| match v {
+                            0 => Some(false),
+                            1 => Some(true),
+                            _ => None,
+                        }),
+                    )
+                })
+            }
             "compx" => {
                 if !drain(s, c, 17, 4)? {
                     return Ok(None);
@@ -1352,7 +1389,7 @@ fn shield_serial(r: &[u8]) -> Option<String> {
     bytes
         .iter()
         .any(|b| *b != 0)
-        .then(|| bytes.iter().map(|b| format!("{b:02x}")).collect())
+        .then(|| crate::hex::encode(bytes, false, false))
 }
 
 /// The WGI owner calls this only for a proven FlyDigi WGI device. No XInput
@@ -1362,14 +1399,16 @@ pub fn flydigi_battery(
     c: &PollContext<'_>,
 ) -> Result<Option<Battery>, ProviderError> {
     let infos = hid.enumerate(0x37d7)?;
-    let candidates: Vec<_> = infos
+    let mut candidates = infos
         .iter()
-        .filter(|i| i.product_id == 0x2401 && i.usage_page == 0xffa0)
-        .collect();
-    if candidates.len() != 1 || !c.active() {
+        .filter(|i| i.product_id == 0x2401 && i.usage_page == 0xffa0);
+    let Some(candidate) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.next().is_some() || !c.active() {
         return Ok(None);
     }
-    let mut s = hid.open(candidates[0])?;
+    let mut s = hid.open(candidate)?;
     if !c.active() {
         return Ok(None);
     }

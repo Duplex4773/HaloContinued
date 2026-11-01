@@ -131,6 +131,47 @@ fn razer_retries_transaction_ids_and_caches_the_working_id() {
 }
 
 #[test]
+fn razer_tries_each_fallback_once_in_order_then_reuses_the_successful_id() {
+    use hb_providers::{catalog::find_device, protocols::razer_request};
+    let device = info(0x1532, 0x007c, 1);
+    let preferred = find_device("razer", device.vendor_id, device.product_id)
+        .unwrap()
+        .parameter;
+    let mut order = vec![preferred];
+    for tid in [0x1f, 0x3f, 0xff, 0x9f, 8] {
+        if !order.contains(&tid) {
+            order.push(tid);
+        }
+    }
+    let mut steps = Vec::new();
+    for &tid in &order[..order.len() - 1] {
+        steps.extend([
+            Step::Send(razer_request(tid, 0x80)),
+            Step::Feature(0, 91, Ok(razer_reply(5, 0x80, 0))),
+        ]);
+    }
+    for _ in 0..2 {
+        let tid = *order.last().unwrap();
+        steps.extend([
+            Step::Send(razer_request(tid, 0x80)),
+            Step::Feature(0, 91, Ok(razer_reply(2, 0x80, 128))),
+            Step::Send(razer_request(tid, 0x84)),
+            Step::Feature(0, 91, Ok(razer_reply(2, 0x84, 0))),
+        ]);
+    }
+    let hid = FakeHid::new(vec![device], steps);
+    let clock = FakeClock::default();
+    let cancel = AtomicBool::new(false);
+    let mut provider = HidProvider::new("razer");
+    for _ in 0..2 {
+        let readings = provider.poll(&hid, &context(&clock, &cancel)).unwrap();
+        assert_eq!(readings[0].level, Some(50));
+        assert_eq!(readings[0].charging, Some(false));
+    }
+    hid.done();
+}
+
+#[test]
 fn cancellation_prevents_opening_devices() {
     let hid = FakeHid::new(vec![info(0xa8a5, 0x2255, 0xff01)], vec![]);
     let clock = FakeClock::default();
@@ -583,7 +624,10 @@ fn remaining_hid_families_use_the_reference_channel_packet_and_positive_reply() 
     ] {
         let known = hb_providers::catalog::DEVICES
             .iter()
-            .find(|d| d.provider == family && (family != "gwolves" || d.variant.is_empty()))
+            .find(|d| {
+                d.provider == family
+                    && (!matches!(family, "gwolves" | "lamzu") || d.variant.is_empty())
+            })
             .unwrap();
         let mut selected = info(known.vid, known.pid, 0);
         let steps = match family {

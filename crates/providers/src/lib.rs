@@ -6,6 +6,7 @@ pub mod device_info;
 pub mod device_metadata;
 pub mod dpi;
 mod dpi_logitech;
+mod hex;
 mod logitech_adapter;
 pub mod logitech_controls;
 mod mchose_adapter;

@@ -9,6 +9,16 @@ pub struct Device {
     pub variant: &'static str,
     pub parameter: u8,
 }
+
+/// Exact allowlist lookup without allocating an index. The catalog generator
+/// sorts unique (provider, vendor, product) keys; regression tests enforce this.
+pub fn find_device(provider: &str, vid: u16, pid: u16) -> Option<&'static Device> {
+    DEVICES
+        .binary_search_by(|d| (d.provider, d.vid, d.pid).cmp(&(provider, vid, pid)))
+        .ok()
+        .map(|index| &DEVICES[index])
+}
+
 pub const DEVICES: &[Device] = &[
     Device {
         provider: "ajazz",
@@ -1164,6 +1174,22 @@ pub const DEVICES: &[Device] = &[
     },
     Device {
         provider: "lamzu",
+        vid: 0x3554,
+        pid: 0xf50f,
+        name: "LAMZU Thorn (wired)",
+        variant: "pr:compx",
+        parameter: 0,
+    },
+    Device {
+        provider: "lamzu",
+        vid: 0x3554,
+        pid: 0xf510,
+        name: "LAMZU Thorn (4K receiver)",
+        variant: "pr:compx",
+        parameter: 0,
+    },
+    Device {
+        provider: "lamzu",
         vid: 0x373e,
         pid: 0x001c,
         name: "LAMZU Maya X",
@@ -1765,9 +1791,25 @@ pub const DEVICES: &[Device] = &[
     Device {
         provider: "pulsar",
         vid: 0x373b,
+        pid: 0x10c9,
+        name: "ATK A9 SE (2.4 GHz)",
+        variant: "pr:compx",
+        parameter: 0,
+    },
+    Device {
+        provider: "pulsar",
+        vid: 0x373b,
         pid: 0x11d9,
         name: "ATK A9 Ultimate (receiver)",
         variant: "pr:compx",
+        parameter: 0,
+    },
+    Device {
+        provider: "pulsar",
+        vid: 0x373b,
+        pid: 0x1216,
+        name: "ATK VXE NK mouse (2.4 GHz)",
+        variant: "pr:bitmouse",
         parameter: 0,
     },
     Device {

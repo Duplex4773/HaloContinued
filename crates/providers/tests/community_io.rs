@@ -26,6 +26,65 @@ fn packet(hex: &str) -> Vec<u8> {
 }
 
 #[test]
+fn newly_reviewed_compx_devices_use_only_vendor_collection() {
+    for (provider, vid, pid) in [
+        ("pulsar", 0x373b, 0x10c9),
+        ("lamzu", 0x3554, 0xf510),
+        ("lamzu", 0x3554, 0xf50f),
+    ] {
+        let mut wrong = device(vid, pid, 0xff02, 2);
+        wrong.output_length = Some(20);
+        let mut good = device(vid, pid, 0xff02, 2);
+        good.output_length = Some(17);
+        good.path.push_str("-control");
+        let h = FakeHid::new(
+            vec![wrong, good],
+            vec![
+                rd(&[]),
+                Step::Write(pulsar_request()),
+                rd(&packet(
+                    "08 04 00 00 00 02 23 00 0e 23 00 00 00 00 00 00 f3",
+                )),
+            ],
+        );
+        let rows = poll(&mut HidProvider::new(provider), &h, &FakeClock::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, Some(35));
+        assert_eq!(rows[0].charging, Some(false));
+    }
+}
+
+#[test]
+fn bitmouse_separates_level_and_charging_and_rejects_unrelated_reports() {
+    let request = |cmd| {
+        let mut r = padded(&[8, 0, 0x72, 2, 0, 1, cmd, 1], 64);
+        r[1] = r[2..].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        r
+    };
+    let h = FakeHid::new(
+        vec![device(0x373b, 0x1216, 0xff05, 1)],
+        vec![
+            rd(&[]),
+            Step::Write(request(7)),
+            rd(&[8, 0x72, 0, 5, 0, 15, 1, 1]),
+            rd(&[8, 0x72, 0, 5, 0, 7, 1, 70, 0x5b, 0x0f]),
+            Step::Write(request(15)),
+            rd(&[8, 0x72, 0, 5, 0, 15, 1, 0, 0x5b, 0x0f]),
+        ],
+    );
+    let rows = poll(&mut HidProvider::new("pulsar"), &h, &FakeClock::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].level, Some(70));
+    assert_eq!(rows[0].charging, Some(false));
+    let h = FakeHid::new(vec![device(0x373b, 0x1216, 0xff02, 2)], vec![]);
+    assert!(
+        poll(&mut HidProvider::new("pulsar"), &h, &FakeClock::default())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn pinned_reviewed_catalog_has_unique_ids_and_excludes_unconfirmed_transports() {
     let rows: serde_json::Value =
         serde_json::from_str(include_str!("../reviewed-devices.json")).unwrap();
@@ -47,7 +106,7 @@ fn pinned_reviewed_catalog_has_unique_ids_and_excludes_unconfirmed_transports() 
         assert_eq!(entry["revision"].as_str().unwrap().len(), 40);
         assert!(entry["pull_request"].as_u64().unwrap() > 0);
     }
-    assert_eq!(seen.len(), 42);
+    assert_eq!(seen.len(), 46);
     for (vid, pid) in [
         (0x1532, 0x00df),
         (0x1532, 0x00de),

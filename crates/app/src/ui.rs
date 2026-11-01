@@ -881,7 +881,7 @@ impl HistorySelection {
                 "Estimated time used · Pauses during sleep, charging or disconnection"
             }
             HistoryAxis::Calendar => {
-                "Calendar time · Shows the last known battery level between readings"
+                "Calendar time · Smoothed battery trend; holds the last level during sleep"
             }
         }
     }
@@ -1812,12 +1812,16 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         if hwnd != (*ptr).monitor.get()
             && (msg == WM_SHOWWINDOW
+                || msg == WM_SIZE
                 || msg == WM_WINDOWPOSCHANGED
                     && lp.0 != 0
                     && (*(lp.0 as *const WINDOWPOS)).flags.0 & (SWP_HIDEWINDOW | SWP_SHOWWINDOW).0
                         != 0)
         {
-            // SetWindowPos can change visibility without WM_SHOWWINDOW.
+            // Restore/minimize can send WM_SIZE without visibility flags, even
+            // while State is borrowed. Layout can also temporarily suppress
+            // WS_VISIBLE with WM_SETREDRAW. Inspect the final state, not that
+            // intermediate state. SetWindowPos need not send WM_SHOWWINDOW.
             // Defer until native processing and any outer State borrow finish.
             (*ptr).deferred.push(WM_APP + 12, 0);
         }
@@ -8821,11 +8825,7 @@ mod history_tests {
             panic!("Calendar history must use timestamps")
         };
         assert_eq!((since, until, width, request), (395200, 1_000_000, 333, 8));
-        assert!(
-            selection
-                .description()
-                .contains("last known battery level between readings")
-        );
+        assert!(selection.description().contains("Smoothed battery trend"));
         selection.axis = HistoryAxis::Usage;
         assert_eq!(selection.index(), 0);
         assert_eq!(selection.labels()[0], "2 hours used");
@@ -10727,6 +10727,19 @@ mod dashboard_lifecycle_tests {
                 state.settings.polling_controls = false;
                 state.build();
             }
+            // A restore can deliver WM_SIZE reentrantly while State is borrowed,
+            // without a SHOWWINDOW or WINDOWPOS visibility flag. It must still
+            // reconcile discovery with the final native visibility afterwards.
+            dispatch_monitor(monitor);
+            {
+                let state = context.state.borrow_mut();
+                assert!(state.dashboard_visible());
+                state.runtime.send(Command::ConfigurationVisible(false));
+                send(first, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
+                assert!(!state.runtime.configuration_visible());
+            }
+            dispatch_monitor(monitor);
+            assert!(context.state.borrow().runtime.configuration_visible());
             let repetitions = std::env::var("HALO_STRESS_DASHBOARD_VISIBILITY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -11254,6 +11267,13 @@ mod dashboard_lifecycle_tests {
                         state.device_section = 0;
                         state.error.clear();
                         state.more_options = advanced;
+                        if page == 2
+                            && std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
+                                .is_ok_and(|mode| mode == "history-trend")
+                        {
+                            state.history.axis = HistoryAxis::Calendar;
+                            state.history.calendar_index = 2;
+                        }
                         if page == 1
                             && std::env::var("HALO_CAPTURE_DASHBOARD_TEST").is_ok_and(|v| {
                                 matches!(
@@ -11705,21 +11725,39 @@ mod dashboard_lifecycle_tests {
                         );
                         let _ = SetViewportOrgEx(dc, previous_origin.x, previous_origin.y, None);
                         if page == 2 {
-                            let points = (0..=16)
+                            let trend = std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
+                                .is_ok_and(|mode| mode == "history-trend");
+                            let points = (0..=if trend { 720 } else { 16 })
                                 .map(|index| {
                                     let mut reading = Reading::new(
                                         "synthetic-mouse",
                                         "Test mouse",
                                         "simulation",
-                                        index * 450,
+                                        index * if trend { 3600 } else { 450 },
                                     );
-                                    reading.level = Some(66 - index as u8);
+                                    reading.level = Some(if trend {
+                                        // Synthetic charge cycles with quantized readings
+                                        // and a changing slope, never user history.
+                                        let hour = (index % 240) as f64 / 239.;
+                                        100 - (81. * hour.powf(0.85)) as u8
+                                    } else {
+                                        66 - index as u8
+                                    });
+                                    if trend && index == 720 {
+                                        reading.level = Some(19);
+                                    }
                                     reading.connection = Connection::Online;
                                     reading
                                 })
                                 .collect();
-                            let mut series = HistorySeries::calendar(points, 0, 7200);
-                            series.axis = HistoryAxis::Usage;
+                            let mut series = HistorySeries::calendar(
+                                points,
+                                0,
+                                if trend { 30 * 86400 } else { 7200 },
+                            );
+                            if !trend {
+                                series.axis = HistoryAxis::Usage;
+                            }
                             let chart = Chart::new(reopened, width as u32, height as u32).unwrap();
                             chart
                                 .paint_with_palette(

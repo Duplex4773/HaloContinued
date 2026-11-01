@@ -119,10 +119,7 @@ impl Link<'_> {
         else {
             return Ok(None);
         };
-        Ok(Some((
-            r[1..5].iter().map(|b| format!("{b:02X}")).collect(),
-            *model,
-        )))
+        Ok(Some((crate::hex::encode(&r[1..5], true, false), *model)))
     }
 }
 

@@ -1,6 +1,8 @@
 mod common;
 #[path = "../src/logitech_controls.rs"]
 mod controls;
+#[path = "../src/hex.rs"]
+mod hex;
 use common::*;
 use controls::*;
 use hb_core::*;
