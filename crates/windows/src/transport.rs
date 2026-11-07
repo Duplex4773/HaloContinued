@@ -74,7 +74,7 @@ impl Drop for Preparsed {
 struct Cached {
     at: Duration,
     generation: u64,
-    devices: Vec<HidInfo>,
+    devices: HidSnapshot,
     short: bool,
     short_retry_at: Option<Duration>,
 }
@@ -176,7 +176,7 @@ impl EnumerationCache {
         generation: u64,
         now: Duration,
         mut refresh: impl FnMut() -> Result<(Vec<HidInfo>, usize), ProviderError>,
-    ) -> Result<Vec<HidInfo>, ProviderError> {
+    ) -> Result<HidSnapshot, ProviderError> {
         let previous = self.0.get(&vendor).filter(|c| c.generation == generation);
         if let Some(c) = previous {
             let immediate_or_due = c.short
@@ -197,6 +197,7 @@ impl EnumerationCache {
         let short_retry_at = previous.filter(|c| c.short).map(|_| now);
         let (devices, present) = refresh()?;
         let short = devices.len() < present;
+        let devices: HidSnapshot = devices.into();
         self.0.insert(
             vendor,
             Cached {
@@ -461,6 +462,10 @@ impl HidTransport for WindowsHid {
         ConnectionStamp::new(u64::from_le_bytes(bytes))
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
+        self.enumerate_shared(vendor)
+            .map(|devices| devices.to_vec())
+    }
+    fn enumerate_shared(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
         let generation = self.generation.load(Ordering::Relaxed);
         let mut cache = shared_lock(&self.cache, SHARED_LOCK_WAIT)?;
         cache.enumerate(vendor, generation, self.epoch.elapsed(), || {
@@ -839,6 +844,43 @@ mod cache_tests {
                 ..Default::default()
             })
             .collect()
+    }
+    #[test]
+    fn cached_metadata_is_shared_and_old_snapshots_survive_reconnect_and_failure() {
+        let mut cache = EnumerationCache::default();
+        let old = cache
+            .enumerate(0x1532, 0, Duration::ZERO, || Ok((infos(1), 1)))
+            .unwrap();
+        let hit = cache
+            .enumerate(0x1532, 0, Duration::from_secs(1), || {
+                panic!("cache hit must not discover")
+            })
+            .unwrap();
+        assert!(std::ptr::eq(old.as_ptr(), hit.as_ptr()));
+        let next = cache
+            .enumerate(0x1532, 1, Duration::from_secs(2), || Ok((infos(2), 2)))
+            .unwrap();
+        assert!(!std::ptr::eq(old.as_ptr(), next.as_ptr()));
+        assert_eq!(old.len(), 1);
+        assert_eq!(next.len(), 2);
+        assert!(
+            cache
+                .enumerate(0x1532, 2, Duration::from_secs(3), || Err(
+                    ProviderError::new("inaccessible")
+                ))
+                .is_err()
+        );
+        let recovered = cache
+            .enumerate(0x1532, 2, Duration::from_secs(4), || Ok((infos(1), 1)))
+            .unwrap();
+        assert!(!std::ptr::eq(next.as_ptr(), recovered.as_ptr()));
+        assert_eq!(next.len(), 2);
+        assert_eq!(old.len(), 1);
+        let expired = cache
+            .enumerate(0x1532, 2, Duration::from_secs(35), || Ok((infos(3), 3)))
+            .unwrap();
+        assert_eq!(expired.len(), 3);
+        assert!(!std::ptr::eq(expired.as_ptr(), recovered.as_ptr()));
     }
     #[test]
     fn failed_open_recovers_only_affected_vendor_without_connection_epoch_change() {

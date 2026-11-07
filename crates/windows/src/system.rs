@@ -185,6 +185,43 @@ pub fn high_contrast() -> bool {
             && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
     }
 }
+/// Read account-wide pointer acceleration without accessing input or changing
+/// settings. The dashboard queries this only in response to UI events.
+pub fn mouse_acceleration() -> Result<bool, ProviderError> {
+    let mut parameters = [0i32; 3];
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSE,
+            0,
+            Some(parameters.as_mut_ptr().cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .map_err(|e| ProviderError::new(e.to_string()))?;
+    acceleration_enabled(parameters[2])
+}
+fn acceleration_enabled(value: i32) -> Result<bool, ProviderError> {
+    match value {
+        0 => Ok(false),
+        1 | 2 => Ok(true),
+        _ => Err(ProviderError::new(
+            "Unrecognised Windows mouse acceleration setting",
+        )),
+    }
+}
+#[cfg(test)]
+mod mouse_acceleration_tests {
+    #[test]
+    fn acceleration_modes_do_not_confuse_unknown_values_with_off() {
+        assert!(!super::acceleration_enabled(0).unwrap());
+        for mode in [1, 2] {
+            assert!(super::acceleration_enabled(mode).unwrap());
+        }
+        for mode in [-1, 3, i32::MAX] {
+            assert!(super::acceleration_enabled(mode).is_err());
+        }
+    }
+}
 fn theme_value(name: windows::core::PCWSTR) -> bool {
     theme_value_at(
         w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),

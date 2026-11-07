@@ -138,7 +138,7 @@ pub(crate) fn preference_unit<'a>(
         serial: suffix,
     })
 }
-fn wired_mouse(key: &str, kind: &str, source: &str, via: &str) -> bool {
+pub fn wired_mouse(key: &str, kind: &str, source: &str, via: &str) -> bool {
     kind == "mouse"
         && source == "razer"
         && via == "usb"

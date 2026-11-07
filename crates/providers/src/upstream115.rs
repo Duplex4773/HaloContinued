@@ -372,7 +372,7 @@ impl HidProvider {
     }
     fn poll_added115(
         &mut self,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {

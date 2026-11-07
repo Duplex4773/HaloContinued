@@ -442,6 +442,30 @@
   [
     "corsair",
     6940,
+    2665,
+    "Corsair HS80 RGB Wireless",
+    "pr:hs80",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2666,
+    "Corsair HS80 RGB Wireless",
+    "pr:hs80",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2667,
+    "Corsair HS80 RGB Wireless",
+    "pr:hs80",
+    0
+  ],
+  [
+    "corsair",
+    6940,
     2711,
     "Corsair HS80 Max Wireless",
     "",
@@ -541,6 +565,14 @@
     24833,
     "8BitDo SN30 Pro",
     "",
+    0
+  ],
+  [
+    "eweadn",
+    2205,
+    1583,
+    "EWEADN S9",
+    "pr:eweadn",
     0
   ],
   [
@@ -1128,6 +1160,14 @@
     0
   ],
   [
+    "jabra",
+    2830,
+    9415,
+    "Jabra Link 380 headset",
+    "pr:jabra",
+    0
+  ],
+  [
     "jbl",
     3787,
     8328,
@@ -1561,6 +1601,14 @@
   ],
   [
     "mchose",
+    16868,
+    8193,
+    "MCHOSE K87",
+    "pr:k87",
+    0
+  ],
+  [
+    "mchose",
     21075,
     4128,
     "MCHOSE M7 Ultra",
@@ -1573,6 +1621,14 @@
     8789,
     "MCHOSE G7",
     "",
+    0
+  ],
+  [
+    "monsgeek",
+    12625,
+    20518,
+    "MonsGeek FUN60 Pro",
+    "pr:monsgeek",
     0
   ],
   [
@@ -1666,6 +1722,14 @@
   [
     "pulsar",
     13652,
+    62725,
+    "VGN Dragonfly 4K (2.4 GHz)",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
     62727,
     "Pulsar X2 V2 Mini (wired)",
     "",
@@ -1716,6 +1780,30 @@
     13652,
     62933,
     "Redragon M991 / K1NG Max",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
+    62940,
+    "Cougar Revenger Pro (2.4 GHz)",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
+    62942,
+    "Cougar Revenger Pro 4K (wired)",
+    "pr:compx",
+    0
+  ],
+  [
+    "pulsar",
+    13652,
+    62943,
+    "Cougar Revenger Pro 4K",
     "pr:compx",
     0
   ],
@@ -2362,6 +2450,22 @@
   [
     "razer",
     5426,
+    229,
+    "Razer Viper V4 Pro",
+    "",
+    31
+  ],
+  [
+    "razer",
+    5426,
+    230,
+    "Razer Viper V4 Pro",
+    "",
+    31
+  ],
+  [
+    "razer",
+    5426,
     600,
     "Razer BlackWidow V3 Mini HyperSpeed",
     "",
@@ -2494,6 +2598,14 @@
     "Razer BlackShark V2 Pro (2023)",
     "",
     63
+  ],
+  [
+    "razer",
+    5426,
+    1402,
+    "Razer BlackShark V3",
+    "pr:blackshark-v3",
+    0
   ],
   [
     "razer",

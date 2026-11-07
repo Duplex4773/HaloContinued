@@ -103,10 +103,11 @@ fn pinned_reviewed_catalog_has_unique_ids_and_excludes_unconfirmed_transports() 
             .unwrap();
         assert_eq!(d.name, row[3].as_str().unwrap());
         assert_eq!(d.variant, row[4].as_str().unwrap());
+        assert_eq!(u64::from(d.parameter), row[5].as_u64().unwrap());
         assert_eq!(entry["revision"].as_str().unwrap().len(), 40);
         assert!(entry["pull_request"].as_u64().unwrap() > 0);
     }
-    assert_eq!(seen.len(), 46);
+    assert_eq!(seen.len(), 60);
     for (vid, pid) in [
         (0x1532, 0x00df),
         (0x1532, 0x00de),
@@ -129,6 +130,10 @@ fn new_compx_id_only_additions_use_existing_exchange_and_literal_capture() {
     for (vid, pid) in [
         (0x3554, 0xf5d5),
         (0x3554, 0xf55e),
+        (0x3554, 0xf505),
+        (0x3554, 0xf5dc),
+        (0x3554, 0xf5de),
+        (0x3554, 0xf5df),
         (0x3554, 0xf5f7),
         (0x3554, 0xf5f6),
         (0x3770, 0x0300),

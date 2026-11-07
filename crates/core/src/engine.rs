@@ -196,47 +196,16 @@ impl Engine {
         self.clean_states();
     }
     fn clean_states(&mut self) {
-        let readings = self.readings();
-        self.clean_states_with(&readings);
-    }
-    fn clean_states_with(&mut self, readings: &[Reading]) {
-        let connected: BTreeSet<_> = readings
-            .iter()
-            .filter(|r| !self.settings.device(&r.key).is_some_and(|d| d.hidden))
-            .map(|r| r.key.as_str())
-            .collect();
-        self.alerts
-            .retain(|key, _| connected.contains(key.as_str()));
-        let known: BTreeSet<_> = self
-            .by_provider
-            .values()
-            .flatten()
-            .map(|r| r.key.as_str())
-            .collect();
-        self.misses.retain(|key, _| known.contains(key.as_str()));
-        self.held
-            .retain(|(key, _), _| connected.contains(key.as_str()));
-        if !self.sound_at.is_empty() {
-            let mut sound_keys = BTreeSet::new();
-            for reading in self
-                .by_provider
-                .values()
-                .flatten()
-                .filter(|r| !self.settings.device(&r.key).is_some_and(|d| d.hidden))
-            {
-                let identities = sound_identities(reading);
-                if let Some(serial) = &identities[1]
-                    && self.sound_at.contains_key(serial)
-                    && conflicting_serial_containers(reading, &self.by_provider, &self.settings)
-                {
-                    // Once a serial is known to describe different containers,
-                    // an older shared cooldown cannot be assigned to either one.
-                    self.sound_at.remove(serial);
-                }
-                sound_keys.extend(identities.into_iter().flatten());
-            }
-            self.sound_at.retain(|key, _| sound_keys.contains(key));
-        }
+        let readings = resolved_readings(&self.by_provider, &self.settings);
+        clean_states_with(
+            &self.by_provider,
+            &self.settings,
+            &readings,
+            &mut self.alerts,
+            &mut self.misses,
+            &mut self.held,
+            &mut self.sound_at,
+        );
     }
     /// One coalesced sound per completed poll, separate from toast quiet mode.
     pub fn take_low_battery_sound(&mut self) -> Option<u8> {
@@ -307,10 +276,12 @@ impl Engine {
                 r.level = None;
             }
         }
-        let seen: BTreeSet<_> = fresh.iter().map(|r| r.key.clone()).collect();
+        let fresh_count = fresh.len();
+        let seen: BTreeSet<_> = fresh.iter().map(|r| r.key.as_str()).collect();
+        let mut cached_readings = Vec::new();
         if let Some(previous) = self.by_provider.get(provider) {
             for r in previous {
-                if seen.contains(&r.key) {
+                if seen.contains(r.key.as_str()) {
                     self.misses.remove(&r.key);
                     continue;
                 }
@@ -322,30 +293,42 @@ impl Engine {
                 } else {
                     2
                 };
-                if *misses < limit || self.settings.keep_disconnected && fresh.len() < 512 {
+                if *misses < limit
+                    || self.settings.keep_disconnected && fresh_count + cached_readings.len() < 512
+                {
                     let mut cached = r.clone();
                     cached.connection = Connection::Stale;
                     cached.charging = Some(false);
-                    fresh.push(cached);
+                    cached_readings.push(cached);
                 }
             }
         }
+        drop(seen);
+        fresh.extend(cached_readings);
         self.by_provider.insert(provider.into(), fresh);
-        let readings = self.readings();
-        self.clean_states_with(&readings);
+        let readings = resolved_readings(&self.by_provider, &self.settings);
+        clean_states_with(
+            &self.by_provider,
+            &self.settings,
+            &readings,
+            &mut self.alerts,
+            &mut self.misses,
+            &mut self.held,
+            &mut self.sound_at,
+        );
         let mut notifications = Vec::new();
         for r in readings {
             if self.settings.device(&r.key).is_some_and(|d| d.hidden) {
                 self.estimator.pause(&r.key);
                 continue;
             }
-            let fresh_here = seen.contains(&r.key)
-                && self
-                    .by_provider
-                    .get(provider)
-                    .is_some_and(|own| own.iter().any(|o| o.key == r.key && o.source == r.source));
+            let fresh_here = self.by_provider.get(provider).is_some_and(|own| {
+                own[..fresh_count]
+                    .iter()
+                    .any(|o| o.key == r.key && o.source == r.source)
+            });
             if fresh_here {
-                self.estimator.record(&r, monotonic);
+                self.estimator.record(r, monotonic);
             }
             let low = self.settings.low_for(&r.key);
             // Only this provider's fresh, selected reading can trigger a sound.
@@ -361,14 +344,14 @@ impl Engine {
                     // constructing identity/alias strings on every healthy poll.
                     if !self.sound_at.is_empty() {
                         for identity in
-                            related_sound_identities(&r, &self.by_provider, &self.settings)
+                            related_sound_identities(r, &self.by_provider, &self.settings)
                         {
                             self.sound_at.remove(&identity);
                         }
                     }
                 } else {
-                    let mut identities = sound_identities(&r);
-                    if conflicting_serial_containers(&r, &self.by_provider, &self.settings)
+                    let mut identities = sound_identities(r);
+                    if conflicting_serial_containers(r, &self.by_provider, &self.settings)
                         && let Some(serial) = identities[1].take()
                     {
                         self.sound_at.remove(&serial);
@@ -542,23 +525,9 @@ impl Engine {
     // Resolve precedence once using borrowed rows. Snapshot construction can
     // then own each selected reading directly, without an intermediate Vec<Reading>.
     fn resolved_readings(&self) -> Vec<&Reading> {
-        let all = enabled_readings(&self.by_provider, &self.settings);
-        let mut kept: Vec<&Reading> = Vec::new();
-        for r in all.clone() {
-            if !reading_eligible(r, all.clone()) {
-                continue;
-            }
-            if let Some(i) = kept.iter().position(|o| o.key == r.key) {
-                if reading_replaces(kept[i], r) {
-                    kept[i] = r;
-                }
-            } else {
-                kept.push(r);
-            }
-        }
-        kept.sort_by(|a, b| a.key.cmp(&b.key));
-        kept
+        resolved_readings(&self.by_provider, &self.settings)
     }
+
     pub fn snapshot(&self, timestamp: i64) -> Snapshot {
         Snapshot {
             timestamp,
@@ -631,6 +600,73 @@ impl Engine {
                 .collect(),
         }
     }
+}
+
+fn clean_states_with(
+    providers: &BTreeMap<String, Vec<Reading>>,
+    settings: &Settings,
+    readings: &[&Reading],
+    alerts: &mut BTreeMap<String, AlertState>,
+    misses: &mut BTreeMap<String, u8>,
+    held: &mut BTreeMap<(String, NotificationKind), Notification>,
+    sound_at: &mut BTreeMap<String, f64>,
+) {
+    let connected: BTreeSet<_> = readings
+        .iter()
+        .copied()
+        .filter(|r| !settings.device(&r.key).is_some_and(|d| d.hidden))
+        .map(|r| r.key.as_str())
+        .collect();
+    alerts.retain(|key, _| connected.contains(key.as_str()));
+    let known: BTreeSet<_> = providers
+        .values()
+        .flatten()
+        .map(|r| r.key.as_str())
+        .collect();
+    misses.retain(|key, _| known.contains(key.as_str()));
+    held.retain(|(key, _), _| connected.contains(key.as_str()));
+    if !sound_at.is_empty() {
+        let mut sound_keys = BTreeSet::new();
+        for reading in providers
+            .values()
+            .flatten()
+            .filter(|r| !settings.device(&r.key).is_some_and(|d| d.hidden))
+        {
+            let identities = sound_identities(reading);
+            if let Some(serial) = &identities[1]
+                && sound_at.contains_key(serial)
+                && conflicting_serial_containers(reading, providers, settings)
+            {
+                // Once a serial is known to describe different containers,
+                // an older shared cooldown cannot be assigned to either one.
+                sound_at.remove(serial);
+            }
+            sound_keys.extend(identities.into_iter().flatten());
+        }
+        sound_at.retain(|key, _| sound_keys.contains(key));
+    }
+}
+
+fn resolved_readings<'a>(
+    providers: &'a BTreeMap<String, Vec<Reading>>,
+    settings: &'a Settings,
+) -> Vec<&'a Reading> {
+    let all = enabled_readings(providers, settings);
+    let mut kept: Vec<&Reading> = Vec::new();
+    for r in all.clone() {
+        if !reading_eligible(r, all.clone()) {
+            continue;
+        }
+        if let Some(i) = kept.iter().position(|o| o.key == r.key) {
+            if reading_replaces(kept[i], r) {
+                kept[i] = r;
+            }
+        } else {
+            kept.push(r);
+        }
+    }
+    kept.sort_by(|a, b| a.key.cmp(&b.key));
+    kept
 }
 
 fn enabled_readings<'a>(

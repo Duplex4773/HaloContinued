@@ -18,6 +18,55 @@ fn observation(ts: i64, level: u8, hz: Option<u32>, session: Option<u64>) -> Usa
 }
 
 #[test]
+fn cancelled_insights_stops_between_batches_without_changing_retained_history() {
+    use std::cell::Cell;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+    for minute in 0..1000 {
+        store
+            .record_usage(&observation(
+                minute * 60,
+                90 - (minute / 60) as u8,
+                Some(1000),
+                Some(1),
+            ))
+            .unwrap();
+    }
+    store.flush().unwrap();
+    let expected = store.query_insights("synthetic-a", 60_000).unwrap();
+    assert!(
+        store
+            .query_insights_if("synthetic-a", 60_000, || false)
+            .unwrap()
+            .is_none()
+    );
+    let checks = Cell::new(0);
+    assert!(
+        store
+            .query_insights_if("synthetic-a", 60_000, || {
+                checks.set(checks.get() + 1);
+                checks.get() < 4
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        checks.get(),
+        4,
+        "Cancellation must stop the unfinished scan"
+    );
+    let actual = store
+        .query_insights_if("synthetic-a", 60_000, || true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    assert_eq!(
+        store.query("synthetic-a", 0, 60_000, 2000).unwrap().len(),
+        1000
+    );
+}
+
+#[test]
 fn usage_and_insights_do_not_bridge_reused_keys_after_identity_changes() {
     for field in 0..5 {
         let directory = tempfile::tempdir().unwrap();
@@ -72,6 +121,7 @@ fn reused_keys_do_not_mix_previous_units_drain_or_boost_events_and_keep_raw_hist
                 key: "synthetic-a".into(),
                 timestamp,
                 session,
+                sequence: 1,
                 kind,
                 rate: PollingRate::try_from(1000).unwrap(),
                 previous: PollingRate::try_from(500).ok(),
@@ -118,6 +168,7 @@ fn linked_activity_uses_insertion_order_when_event_timestamps_match() {
                     key: "synthetic-a".into(),
                     timestamp: 0,
                     session: 1,
+                    sequence: 1,
                     kind,
                     rate: PollingRate::try_from(1000).unwrap(),
                     previous: PollingRate::try_from(500).ok(),
@@ -152,7 +203,7 @@ fn malformed_linked_activity_does_not_hide_valid_battery_readings() {
             .unwrap()
             .execute(
                 &format!(
-                    "INSERT INTO polling_events VALUES ('synthetic-a','1',0,{kind},1000,NULL)"
+                    "INSERT INTO polling_events(device,session,ts,kind,rate,previous_rate) VALUES ('synthetic-a','1',0,{kind},1000,NULL)"
                 ),
                 [],
             )
@@ -216,7 +267,7 @@ fn malformed_polling_events_do_not_hide_valid_history_or_inflate_activity_counts
     store.flush().unwrap();
     let db = Connection::open(&path).unwrap();
     db.execute_batch(
-        "INSERT INTO polling_events VALUES
+        "INSERT INTO polling_events(device,session,ts,kind,rate,previous_rate) VALUES
         ('synthetic-a','1',1,'manual',1000,NULL),
         ('synthetic-a','2',2,'boost',2000,1000),
         ('synthetic-a','3',3,'restore',1000,2000),
@@ -375,7 +426,7 @@ fn old_database_is_readable_without_upgrade_and_upgrades_preserving_history() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM usage_metadata", [], |row| row
@@ -571,6 +622,7 @@ fn confirmed_events_are_scoped_idempotent_and_not_inferred_for_old_data() {
         key: "synthetic-a".into(),
         timestamp: 0,
         session: 1,
+        sequence: 1,
         kind: Kind::Boost,
         rate: PollingRate::try_from(2000).unwrap(),
         previous: PollingRate::try_from(1000).ok(),
@@ -653,6 +705,7 @@ fn same_rate_manual_choice_ends_boost_ownership_without_inflating_change_counts(
         key: "synthetic-a".into(),
         timestamp: 0,
         session: 1,
+        sequence: 1,
         kind: PollingActivityKind::Boost,
         rate,
         previous: PollingRate::try_from(1000).ok(),

@@ -28,18 +28,22 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Latest release: **1.1.1** for Windows 11 x64, available as an unsigned per-user
+Latest release: **1.1.2** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.1.1 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.1/HaloContinued-1.1.1-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.1.1 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.1/HaloContinued-1.1.1-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.2 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.2/HaloContinued-1.1.2-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.2 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.2/HaloContinued-1.1.2-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.1/HaloContinued-1.1.1-SHA256SUMS.txt)
-· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.1)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.2/HaloContinued-1.1.2-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.2)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
+
+**New in 1.1.2:** Device workspace updates, a read-only Windows mouse acceleration
+check, battery support for nine more models, and fixes for tray recovery, polling
+rate readback, and battery history. See the [1.1.2 changelog](CHANGELOG.md).
 
 **New in 1.1.1:**
 
@@ -219,6 +223,18 @@ These have hardware reports in the parent PRs; local validation uses simulated
 transports. The NK receiver uses its dedicated battery protocol and collection;
 unknown charging replies remain unknown. These additions do not enable hardware
 configuration commands.
+
+Additional battery support in 1.1.2:
+
+- **Cougar Revenger Pro 4K** via both receivers and USB cable. [Parent PR #354](https://github.com/HeyOkay/HaloBattery/pull/354)
+- **EWEADN S9**, **MCHOSE K87**, and **MonsGeek FUN60 Pro** via their 2.4 GHz receivers. [Parent PR #352](https://github.com/HeyOkay/HaloBattery/pull/352)
+- **Corsair HS80 RGB Wireless** via USB and receiver, including powered-off USB charging. Cable-based charging is inferred, and USB and receiver readings share an icon when their hardware identity matches. [Parent PR #359](https://github.com/HeyOkay/HaloBattery/pull/359)
+- **Razer BlackShark V3** via its 2.4 GHz receiver. It listens for pushed updates and limits active battery requests to initial connection, link-up, and five minutes without a battery report. [Parent PR #349](https://github.com/HeyOkay/HaloBattery/pull/349)
+- **Jabra Evolve2 65** via the tested Link 380 receiver (`0B0E:24C7`). [Parent PR #337](https://github.com/HeyOkay/HaloBattery/pull/337)
+- **Razer Viper V4 Pro** via USB and receiver, and **VGN Dragonfly 4K** via its receiver. [Parent PR #363](https://github.com/HeyOkay/HaloBattery/pull/363)
+
+These additions are for battery monitoring. Hardware validation comes from the
+upstream reports. Local tests use simulated HID devices.
 
 | Control | Enabled support |
 | --- | --- |

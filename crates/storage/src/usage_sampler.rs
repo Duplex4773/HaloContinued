@@ -34,6 +34,8 @@ pub(super) struct TimingReading<'a> {
     pub charging_inferred: bool,
     pub connection: Connection,
     pub timestamp: i64,
+    #[serde(default)]
+    pub next_poll_seconds: Option<u16>,
     #[serde(rename = "precision")]
     _precision: Precision,
     #[serde(rename = "name")]

@@ -25,6 +25,7 @@ pub struct PollingActivity {
     pub key: String,
     pub timestamp: i64,
     pub session: u64,
+    pub sequence: u64,
     pub kind: PollingActivityKind,
     pub rate: PollingRate,
     pub previous: Option<PollingRate>,

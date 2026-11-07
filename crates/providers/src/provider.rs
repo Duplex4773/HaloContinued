@@ -49,6 +49,9 @@ pub const FAMILIES: &[(&str, &str)] = &[
     ("ajazz", "AJAZZ mice"),
     ("shield", "NVIDIA SHIELD controllers"),
     ("aula", "AULA mice and keyboards"),
+    ("eweadn", "EWEADN mice"),
+    ("jabra", "Jabra headsets"),
+    ("monsgeek", "MonsGeek keyboards"),
 ];
 pub fn providers() -> Vec<Box<dyn BatteryProvider>> {
     FAMILIES
@@ -151,7 +154,7 @@ impl HidProvider {
     }
     fn poll_jbl(
         &mut self,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {
@@ -231,7 +234,7 @@ impl HidProvider {
     }
     /// Called only after all vendor enumerations succeeded. Absence is then
     /// evidence for releasing protocol hints, not a transient enumeration error.
-    fn prune_enumerated(&mut self, infos: &[HidInfo], now: Duration) {
+    fn prune_enumerated(&mut self, infos: &[&HidInfo], now: Duration) {
         if self.last.is_empty()
             && self.last_observed.is_empty()
             && self.razer_dead.is_empty()
@@ -1469,7 +1472,7 @@ impl HidProvider {
     }
     fn logitech_poll(
         &mut self,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {
@@ -1942,7 +1945,7 @@ fn candidate(id: &str, d: &Device, i: &HidInfo) -> bool {
         _ => i.usage_page >= 0xff00,
     }
 }
-fn candidate_group(id: &str, d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool {
+fn candidate_group(id: &str, d: &Device, i: &HidInfo, infos: &[&HidInfo]) -> bool {
     if !matches!(
         id,
         "astro" | "keychron" | "jbl" | "corsair" | "pulsar" | "audeze"
@@ -2045,10 +2048,17 @@ impl BatteryProvider for HidProvider {
         self.audeze_pending = false;
         self.playstation_pending = false;
         self.playstation_budget.clear();
-        let mut infos = Vec::new();
+        let mut inventories = Vec::new();
         for &vendor in &self.vendors {
-            infos.extend(hid.enumerate(vendor)?);
+            let devices = hid.enumerate_shared(vendor)?;
+            if !devices.is_empty() {
+                inventories.push(devices);
+            }
         }
+        let infos: Vec<_> = inventories
+            .iter()
+            .flat_map(|devices| devices.iter())
+            .collect();
         let mut community_result = Ok(Vec::new());
         let community_queryable = self.community_enabled
             && infos.iter().any(|i| {
@@ -2471,6 +2481,9 @@ impl BatteryProvider for HidProvider {
                         "usb"
                     }
                     .into();
+                    if self.id == "razer" && d.pid == 0x00e6 {
+                        r.via = "wireless".into();
+                    }
                     set_battery(&mut r, b);
                     if self.id == "razer"
                         && d.pid == 0x0528
@@ -2898,7 +2911,7 @@ mod allocation_tests {
                 interface: 4,
                 ..Default::default()
             };
-            let infos = vec![info.clone(); 64];
+            let infos = vec![&info; 64];
             let expected = candidate(id, d, &info);
             let baseline = allocations(|| {
                 std::hint::black_box(candidate(id, d, &info));
@@ -2921,7 +2934,7 @@ mod allocation_tests {
         };
         assert_eq!(
             allocations(|| assert_eq!(
-                candidate_group("steelseries", d, &info, std::slice::from_ref(&info)),
+                candidate_group("steelseries", d, &info, &[&info]),
                 candidate("steelseries", d, &info)
             )),
             0
@@ -3064,7 +3077,7 @@ mod cache_retention_tests {
         provider
             .razer_cache
             .insert("hint".into(), (device.path.clone(), 0x1f));
-        provider.prune_enumerated(std::slice::from_ref(&device), Duration::from_secs(3600));
+        provider.prune_enumerated(&[&device], Duration::from_secs(3600));
         let sleeping = provider.cached(&key, Duration::from_secs(3600)).unwrap();
         assert_eq!(sleeping.connection, Connection::Sleeping);
         assert_eq!((sleeping.level, sleeping.charging), (None, None));

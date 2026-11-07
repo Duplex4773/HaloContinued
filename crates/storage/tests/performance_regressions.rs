@@ -229,6 +229,7 @@ fn boost_attribution_does_not_allocate_a_string_per_history_sample() {
             key: "invented".into(),
             timestamp: 0,
             session: 1,
+            sequence: 1,
             kind: hb_core::PollingActivityKind::Boost,
             rate: PollingRate::try_from(4000).unwrap(),
             previous: PollingRate::try_from(1000).ok(),

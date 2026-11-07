@@ -38,7 +38,14 @@ def table(module, name):
             return value(node.value)
     raise ValueError(f'Missing {module}.{name}')
 
-rows = {tuple(r[:3]): r for r in json.loads((ROOT / 'crates/providers/tests/catalog-fixtures.json').read_text())}
+def rust_string(value):
+    escapes = {'"': r'\"', '\\': r'\\'}
+    return '"' + ''.join(
+        escapes.get(char, f'\\u{{{ord(char):x}}}' if ord(char) < 32 else char)
+        for char in value
+    ) + '"'
+
+rows = {tuple(r[:3]): r for r in json.loads((ROOT / 'crates/providers/tests/catalog-fixtures.json').read_text(encoding='utf-8'))}
 def add(provider, vid, pid, name, variant='', parameter=0):
     rows[(provider, vid, pid)] = [provider, vid, pid, name, variant, parameter]
 
@@ -61,7 +68,7 @@ for pid in table('steam', 'PUCKS'):
     add('steam', 0x28de, pid, 'Steam Controller (2025)')
 # Hardware-confirmed additions from reviewed, pinned parent pull requests. Apply
 # last so importing the older main catalog cannot remove their protocol routing.
-for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text()):
+for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text(encoding='utf-8')):
     add(*entry['device'])
 ordered = sorted(rows.values())
 catalog = ROOT / 'crates/providers/src/catalog.rs'
@@ -69,7 +76,7 @@ old = catalog.read_text(encoding='utf-8')
 start, end = old.index('pub const DEVICES:'), old.index('pub const AUDEZE_REQUESTS:')
 lines = ['pub const DEVICES: &[Device] = &[']
 for provider, vid, pid, name, variant, parameter in ordered:
-    lines.append(f'Device {{ provider:{json.dumps(provider)}, vid:0x{vid:04x}, pid:0x{pid:04x}, name:{json.dumps(name)}, variant:{json.dumps(variant)}, parameter:{parameter} }},')
+    lines.append(f'Device {{ provider:{rust_string(provider)}, vid:0x{vid:04x}, pid:0x{pid:04x}, name:{rust_string(name)}, variant:{rust_string(variant)}, parameter:{parameter} }},')
 lines.append('];\n')
 catalog.write_text(old[:start].replace('upstream 1.14.0', 'upstream 1.15.0').replace('tools/port_catalog.py', 'tools/sync-upstream-catalog.py') + '\n'.join(lines) + old[end:], encoding='utf-8')
 (ROOT / 'crates/providers/tests/catalog-fixtures.json').write_text(json.dumps(ordered, indent=2) + '\n', encoding='utf-8')
@@ -82,10 +89,10 @@ verified = {
     'mchose:f013:', 'hyperx_cloud3:0995:', 'hyperx_cloud3:0795:',
     'pulsar:5406:', 'pulsar:3414:', 'steelseries:2317:', 'corsair:1b7f:', 'corsair:0a40:',
 }
-for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text()):
+for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text(encoding='utf-8')):
     provider, _, pid, _, variant, _ = entry['device']
     protocol = variant.removeprefix('pr:')
-    family = {'nearlink':0x108c, 'ajazz':0x5c2f, 'aula-mouse':0x22a0, 'turbo':0x6008}.get(protocol, pid)
+    family = {'nearlink':0x108c, 'ajazz':0x5c2f, 'aula-mouse':0x22a0, 'turbo':0x6008, 'hs80':0x0a6b}.get(protocol, pid)
     if protocol == 'rapoo':
         family = 0x1413 if pid in (0x1413,0x4613) else 0x1924
     if protocol == 'turtle':

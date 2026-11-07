@@ -114,12 +114,12 @@ pub fn discover(
         if !context.active() {
             return Err(ProviderError::new("Sleep discovery cancelled"));
         }
-        let infos = hid.enumerate(vendor)?;
+        let infos = hid.enumerate_shared(vendor)?;
         if infos.len() > 512 {
             return Err(ProviderError::new("Too many HID collections"));
         }
         let mut groups: BTreeMap<String, Vec<(&HidInfo, &SleepModel)>> = BTreeMap::new();
-        for i in &infos {
+        for i in infos.iter() {
             if let Some(m) = MODELS.iter().find(|m| collection(m, i)) {
                 groups
                     .entry(format!("{}{}", prefix(m), trusted_identity(i)))
@@ -181,7 +181,7 @@ pub fn execute(
         if request.seconds.is_some_and(|s| !m.supports(s)) {
             return Err(ProviderError::new("Unsupported sleep duration"));
         }
-        let infos = hid.enumerate(m.vendor)?;
+        let infos = hid.enumerate_shared(m.vendor)?;
         let mut matches = infos.iter().filter_map(|i| {
             MODELS
                 .iter()

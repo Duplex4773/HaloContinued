@@ -38,6 +38,15 @@ pub(crate) const PANEL_MARKER: isize = 0x4842_504c;
 const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
 }
+pub(crate) fn mix(a: COLORREF, b: COLORREF, percent: u32) -> COLORREF {
+    let channel = |shift: u32| {
+        let a = (a.0 >> shift) & 255;
+        let b = (b.0 >> shift) & 255;
+        (a * (100 - percent) + b * percent + 50) / 100
+    };
+    rgb(channel(0), channel(8), channel(16))
+}
+
 impl Palette {
     pub fn new(dark: bool, high_contrast: bool) -> Self {
         if high_contrast {
@@ -58,32 +67,70 @@ impl Palette {
         }
         if dark {
             Self {
-                background: rgb(22, 27, 26),
-                surface: rgb(32, 38, 37),
-                text: rgb(237, 242, 239),
-                disabled: rgb(169, 185, 174),
-                border: rgb(53, 65, 59),
-                accent: rgb(126, 225, 178),
-                selection: rgb(36, 62, 50),
-                selection_text: rgb(126, 225, 178),
+                background: rgb(21, 25, 30),
+                surface: rgb(30, 37, 45),
+                text: rgb(241, 244, 246),
+                disabled: rgb(175, 190, 201),
+                border: rgb(55, 67, 78),
+                accent: rgb(131, 223, 184),
+                selection: rgb(42, 59, 62),
+                selection_text: rgb(131, 223, 184),
                 dark,
                 high_contrast,
             }
         } else {
             Self {
-                background: rgb(247, 248, 247),
+                background: rgb(248, 250, 251),
                 surface: rgb(255, 255, 255),
-                text: rgb(32, 38, 36),
-                disabled: rgb(89, 103, 94),
-                border: rgb(220, 227, 223),
-                accent: rgb(17, 107, 72),
-                selection: rgb(222, 241, 229),
-                selection_text: rgb(17, 107, 72),
+                text: rgb(30, 41, 50),
+                disabled: rgb(83, 97, 110),
+                border: rgb(212, 221, 227),
+                accent: rgb(18, 104, 79),
+                selection: rgb(227, 237, 234),
+                selection_text: rgb(18, 104, 79),
                 dark,
                 high_contrast,
             }
         }
     }
+    pub(crate) fn caption(self) -> COLORREF {
+        if self.high_contrast {
+            self.background
+        } else if self.dark {
+            rgb(27, 32, 39)
+        } else {
+            rgb(238, 242, 245)
+        }
+    }
+
+    pub(crate) fn inset(self) -> COLORREF {
+        if self.high_contrast {
+            self.background
+        } else if self.dark {
+            rgb(25, 31, 38)
+        } else {
+            rgb(240, 244, 246)
+        }
+    }
+
+    pub(crate) fn track(self) -> COLORREF {
+        if self.high_contrast {
+            self.border
+        } else if self.dark {
+            rgb(53, 67, 74)
+        } else {
+            rgb(224, 232, 233)
+        }
+    }
+
+    pub(crate) fn selected_border(self) -> COLORREF {
+        mix(self.border, self.accent, 57)
+    }
+
+    pub(crate) fn hover(self, background: COLORREF) -> COLORREF {
+        mix(background, self.text, 6)
+    }
+
     pub fn d2d(color: COLORREF) -> windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
         windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
             r: (color.0 & 255) as f32 / 255.,
@@ -101,6 +148,19 @@ pub(crate) fn color_brush(hdc: HDC, color: COLORREF) -> HBRUSH {
         HBRUSH(GetStockObject(DC_BRUSH).0)
     }
 }
+pub(crate) unsafe fn draw_utf16(
+    hdc: HDC,
+    text: &mut [u16],
+    bounds: &mut RECT,
+    flags: DRAW_TEXT_FORMAT,
+) {
+    // DrawTextW can read the first UTF-16 unit even when the count is zero.
+    // An empty Rust buffer need not have readable storage.
+    if !text.is_empty() {
+        unsafe { DrawTextW(hdc, text, bounds, flags) };
+    }
+}
+
 pub(crate) fn rounded_surface(
     hdc: HDC,
     rect: &RECT,
@@ -181,7 +241,7 @@ impl DashboardTheme {
             );
             if !self.palette.high_contrast {
                 for (attribute, color) in [
-                    (DWMWA_CAPTION_COLOR, self.palette.background),
+                    (DWMWA_CAPTION_COLOR, self.palette.caption()),
                     (DWMWA_TEXT_COLOR, self.palette.text),
                     (DWMWA_BORDER_COLOR, self.palette.border),
                 ] {
@@ -259,12 +319,18 @@ impl DashboardTheme {
                 );
             }
             if class == "ComboBox" {
-                let height = (28 * GetDpiForWindow(hwnd) / 96) as isize;
+                let dpi = GetDpiForWindow(hwnd);
+                let height = (28 * dpi / 96) as isize;
+                let field_height = if matches!(GetDlgCtrlID(hwnd), 43 | 50 | 431 | 474) {
+                    (30 * dpi / 96) as isize
+                } else {
+                    height
+                };
                 SendMessageW(
                     hwnd,
                     CB_SETITEMHEIGHT,
                     Some(WPARAM(usize::MAX)),
-                    Some(LPARAM(height)),
+                    Some(LPARAM(field_height)),
                 );
                 SendMessageW(
                     hwnd,
@@ -327,7 +393,7 @@ impl DashboardTheme {
                     *cache = Some(WidgetFont {
                         dpi,
                         font: CreateFontW(
-                            -24 * dpi as i32 / 96,
+                            -26 * dpi as i32 / 96,
                             0,
                             0,
                             0,
@@ -397,7 +463,7 @@ impl DashboardTheme {
                     rect.left += 6;
                     SetTextColor(item.hDC, fg);
                     SetBkMode(item.hDC, TRANSPARENT);
-                    DrawTextW(
+                    draw_utf16(
                         item.hDC,
                         &mut text,
                         &mut rect,
@@ -654,7 +720,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
             return DefSubclassProc(hwnd, msg, wp, lp);
         }
         let appearance = *(data as *const ControlAppearance);
-        let input_background = appearance.palette.background;
+        let input_background = appearance.palette.inset();
         let mut palette = appearance.palette;
         if GetWindowLongPtrW(hwnd, GWLP_USERDATA) == PANEL_MARKER {
             palette.background = palette.surface;
@@ -777,7 +843,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                             top,
                             bottom: top + bar.dxyLineButton,
                         };
-                        DrawTextW(
+                        draw_utf16(
                             hdc,
                             &mut [glyph as u16],
                             &mut arrow_rect,
@@ -820,7 +886,12 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                         text.truncate(len as usize);
                         let mut label = rect;
                         label.left += 9 * dpi / 96;
-                        label.right -= 28 * dpi / 96;
+                        label.right -= (if matches!(GetDlgCtrlID(hwnd), 43 | 50 | 431 | 474) {
+                            16
+                        } else {
+                            28
+                        }) * dpi
+                            / 96;
                         SetTextColor(
                             hdc,
                             if enabled {
@@ -830,7 +901,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                             },
                         );
                         SetBkMode(hdc, TRANSPARENT);
-                        DrawTextW(
+                        draw_utf16(
                             hdc,
                             &mut text,
                             &mut label,
@@ -849,7 +920,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                     },
                 );
                 SetBkMode(hdc, TRANSPARENT);
-                DrawTextW(
+                draw_utf16(
                     hdc,
                     &mut ['▾' as u16],
                     &mut arrow_rect,
@@ -863,40 +934,34 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                     && SendMessageW(hwnd, BM_GETCHECK, None, None).0 == BST_CHECKED.0 as isize;
                 let enabled = IsWindowEnabled(hwnd).as_bool();
                 let id = GetDlgCtrlID(hwnd);
-                let navigation = matches!(id, 1..=3 | 6 | 17..=19 | 22 | 24);
-                let primary = matches!(id, 15 | 40 | 210 | 433 | 453) && !check;
+                let navigation = matches!(id, 1..=3 | 6);
+                let disclosure = matches!(id, 18 | 24);
+                let flat = navigation || disclosure || matches!(id, 4 | 42);
+                let primary = matches!(id, 15 | 210) && !check;
+                let apply_rate = id == 40;
                 let active = enabled && (appearance.hovered || state & BST_PUSHED != 0);
                 let background = if check {
                     palette.background
                 } else if primary && enabled {
                     palette.accent
-                } else if navigation {
-                    if active {
-                        palette.selection
-                    } else {
+                } else if active {
+                    palette.hover(if flat {
                         palette.background
-                    }
-                } else if selected || active {
+                    } else {
+                        palette.surface
+                    })
+                } else if apply_rate && enabled {
                     palette.selection
+                } else if flat {
+                    palette.background
                 } else {
                     palette.surface
-                };
-                let background = if active && !check && !navigation {
-                    let amount: u32 = if state & BST_PUSHED != 0 { 20 } else { 10 };
-                    let channel = |shift: u32| -> u32 {
-                        let a = (background.0 >> shift) & 255;
-                        let b = (palette.accent.0 >> shift) & 255;
-                        (a * (100 - amount) + b * amount) / 100
-                    };
-                    rgb(channel(0), channel(8), channel(16))
-                } else {
-                    background
                 };
                 FillRect(hdc, &rect, color_brush(hdc, palette.background));
                 let mut text_rect = rect;
                 let dpi = GetDpiForWindow(hwnd).max(96) as i32;
                 if check {
-                    let size = 18 * dpi / 96;
+                    let size = 17 * dpi / 96;
                     let mark = RECT {
                         left: 1,
                         top: (rect.bottom - size) / 2,
@@ -934,36 +999,36 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                             },
                         );
                         SetBkMode(hdc, TRANSPARENT);
-                        DrawTextW(
+                        draw_utf16(
                             hdc,
                             &mut tick,
                             &mut mark_rect,
                             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                         );
                     }
-                    text_rect.left = mark.right + 9 * dpi / 96;
+                    text_rect.left = mark.right + (if id == 49 { 5 } else { 9 }) * dpi / 96;
                 } else {
                     rounded_surface(
                         hdc,
                         &rect,
                         background,
-                        if navigation {
+                        if flat {
                             background
-                        } else if selected || (primary && enabled) || active {
+                        } else if primary && enabled {
                             palette.accent
                         } else {
                             palette.border
                         },
-                        10 * dpi / 96,
+                        6 * dpi / 96,
                     );
                     // A persistent underline identifies the current page even
                     // without colour. It uses the same paint pass as the label.
                     if selected {
                         let rail = RECT {
-                            left: rect.left + 14 * dpi / 96,
-                            right: rect.right - 14 * dpi / 96,
-                            top: rect.bottom - 3 * dpi / 96,
-                            bottom: rect.bottom - dpi / 96,
+                            left: rect.left,
+                            right: rect.right,
+                            top: rect.bottom - 2 * dpi / 96,
+                            bottom: rect.bottom,
                         };
                         FillRect(hdc, &rail, color_brush(hdc, palette.accent));
                     }
@@ -984,7 +1049,7 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                             } else {
                                 rgb(255, 255, 255)
                             }
-                        } else if selected || active {
+                        } else if selected || apply_rate {
                             palette.selection_text
                         } else {
                             palette.text
@@ -996,13 +1061,27 @@ unsafe fn control_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, data: us
                 SetBkMode(hdc, TRANSPARENT);
                 let ui = SendMessageW(hwnd, WM_QUERYUISTATE, None, None).0 as u32;
                 let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
-                if !check {
+                if id == 4 {
+                    let size = 16 * dpi / 96;
+                    crate::dashboard_widgets::draw_symbol(
+                        hdc,
+                        RECT {
+                            left: 4 * dpi / 96,
+                            right: 4 * dpi / 96 + size,
+                            top: (rect.bottom - size) / 2,
+                            bottom: (rect.bottom + size) / 2,
+                        },
+                        "refresh",
+                        palette.text,
+                    );
+                    text_rect.left = 25 * dpi / 96;
+                } else if !check && !disclosure && id != 42 {
                     flags |= DT_CENTER;
                 }
                 if ui & UISF_HIDEACCEL != 0 {
                     flags |= DT_HIDEPREFIX;
                 }
-                DrawTextW(hdc, &mut text, &mut text_rect, flags);
+                draw_utf16(hdc, &mut text, &mut text_rect, flags);
                 if GetFocus() == hwnd && ui & UISF_HIDEFOCUS == 0 {
                     text_rect.left += 2;
                     text_rect.top += 2;
@@ -1177,7 +1256,7 @@ mod tests {
                         (PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND) as isize,
                     )),
                 );
-                assert_eq!(GetPixel(dc, rect.right - 4, 4), theme.palette.background);
+                assert_eq!(GetPixel(dc, rect.right - 4, 4), theme.palette.inset());
             }
             SelectObject(dc, previous);
             let _ = DeleteObject(bitmap.into());

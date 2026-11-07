@@ -25,7 +25,7 @@ pub(crate) fn execute(
             "device connection changed; refresh configuration before applying",
         );
     }
-    let devices = match hid.enumerate(0x3837) {
+    let devices = match hid.enumerate_shared(0x3837) {
         Ok(devices) => devices,
         Err(error) => return ControlOutcome::failed(request, error.message),
     };

@@ -34,6 +34,7 @@ fn insights_normal_rate_follows_manual_choices_and_survives_boosts_over_saver() 
                 key: "synthetic:mouse".into(),
                 timestamp,
                 session: timestamp as u64,
+                sequence: 1,
                 kind,
                 rate: PollingRate::try_from(hz).unwrap(),
                 previous: PollingRate::try_from(previous).ok(),
@@ -146,7 +147,7 @@ fn version_three_history_migrates_atomically_and_read_only_legacy_queries_still_
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         db.query_row("SELECT payload FROM state WHERE key='retained'", [], |r| {
@@ -163,6 +164,61 @@ fn version_three_history_migrates_atomically_and_read_only_legacy_queries_still_
 }
 
 #[test]
+fn version_four_polling_history_keeps_distinct_events_in_the_same_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    drop(Store::open(&path).unwrap());
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "DROP TABLE polling_events;
+        CREATE TABLE polling_events(device TEXT NOT NULL,session TEXT NOT NULL,ts INTEGER NOT NULL,kind TEXT NOT NULL,rate INTEGER NOT NULL,previous_rate INTEGER,PRIMARY KEY(device,session,ts,kind));
+        CREATE INDEX polling_events_time ON polling_events(ts);
+        CREATE INDEX polling_events_device_time ON polling_events(device,ts);
+        CREATE INDEX polling_events_device_session_time ON polling_events(device,session,ts);
+        INSERT INTO polling_events VALUES('synthetic:mouse','1',100,'manual',1000,500);
+        PRAGMA user_version=4;",
+    ).unwrap();
+    drop(db);
+
+    let event = PollingActivity {
+        key: "synthetic:mouse".into(),
+        timestamp: 100,
+        session: 1,
+        sequence: 1,
+        kind: PollingActivityKind::Manual,
+        rate: PollingRate::try_from(2000).unwrap(),
+        previous: PollingRate::try_from(1000).ok(),
+    };
+    let prior = Store::read_only(&path)
+        .unwrap()
+        .query_insights(&event.key, 100)
+        .unwrap();
+    assert_eq!(prior.recent.manual_changes, 1);
+    assert_eq!(prior.recent.normal_rate, event.previous);
+
+    let mut store = Store::open(&path).unwrap();
+    store.record_polling_activity(&event).unwrap();
+    store.record_polling_activity(&event).unwrap();
+    let updated = store.query_insights(&event.key, 100).unwrap();
+    assert_eq!(updated.recent.manual_changes, 2);
+    assert_eq!(updated.recent.normal_rate, Some(event.rate));
+
+    let another = PollingActivity {
+        sequence: 2,
+        ..event
+    };
+    store.record_polling_activity(&another).unwrap();
+    assert_eq!(
+        store
+            .query_insights(&another.key, 100)
+            .unwrap()
+            .recent
+            .manual_changes,
+        3
+    );
+}
+
+#[test]
 fn saver_changes_and_restorations_have_distinct_insights_activity_and_duration() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(&dir.path().join("history.db")).unwrap();
@@ -175,6 +231,7 @@ fn saver_changes_and_restorations_have_distinct_insights_activity_and_duration()
                 key: "synthetic:mouse".into(),
                 timestamp: ts,
                 session,
+                sequence: 1,
                 kind,
                 rate: PollingRate::try_from(hz).unwrap(),
                 previous: PollingRate::try_from(previous).ok(),

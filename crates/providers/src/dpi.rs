@@ -223,7 +223,7 @@ fn razer(
     {
         return Err(error("DPI exceeds this mouse's supported range."));
     }
-    let infos = hid.enumerate(0x1532)?;
+    let infos = hid.enumerate_shared(0x1532)?;
     if infos.len() > 512 {
         return Err(error("Too many mouse collections."));
     }

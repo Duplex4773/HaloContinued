@@ -247,7 +247,7 @@ impl DeviceController for HidDeviceController {
                 "device connection changed; refresh configuration before applying",
             );
         }
-        let devices = match hid.enumerate(0x1532) {
+        let devices = match hid.enumerate_shared(0x1532) {
             Ok(d) => d,
             Err(e) => return ControlOutcome::failed(request, e.message),
         };

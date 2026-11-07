@@ -3,7 +3,7 @@
 impl HidProvider {
     fn poll_114_headsets(
         &mut self,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {

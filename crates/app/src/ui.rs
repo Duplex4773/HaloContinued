@@ -1,9 +1,9 @@
 //! A single UI thread owns all HWND, HICON and Direct2D resources.
 use crate::{
     chart::Chart,
-    dashboard_theme::{DashboardTheme, Palette, color_brush, rounded_surface},
+    dashboard_theme::{DashboardTheme, Palette, color_brush, draw_utf16, rounded_surface},
     icons::{self, Frames},
-    runtime::{Command, Event, Runtime},
+    runtime::{Command, Event, PowerSignals, Runtime},
 };
 use hb_core::*;
 use std::{
@@ -12,6 +12,10 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use windows::{
@@ -34,7 +38,9 @@ use windows::{
     core::{GUID, PCWSTR, w},
 };
 const TRAY: u32 = WM_APP + 1;
-const PAGE_TOP: i32 = 60;
+const DASHBOARD_WIDTH: i32 = 778;
+const PAGE_WIDTH: i32 = DASHBOARD_WIDTH - 40;
+const PAGE_TOP: i32 = 43;
 const PAGE_FOOTER: i32 = 62;
 #[path = "dashboard_settings.rs"]
 mod dashboard_settings;
@@ -45,6 +51,7 @@ mod device_overview;
 #[path = "display_menu.rs"]
 mod display_menu;
 use device_information::DeviceInfoUi;
+use device_overview::{BATTERY_SECTION, CUSTOM_DPI, INFO_SECTION, WORKSPACE_FOOTER};
 const ICON_CHOICES: &[&str] = &[
     "Automatic",
     "Mouse",
@@ -69,6 +76,11 @@ fn providers() -> Vec<&'static str> {
         .chain(["xinput"])
         .collect()
 }
+#[cfg(test)]
+thread_local! {
+    static TEST_STARTUP_CHANGES: Cell<u32> = const { Cell::new(0) };
+}
+
 fn dashboard_startup(enabled: bool) -> Result<(), ProviderError> {
     #[cfg(not(test))]
     {
@@ -79,6 +91,7 @@ fn dashboard_startup(enabled: bool) -> Result<(), ProviderError> {
         // Native fixtures save real form data in an isolated profile, but must
         // never register their temporary executable in the user's startup list.
         let _ = enabled;
+        TEST_STARTUP_CHANGES.with(|count| count.set(count.get() + 1));
         Ok(())
     }
 }
@@ -175,6 +188,27 @@ fn dpi_input(text: &str, limits: Option<&DpiLimits>) -> Result<DpiValue, String>
     }
     Ok(DpiValue::uniform(value))
 }
+// Most live labels are short and unchanged. Compare native UTF-16 directly,
+// without allocating a String or retaining a second copy of each control text.
+fn control_text_matches(hwnd: HWND, text: &str) -> bool {
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd).max(0) as usize;
+        if text.encode_utf16().count() != length {
+            return false;
+        }
+        let mut short = [0u16; 256];
+        let mut long;
+        let buffer = if length < short.len() {
+            &mut short[..length + 1]
+        } else {
+            long = vec![0u16; length + 1];
+            &mut long[..]
+        };
+        let copied = GetWindowTextW(hwnd, buffer).max(0) as usize;
+        copied == length && buffer[..copied].iter().copied().eq(text.encode_utf16())
+    }
+}
+
 fn user_message(message: &str) -> &str {
     if let Some(detail) = message.strip_prefix("HDR: ") {
         return detail;
@@ -534,20 +568,16 @@ struct PollingUi {
     status: BTreeMap<String, String>,
 }
 impl PollingUi {
-    fn observe_background(&mut self, outcome: &ControlOutcome) {
+    fn observe_background(&mut self, outcome: &ControlOutcome, remember_previous: bool) {
         // An automatic transaction supersedes prior readback, including when
         // the resulting hardware rate is uncertain or the connection changed.
         self.observations.remove(&outcome.key);
-        let verified = outcome.observation.as_ref().filter(|observation| {
-            outcome.failure.is_none()
-                && observation.target.generation == self.generation
-                && observation.target.device.key == outcome.key
-                && observation.rate.is_some()
-        });
+        let verified = confirmed_polling(outcome, self.generation);
         if let Some(observation) = verified {
             self.observations
                 .insert(outcome.key.clone(), observation.clone());
-            if outcome.may_have_changed
+            if remember_previous
+                && outcome.may_have_changed
                 && let Some(previous) = outcome.previous
             {
                 self.previous.insert(outcome.key.clone(), previous);
@@ -559,6 +589,32 @@ impl PollingUi {
         } else {
             self.previous.remove(&outcome.key);
             self.previous_devices.remove(&outcome.key);
+        }
+    }
+    fn mirror_manual_readback(&mut self, source: &Self, key: &str) {
+        if source.generation < self.generation {
+            return;
+        }
+        if source.generation > self.generation {
+            self.invalidate(source.generation);
+        }
+        self.observations.remove(key);
+        if let Some(observation) = source.observations.get(key) {
+            self.observations.insert(key.into(), observation.clone());
+        }
+        self.previous.remove(key);
+        self.previous_devices.remove(key);
+        if let Some((rate, device)) = source
+            .previous
+            .get(key)
+            .zip(source.previous_devices.get(key))
+        {
+            self.previous.insert(key.into(), *rate);
+            self.previous_devices.insert(key.into(), device.clone());
+        }
+        self.status.remove(key);
+        if let Some(status) = source.status.get(key) {
+            self.status.insert(key.into(), status.clone());
         }
     }
     fn revoke_observation(&mut self, key: &str) {
@@ -734,6 +790,8 @@ impl PollingUi {
                 || observation.target.generation < self.generation
             {
                 self.observations.remove(&outcome.key);
+                self.previous.remove(&outcome.key);
+                self.previous_devices.remove(&outcome.key);
                 self.status.insert(
                     outcome.key.clone(),
                     "Device configuration changed; Refresh before applying".into(),
@@ -741,10 +799,13 @@ impl PollingUi {
                 return true;
             }
             self.generation = observation.target.generation;
+        }
+        self.observations.remove(&outcome.key);
+        if outcome.failure.is_none()
+            && let Some(observation) = &outcome.observation
+        {
             self.observations
                 .insert(outcome.key.clone(), observation.clone());
-        } else {
-            self.observations.remove(&outcome.key);
         }
         if let PollingIntent::Apply { restore: false, .. } = pending.intent
             && let Some(previous) = outcome.previous
@@ -893,6 +954,7 @@ impl HistorySelection {
                 until,
                 width,
                 request,
+                cancelled: Arc::default(),
             },
             HistoryAxis::Calendar => Command::History {
                 key,
@@ -900,6 +962,7 @@ impl HistorySelection {
                 until,
                 width,
                 request,
+                cancelled: Arc::default(),
             },
         }
     }
@@ -907,6 +970,7 @@ impl HistorySelection {
 #[derive(Default)]
 struct InsightsUi {
     sequence: u64,
+    cancelled: Option<Arc<AtomicBool>>,
     pending: Option<(u64, String)>,
     key: Option<String>,
     data: Option<BatteryInsights>,
@@ -921,11 +985,16 @@ impl InsightsUi {
         {
             return None;
         }
+        self.abandon();
+        self.cancelled = Some(Arc::new(AtomicBool::new(false)));
         self.sequence = self.sequence.wrapping_add(1).max(1);
         self.pending = Some((self.sequence, key.into()));
         Some(self.sequence)
     }
     fn abandon(&mut self) {
+        if let Some(cancelled) = self.cancelled.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
         self.pending = None;
     }
     fn invalidate(&mut self) {
@@ -952,7 +1021,7 @@ impl InsightsUi {
         {
             return false;
         }
-        self.pending = None;
+        self.abandon();
         match result {
             Ok(data) => {
                 self.status = insight_coverage_text(&data);
@@ -964,6 +1033,63 @@ impl InsightsUi {
             }
         }
         true
+    }
+}
+#[cfg(test)]
+mod performance_query_tests {
+    use super::*;
+    #[test]
+    fn leaving_or_replacing_insights_cancels_only_the_obsolete_query() {
+        let mut ui = InsightsUi::default();
+        let old = ui.begin("first").unwrap();
+        let old_cancel = ui.cancelled.as_ref().unwrap().clone();
+        assert!(ui.begin("first").is_none());
+        assert!(!old_cancel.load(Ordering::Relaxed));
+        let current = ui.begin("replacement").unwrap();
+        let current_cancel = ui.cancelled.as_ref().unwrap().clone();
+        assert!(old_cancel.load(Ordering::Relaxed));
+        assert!(!ui.accept(old, Some("first"), Ok(BatteryInsights::default())));
+        assert!(!current_cancel.load(Ordering::Relaxed));
+        assert!(ui.accept(current, Some("replacement"), Ok(BatteryInsights::default())));
+        assert!(current_cancel.load(Ordering::Relaxed));
+        ui.begin("replacement");
+        let closing = ui.cancelled.as_ref().unwrap().clone();
+        ui.invalidate();
+        assert!(closing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn borrowed_overview_inventory_matches_owned_rows_without_allocations() {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut reading = Reading::new("razer:00bf:SYNTHETIC", "Test mouse", "razer", 1);
+        reading.kind = "mouse".into();
+        reading.serial = Some("replacement-unit".into());
+        engine.apply("razer", Ok(vec![reading.clone()]), 1., false);
+        let snapshot = engine.snapshot(1);
+        let mut stale = ConfigurationDevice::from_reading(&reading);
+        stale.serial = Some("old-unit".into());
+        stale.name = "Stale name".into();
+        let mut keyboard = stale.clone();
+        keyboard.key = "corsair:keyboard:SYNTHETIC".into();
+        keyboard.kind = "keyboard".into();
+        let config = vec![stale, keyboard.clone(), keyboard];
+        let expected = merged_device_rows(&snapshot.devices, &config);
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            let mut count = 0;
+            for ((descriptor, battery), (device, old_battery)) in
+                borrowed_device_rows(&snapshot.devices, &config).zip(&expected)
+            {
+                assert_eq!(descriptor, DeviceDescriptorRef::from(device));
+                assert_eq!(
+                    battery.map(|b| &b.reading),
+                    old_battery.as_ref().map(|b| &b.reading)
+                );
+                count += 1;
+            }
+            assert_eq!(count, expected.len());
+        });
+        assert_eq!(allocations.calls, 0);
+        assert_eq!(allocations.bytes, 0);
     }
 }
 const INSIGHTS_EMPTY: &str = "To compare rates, turn on Allow device settings changes in Settings, then select Refresh rate in Devices or the tray menu. Only rates confirmed by the device are included.";
@@ -1160,10 +1286,10 @@ fn charge_cycle_text(cycle: &ChargeCycle) -> String {
         polling_timestamp(cycle.end_timestamp),
     )
 }
-/// Four coalesced lifecycle actions, held without an allocation or a timer.
+/// Coalesced lifecycle and tray recovery messages, held without an allocation or a timer.
 /// Reposting while a native modal loop owns State would keep that loop busy.
 #[derive(Default)]
-struct DeferredDashboard(Cell<[Option<(u32, usize)>; 4]>);
+struct DeferredDashboard(Cell<[Option<(u32, usize)>; 5]>);
 impl DeferredDashboard {
     fn push(&self, message: u32, parameter: usize) {
         let mut messages = self.0.get();
@@ -1172,7 +1298,7 @@ impl DeferredDashboard {
             .position(|item| item.is_some_and(|(m, _)| m == message))
         {
             messages.copy_within(index + 1.., index);
-            messages[3] = None;
+            *messages.last_mut().unwrap() = None;
         }
         if let Some(slot) = messages.iter_mut().find(|item| item.is_none()) {
             *slot = Some((message, parameter));
@@ -1192,6 +1318,7 @@ mod deferred_dashboard_tests {
                 queue.push(WM_APP + 9, index);
                 queue.push(WM_APP + 11, index);
                 queue.push(WM_APP + 12, 0);
+                queue.push(0xc123, 0); // Registered TaskbarCreated message.
             }
             queue.push(WM_APP + 8, 0);
         });
@@ -1202,14 +1329,17 @@ mod deferred_dashboard_tests {
                 Some((WM_APP + 9, 999)),
                 Some((WM_APP + 11, 999)),
                 Some((WM_APP + 12, 0)),
-                Some((WM_APP + 8, 0))
+                Some((0xc123, 0)),
+                Some((WM_APP + 8, 0)),
             ]
         );
     }
 }
 struct UiContext {
+    power: PowerSignals,
     state: RefCell<State>,
     monitor: Cell<HWND>,
+    taskbar: u32,
     // Native child painting can reenter while State is being updated. Keep an
     // immutable, owned theme available without borrowing application state.
     paint: RefCell<Option<(HWND, Rc<DashboardTheme>)>>,
@@ -1222,7 +1352,7 @@ impl UiContext {
             return;
         }
         let mut blocked = false;
-        for (message, parameter) in self.deferred.0.replace([None; 4]).into_iter().flatten() {
+        for (message, parameter) in self.deferred.0.take().into_iter().flatten() {
             if blocked
                 || unsafe {
                     PostMessageW(
@@ -1262,6 +1392,32 @@ fn merged_device_rows(
     }
     rows
 }
+fn borrowed_device_rows<'a>(
+    batteries: &'a [DeviceView],
+    configuration: &'a [ConfigurationDevice],
+) -> impl Iterator<Item = (DeviceDescriptorRef<'a>, Option<&'a DeviceView>)> {
+    batteries
+        .iter()
+        .map(|battery| {
+            let descriptor = configuration
+                .iter()
+                .find(|d| d.matches_reading(&battery.reading))
+                .map(DeviceDescriptorRef::from)
+                .unwrap_or_else(|| DeviceDescriptorRef::from(&battery.reading));
+            (descriptor, Some(battery))
+        })
+        .chain(
+            configuration
+                .iter()
+                .enumerate()
+                .filter_map(|(index, device)| {
+                    (!batteries.iter().any(|b| b.reading.key == device.key)
+                        && !configuration[..index].iter().any(|d| d.key == device.key))
+                    .then_some((DeviceDescriptorRef::from(device), None))
+                }),
+        )
+}
+
 fn inventory_contains_device(
     batteries: &[DeviceView],
     configuration: &[ConfigurationDevice],
@@ -1286,28 +1442,6 @@ fn inventory_contains_device(
             .find(|d| d.key == device.key)
             .is_some_and(|d| d == device)
     }
-}
-fn device_row_index(
-    batteries: &[DeviceView],
-    configuration: &[ConfigurationDevice],
-    key: &str,
-) -> Option<usize> {
-    if let Some(index) = batteries.iter().position(|d| d.reading.key == key) {
-        return Some(index);
-    }
-    let mut row = batteries.len();
-    for (index, device) in configuration.iter().enumerate() {
-        if batteries.iter().any(|d| d.reading.key == device.key)
-            || configuration[..index].iter().any(|d| d.key == device.key)
-        {
-            continue;
-        }
-        if device.key == key {
-            return Some(row);
-        }
-        row += 1;
-    }
-    None
 }
 fn selected_device_sources<'a>(
     batteries: &'a [DeviceView],
@@ -1434,11 +1568,10 @@ struct State {
     history: HistorySelection,
     history_resize: HistoryResize,
     request: u64,
-    history_pending: Option<u64>,
+    history_pending: Option<(u64, Arc<AtomicBool>)>,
     hdr_pending: bool,
     history_cache_active: bool,
     history_queued: Option<Box<Command>>,
-    taskbar: u32,
     notify: Option<HDEVNOTIFY>,
     animating: bool,
     tray_theme: TrayThemeCache,
@@ -1453,8 +1586,8 @@ struct State {
     wheel_remainder: i32,
     page_height: i32,
     more_options: bool,
-    device_section: u16,
-    control_details: bool,
+    startup_initial: Option<bool>,
+    workspace_sections: u16,
     overview_keys: Vec<String>,
     overview_visibility: Option<u16>,
     polling: PollingUi,
@@ -1463,14 +1596,13 @@ struct State {
     sleep: SleepUi,
     dpi: DpiUi,
     information: DeviceInfoUi,
-    polling_intents: BTreeMap<String, (u64, PollingRate)>,
+    polling_intents: BTreeMap<String, (u64, PollingRate, bool)>,
     tooltip_rates: BTreeMap<String, PollingObservation>,
 }
 #[derive(Default)]
 struct DpiUi {
     next: u64,
     pending: Option<(u64, String)>,
-    attempted: Option<(String, u64)>,
     shown_key: Option<String>,
     outcome: Option<DpiOutcome>,
     previous: Option<(String, u64, DpiState)>,
@@ -1485,7 +1617,6 @@ struct FormDraft {
 #[derive(Default)]
 struct SleepUi {
     saver_key: Option<String>,
-    details: bool,
     saver_details: bool,
     next: u64,
     shown_key: Option<String>,
@@ -1534,6 +1665,15 @@ fn copy(dst: &mut [u16], s: &str) {
         position += units.len();
     }
 }
+fn confirmed_polling(outcome: &ControlOutcome, generation: u64) -> Option<&PollingObservation> {
+    outcome.observation.as_ref().filter(|observation| {
+        outcome.failure.is_none()
+            && observation.target.generation == generation
+            && observation.target.device.key == outcome.key
+            && observation.rate.is_some()
+    })
+}
+
 fn cache_tooltip_rate(
     cache: &mut BTreeMap<String, PollingObservation>,
     outcome: &ControlOutcome,
@@ -1541,13 +1681,7 @@ fn cache_tooltip_rate(
     enabled: bool,
 ) {
     cache.remove(&outcome.key);
-    if enabled
-        && outcome.failure.is_none()
-        && let Some(observation) = &outcome.observation
-        && observation.target.generation == generation
-        && observation.target.device.key == outcome.key
-        && observation.rate.is_some()
-    {
+    if enabled && let Some(observation) = confirmed_polling(outcome, generation) {
         if cache.len() >= 512 {
             cache.pop_first();
         }
@@ -1616,6 +1750,7 @@ pub fn run(
             hInstance: instance.into(),
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW).map_err(err)?,
+            hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as _)).unwrap_or_default(),
             hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut _),
             ..Default::default()
         };
@@ -1623,6 +1758,7 @@ pub fn run(
             return Err(ProviderError::new("Register window class failed"));
         }
         let context = Box::new(UiContext {
+            power: runtime.power_signals(),
             state: RefCell::new(State {
                 context: std::ptr::null(),
                 runtime,
@@ -1652,7 +1788,6 @@ pub fn run(
                 hdr_pending: false,
                 history_cache_active: false,
                 history_queued: None,
-                taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
                 notify: None,
                 animating: false,
                 tray_theme: TrayThemeCache::default(),
@@ -1667,8 +1802,8 @@ pub fn run(
                 wheel_remainder: 0,
                 page_height: 0,
                 more_options: false,
-                device_section: 0,
-                control_details: false,
+                startup_initial: None,
+                workspace_sections: 0,
                 overview_keys: Vec::new(),
                 overview_visibility: None,
                 polling: PollingUi::default(),
@@ -1681,6 +1816,7 @@ pub fn run(
                 tooltip_rates: BTreeMap::new(),
             }),
             monitor: Cell::new(HWND::default()),
+            taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
             paint: RefCell::new(None),
             popup: RefCell::new(None),
             deferred: DeferredDashboard::default(),
@@ -1744,6 +1880,7 @@ pub fn run(
             DispatchMessageW(&message);
         }
         let mut state = context.state.borrow_mut();
+        state.cancel_history();
         state.runtime.attach_window(0);
         state.trays.clear();
         if let Some(h) = state.dashboard.take() {
@@ -1810,6 +1947,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
+        let taskbar = (*ptr).taskbar;
+        let explorer_restarted = taskbar != 0 && msg == taskbar;
+        // Both windows can receive the broadcast. The monitor owns the tray.
+        if explorer_restarted && hwnd != (*ptr).monitor.get() {
+            return LRESULT(0);
+        }
+        if msg == WM_POWERBROADCAST {
+            if hwnd == (*ptr).monitor.get() {
+                match wp.0 as u32 {
+                    PBT_APMSUSPEND => (*ptr).power.notify(true),
+                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => (*ptr).power.notify(false),
+                    _ => {}
+                }
+            }
+            return LRESULT(1);
+        }
         if hwnd != (*ptr).monitor.get()
             && (msg == WM_SHOWWINDOW
                 || msg == WM_SIZE
@@ -1847,7 +2000,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             // let that bypass State cleanup while a native callback reenters.
             let deferred = match msg {
                 WM_CLOSE => Some((WM_APP + 9, WPARAM(hwnd.0 as usize))),
-                m if m == WM_APP + 8 || m == WM_APP + 9 || m == WM_APP + 11 || m == WM_APP + 12 => {
+                m if explorer_restarted
+                    || m == WM_APP + 8
+                    || m == WM_APP + 9
+                    || m == WM_APP + 11
+                    || m == WM_APP + 12 =>
+                {
                     Some((m, wp))
                 }
                 _ => None,
@@ -1859,14 +2017,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
         let s = &mut *guard;
-        if let Some(update) = tray_message_update(msg, s.taskbar) {
+        if let Some(update) = tray_message_update(msg, taskbar) {
             if msg == WM_SETTINGCHANGE {
                 s.refresh_theme();
+                s.refresh_mouse_acceleration();
             }
             s.sync_trays(update);
             return LRESULT(0);
         }
         match msg {
+            WM_ACTIVATE if Some(hwnd) == s.dashboard => {
+                if wp.0 as u16 != WA_INACTIVE as u16 {
+                    s.refresh_mouse_acceleration();
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
                 s.refresh_theme();
                 s.sync_trays(TrayUpdate::Redraw);
@@ -1904,6 +2069,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_QUERYENDSESSION => LRESULT(1),
             WM_ENDSESSION => {
                 if wp.0 != 0 {
+                    s.cancel_history();
                     s.runtime.stop();
                     PostQuitMessage(0);
                 }
@@ -1924,16 +2090,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE
                     ),
                 });
-                LRESULT(1)
-            }
-            WM_POWERBROADCAST => {
-                match wp.0 as u32 {
-                    PBT_APMSUSPEND => s.runtime.send(Command::Suspend),
-                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
-                        s.runtime.send(Command::Resume)
-                    }
-                    _ => {}
-                }
                 LRESULT(1)
             }
             TRAY => {
@@ -2002,7 +2158,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let m = &mut *(lp.0 as *mut MINMAXINFO);
                 let dpi = GetDpiForWindow(hwnd).max(96) as i32;
                 m.ptMinTrackSize = POINT {
-                    x: 840 * dpi / 96,
+                    x: (DASHBOARD_WIDTH + 16) * dpi / 96,
                     y: 420 * dpi / 96,
                 };
                 LRESULT(0)
@@ -2025,7 +2181,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 if Some(hwnd) == s.dashboard && wp.0 as u32 != SIZE_MINIMIZED {
                     s.layout_page();
-                    if s.page == 1 && s.device_section == 4 {
+                    if s.page == 1 && s.workspace_sections & INFO_SECTION != 0 {
                         s.read_device_information(false);
                     }
                 }
@@ -2452,8 +2608,13 @@ impl State {
         }
         let height = rect.bottom * 96 / dpi;
         let width = rect.right * 96 / dpi;
-        self.position_control(4, (width - 160).max(660), 12, 120, 34);
-        self.position_control(8, 0, 58, width, 1);
+        self.position_control(4, width - 88, 4, 78, 38);
+        self.position_control(8, 0, PAGE_TOP - 1, width, 1);
+        let footer = if self.page == 1 {
+            WORKSPACE_FOOTER
+        } else {
+            PAGE_FOOTER
+        };
         self.arrange_overview();
         if let Some(host) = self.page_host {
             unsafe {
@@ -2463,7 +2624,7 @@ impl State {
                     0,
                     PAGE_TOP * dpi / 96,
                     ((rect.right * 96 / dpi - 16) * dpi / 96).max(1),
-                    (height - PAGE_TOP - PAGE_FOOTER).max(1) * dpi / 96,
+                    (height - PAGE_TOP - footer).max(1) * dpi / 96,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
@@ -2472,14 +2633,13 @@ impl State {
                 rect.right * 96 / dpi - 16,
                 PAGE_TOP,
                 14,
-                (height - PAGE_TOP - PAGE_FOOTER).max(1),
+                (height - PAGE_TOP - footer).max(1),
             );
             self.scroll_page(self.page_scroll);
         }
         match self.page {
             1 => {
-                self.position_control(5, 24, height - 45, 155, 34);
-                self.position_control(95, 200, height - 45, (width - 240).max(1), 38);
+                self.position_control(95, 0, height - footer, width, footer);
             }
             3 => {
                 self.position_control(210, 20, height - 46, 160, 30);
@@ -2886,7 +3046,7 @@ impl State {
             1 if same_device => (
                 &[11, 13, 442, 451],
                 vec![12, 49, 440],
-                &[14, 43, 50, 431, 444, 445],
+                &[14, 43, 50, 431, 444, 445, 474],
             ),
             3 if self.checked(3) => (
                 &[201, 203, 209, 215],
@@ -2958,10 +3118,11 @@ impl State {
                         let _ = ShowWindow(h, SW_SHOW);
                     }
                     self.configuration_visibility();
+                    self.refresh_mouse_acceleration();
                     if GetForegroundWindow() != h {
                         let _ = SetForegroundWindow(h);
                     }
-                    if self.page == 1 && self.device_section == 4 {
+                    if self.page == 1 && self.workspace_sections & INFO_SECTION != 0 {
                         self.read_device_information(false);
                     }
                     return;
@@ -2975,15 +3136,23 @@ impl State {
             let (x, y) = (CW_USEDEFAULT, CW_USEDEFAULT);
             let dpi = GetDpiForWindow(self.monitor).max(96) as i32;
             let title = wide(concat!("Halo Continued ", env!("CARGO_PKG_VERSION")));
+            let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+            let mut frame = RECT {
+                right: DASHBOARD_WIDTH * dpi / 96,
+                bottom: 570 * dpi / 96,
+                ..Default::default()
+            };
+            let _ =
+                AdjustWindowRectExForDpi(&mut frame, style, false, WS_EX_CONTROLPARENT, dpi as u32);
             match CreateWindowExW(
                 WS_EX_CONTROLPARENT,
                 w!("HaloBatteryNext.Native"),
                 PCWSTR(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                style,
                 x,
                 y,
-                840 * dpi / 96,
-                880 * dpi / 96,
+                frame.right - frame.left,
+                frame.bottom - frame.top,
                 None,
                 None,
                 None,
@@ -3028,7 +3197,7 @@ impl State {
                     self.configuration_visibility();
                     self.read_polling();
                     self.query_insights();
-                    if self.page == 1 && self.device_section == 4 {
+                    if self.page == 1 && self.workspace_sections & INFO_SECTION != 0 {
                         self.read_device_information(false);
                     }
                     if GetForegroundWindow() != h {
@@ -3078,6 +3247,9 @@ impl State {
                 )
                 .0
             });
+        if self.page != 3 || !self.checked(3) {
+            self.startup_initial = None;
+        }
         self.device_form_key = current_key;
         let _redraw = DashboardRedraw::new(hwnd);
         self.chart = None;
@@ -3119,10 +3291,10 @@ impl State {
                         w!("Segoe UI"),
                     )
                 };
-                self.font = make_font(14, 400);
+                self.font = make_font(13, 400);
                 self.heading_font = make_font(22, 600);
                 self.small_font = make_font(12, 400);
-                self.section_font = make_font(16, 600);
+                self.section_font = make_font(14, 600);
                 self.font_dpi = dpi;
             }
         }
@@ -3146,10 +3318,10 @@ impl State {
                     } else {
                         WINDOW_STYLE::default()
                     },
-                16 + i as i32 * 78,
-                12,
-                76,
-                32,
+                10 + [0, 64, 126, 192][i],
+                4,
+                [62, 60, 64, 66][i],
+                38,
             );
             unsafe {
                 send(
@@ -3160,8 +3332,8 @@ impl State {
                 );
             }
         }
-        self.button(4, "&Refresh", 660, 16, 120);
-        self.widget(8, "", 0, 58, 840, 1);
+        self.button(4, "&Refresh", 710, 4, 78);
+        self.widget(8, "", 0, PAGE_TOP - 1, DASHBOARD_WIDTH, 1);
         self.prepare_page();
         let names: Vec<_> = self
             .snapshot
@@ -3172,38 +3344,17 @@ impl State {
         self.selected = self.selected.min(names.len().saturating_sub(1));
         match self.page {
             1 => {
-                self.heading(90, "Your devices", 20, 66, 740);
-                let rows = self.device_rows();
-                let index = self
-                    .selected_device
-                    .as_ref()
-                    .and_then(|key| rows.iter().position(|(d, _)| &d.key == key))
-                    .unwrap_or(0);
-                self.selected_device = rows.get(index).map(|(d, _)| d.key.clone());
-                let device_names = rows
-                    .iter()
-                    .map(|(d, battery)| {
-                        battery.as_ref().map_or_else(
-                            || {
-                                format!(
-                                    "{} · {}",
-                                    self.configuration_name(d),
-                                    if d.kind == "keyboard" {
-                                        "Wired keyboard · No battery"
-                                    } else {
-                                        "Mouse · Battery not monitored"
-                                    }
-                                )
-                            },
-                            |b| b.text.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                self.combo(10, &device_names, index, 20, 96, 760);
+                let (configured, battery) = selected_device_sources(
+                    &self.snapshot.devices,
+                    &self.configuration_devices,
+                    self.selected_device.as_deref(),
+                );
+                self.selected_device = configured
+                    .map(|device| device.key.clone())
+                    .or_else(|| battery.map(|device| device.reading.key.clone()));
                 if let Some((device, battery)) = self.current_device() {
                     if let Some(d) = battery {
-                        self.heading(88, &battery_summary(&d), 20, 140, 740);
-                        self.label(91, &device_detail(&d), 20, 170, 740);
+                        self.label(91, "", 190, 140, 500);
                         self.heading(89, "Device preferences", 20, 212, 740);
                         self.label(92, "Display &name", 20, 255, 120);
                         self.edit(11, &d.name, 150, 251, 360);
@@ -3255,62 +3406,25 @@ impl State {
                         self.button(15, "&Save changes", 20, 374, 160);
                         self.button(16, "Reset preferences", 192, 374, 190);
                     } else {
-                        self.heading(
-                            88,
-                            if device.kind == "keyboard" {
-                                "Wired keyboard"
-                            } else {
-                                "Mouse settings"
-                            },
-                            20,
-                            140,
-                            740,
-                        );
-                        self.label(
-                            91,
-                            if device.kind == "keyboard" {
-                                "No battery · Device settings only"
-                            } else {
-                                "Battery not monitored · Device settings only"
-                            },
-                            20,
-                            170,
-                            740,
-                        );
+                        self.label(91, "", 190, 140, 500);
                         self.heading(89, "Device preferences", 20, 212, 740);
                         self.label(92, "Display &name", 20, 255, 120);
                         self.edit(11, &self.configuration_name(&device), 150, 251, 360);
                         self.button(15, "&Save changes", 20, 374, 160);
                         self.button(16, "Reset name", 192, 374, 172);
                     }
-                } else {
-                    self.label(
-                        91,
-                        "No devices found. Connect or wake your device, then select Refresh.",
-                        20,
-                        150,
-                        740,
-                    );
-                    self.page_height = 220 - PAGE_TOP;
                 }
                 self.polling_controls();
-                let footer_y = if self.controls.contains_key(&49) {
-                    910
-                } else {
-                    680
-                };
                 let message = user_message(&self.error).to_owned();
-                self.control(
-                    95,
-                    w!("STATIC"),
-                    &message,
-                    WINDOW_STYLE::default(),
-                    245,
-                    footer_y,
-                    535,
-                    46,
-                );
-                self.button(5, "Save support report", 20, footer_y + 45, 205);
+                self.widget(95, &message, 0, 536, DASHBOARD_WIDTH, WORKSPACE_FOOTER);
+                unsafe {
+                    send(
+                        self.controls[&95],
+                        WM_SETFONT,
+                        WPARAM(self.small_font.0 as usize),
+                        LPARAM(0),
+                    );
+                }
             }
             2 => {
                 self.heading(90, "Battery history", 20, 68, 740);
@@ -3373,7 +3487,7 @@ impl State {
     }
     fn set_control_text(&self, id: u16, text: &str) {
         if let Some(h) = self.controls.get(&id) {
-            if self.text(id) == text {
+            if control_text_matches(*h, text) {
                 return;
             }
             let text = wide(text);
@@ -3389,30 +3503,30 @@ impl State {
             .get(self.selected)
             .map(|d| d.reading.key.clone());
         self.insights.select(key);
-        self.heading(72, "Battery insights", 20, 68, 760);
-        self.combo(10, names, self.selected, 20, 104, 760);
+        self.heading(72, "Battery insights", 20, 68, PAGE_WIDTH);
+        self.combo(10, names, self.selected, 20, 104, PAGE_WIDTH);
         self.widget(
             400,
             "Time left\nLearning\nBased on your usual rate mix",
             20,
             152,
-            245,
+            237,
             126,
         );
         self.widget(
             401,
             "Full charge\nLearning\nEstimated use from 100%",
-            278,
+            270,
             152,
-            245,
+            237,
             126,
         );
         self.widget(
             402,
             "Polling rate recorded\n—\nOf use recorded in the last 7 days",
-            536,
+            520,
             152,
-            244,
+            238,
             126,
         );
         self.control(
@@ -3422,35 +3536,35 @@ impl State {
             WINDOW_STYLE::default(),
             20,
             290,
-            760,
+            PAGE_WIDTH,
             46,
         );
-        self.heading(73, "How you use your battery", 20, 348, 760);
+        self.heading(73, "How you use your battery", 20, 348, PAGE_WIDTH);
         self.widget(
             410,
             "Polling-rate mix · last 7 days\nWaiting for confirmed readings",
             20,
             388,
-            370,
+            361,
             248,
         );
         self.widget(
             411,
             "Activity · last 7 days\nWaiting for recorded changes",
-            406,
+            397,
             388,
-            374,
+            361,
             248,
         );
-        self.heading(80, "Battery life by rate", 20, 662, 760);
-        self.combo(70, &[], 0, 20, 704, 760);
-        self.widget(74, "Learning battery use", 20, 748, 760, 226);
-        self.heading(75, "Recent battery sessions", 20, 998, 760);
-        self.combo(71, &[], 0, 20, 1040, 760);
-        self.widget(76, "No sessions yet", 20, 1084, 760, 260);
+        self.heading(80, "Battery life by rate", 20, 662, PAGE_WIDTH);
+        self.combo(70, &[], 0, 20, 704, PAGE_WIDTH);
+        self.widget(74, "Learning battery use", 20, 748, PAGE_WIDTH, 226);
+        self.heading(75, "Recent battery sessions", 20, 998, PAGE_WIDTH);
+        self.combo(71, &[], 0, 20, 1040, PAGE_WIDTH);
+        self.widget(76, "No sessions yet", 20, 1084, PAGE_WIDTH, 260);
         self.control(77,w!("STATIC"),
             "Estimates exclude sleep, charging and gaps. Recorded use is not gaming time.\r\nBattery life varies with how you use the device. No input activity is tracked.",
-            WINDOW_STYLE::default(),20,1360,760,48);
+            WINDOW_STYLE::default(),20,1360,PAGE_WIDTH,48);
         self.control(
             78,
             w!("STATIC"),
@@ -3458,7 +3572,7 @@ impl State {
             WINDOW_STYLE::default(),
             20,
             700,
-            760,
+            PAGE_WIDTH,
             60,
         );
         self.render_insights();
@@ -3486,7 +3600,12 @@ impl State {
         self.set_control_text(78, &self.insights.status);
         if self
             .runtime
-            .request_insights(key, SystemClock::default().unix(), request)
+            .request_insights(
+                key,
+                SystemClock::default().unix(),
+                request,
+                self.insights.cancelled.as_ref().unwrap().clone(),
+            )
             .is_err()
         {
             self.insights.abandon();
@@ -3677,27 +3796,27 @@ impl State {
                 } else {
                     46
                 };
-            position(self, 79, 20, 290, 760, explanation_height);
+            position(self, 79, 20, 290, PAGE_WIDTH, explanation_height);
             let habits_y = 388 + explanation_height - 46;
-            position(self, 73, 20, habits_y - 40, 760, 28);
-            let habits_height = height(410, 370, 172).max(height(411, 374, 172));
-            position(self, 410, 20, habits_y, 370, habits_height);
-            position(self, 411, 406, habits_y, 374, habits_height);
+            position(self, 73, 20, habits_y - 40, PAGE_WIDTH, 28);
+            let habits_height = height(410, 361, 172).max(height(411, 361, 172));
+            position(self, 410, 20, habits_y, 361, habits_height);
+            position(self, 411, 397, habits_y, 361, habits_height);
             let rate_y = habits_y + habits_height + 26;
-            position(self, 80, 20, rate_y, 760, 28);
-            position(self, 70, 20, rate_y + 42, 760, 280);
-            let rate_height = height(74, 760, 160);
-            position(self, 74, 20, rate_y + 86, 760, rate_height);
+            position(self, 80, 20, rate_y, PAGE_WIDTH, 28);
+            position(self, 70, 20, rate_y + 42, PAGE_WIDTH, 280);
+            let rate_height = height(74, PAGE_WIDTH, 160);
+            position(self, 74, 20, rate_y + 86, PAGE_WIDTH, rate_height);
             rate_y + 86 + rate_height + 24
         } else {
             348
         };
-        position(self, 75, 20, session_y, 760, 28);
-        position(self, 71, 20, session_y + 42, 760, 280);
-        let session_height = height(76, 760, 170);
-        position(self, 76, 20, session_y + 86, 760, session_height);
+        position(self, 75, 20, session_y, PAGE_WIDTH, 28);
+        position(self, 71, 20, session_y + 42, PAGE_WIDTH, 280);
+        let session_height = height(76, PAGE_WIDTH, 170);
+        position(self, 76, 20, session_y + 86, PAGE_WIDTH, session_height);
         let note_y = session_y + 86 + session_height + 16;
-        position(self, 77, 20, note_y, 760, 48);
+        position(self, 77, 20, note_y, PAGE_WIDTH, 48);
         self.page_height = note_y + 64 - PAGE_TOP;
         self.layout_page();
     }
@@ -3855,45 +3974,45 @@ impl State {
                 self.notification_controls()
             }
             1000..=32767 if self.page == 1 => self.overview_select((id - 1000) as usize),
-            17..=19 | 22 | 24 if self.page == 1 => {
-                let section = match id {
-                    22 => 3,
-                    24 => 4,
-                    _ => id - 17,
+            18 | 24 if self.page == 1 && notification == BN_CLICKED as u16 => {
+                self.workspace_sections ^= if id == 18 {
+                    BATTERY_SECTION
+                } else {
+                    INFO_SECTION
                 };
-                if section != self.device_section {
+                if self.workspace_sections & INFO_SECTION == 0 {
                     self.information.clear();
                 }
-                self.device_section = section;
-                if section == 2
-                    && self.current_device().is_some_and(|(d, _)| {
-                        self.dpi.attempted.as_ref() != Some(&(d.key, self.polling.generation))
-                    })
-                    && self.dpi.pending.is_none()
-                {
-                    self.queue_dpi(None);
-                    self.polling_controls();
-                }
-                self.page_scroll = 0;
                 let _redraw = self.dashboard.map(DashboardRedraw::new);
                 self.layout_page();
-                if self.device_section == 4 {
-                    self.read_device_information(false);
-                }
+                self.refresh_workspace_freshness();
+                self.read_device_information(false);
             }
-            23 if self.page == 1 => {
-                if self.device_section == 1 {
-                    self.sleep.details = !self.sleep.details;
-                } else {
-                    self.control_details = !self.control_details;
-                }
+            474 if self.page == 1 && notification == CBN_SELCHANGE as u16 => {
+                self.enable_control(453, self.choice(474) != 0);
                 let _redraw = self.dashboard.map(DashboardRedraw::new);
                 self.layout_page();
             }
-            473 if self.page == 1 && self.device_section == 1 => {
+            473 if self.page == 1 && self.workspace_sections & BATTERY_SECTION != 0 => {
                 self.sleep.saver_details = !self.sleep.saver_details;
                 let _redraw = self.dashboard.map(DashboardRedraw::new);
                 self.layout_page();
+            }
+            496 if self.page == 1 => self.command(5, 0),
+            499 if self.page == 1 && self.controls.contains_key(&499) => {
+                let result = unsafe {
+                    ShellExecuteW(
+                        self.dashboard,
+                        w!("open"),
+                        w!("ms-settings:mousetouchpad"),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    )
+                };
+                if result.0 as isize <= 32 {
+                    self.set_control_text(95, "Open Windows Settings > Bluetooth & devices > Mouse to change Enhance pointer precision.");
+                }
             }
             49 if notification == BN_CLICKED as u16 => self.command(51, 0),
             50 if notification == CBN_SELCHANGE as u16 => self.command(51, 0),
@@ -3908,13 +4027,16 @@ impl State {
                 self.build();
                 self.read_polling();
                 self.query_insights();
-                if self.page == 1 && self.device_section == 4 {
+                if self.page == 1 && self.workspace_sections & INFO_SECTION != 0 {
                     self.read_device_information(false);
                 }
             }
-            484 if self.page == 1 && self.device_section == 4 => self.read_device_information(true),
+            484 if self.page == 1 && self.workspace_sections & INFO_SECTION != 0 => {
+                self.read_device_information(true)
+            }
             4 => {
-                if self.page == 1 && self.device_section == 4 {
+                self.refresh_mouse_acceleration();
+                if self.page == 1 && self.workspace_sections & INFO_SECTION != 0 {
                     self.read_device_information(true);
                     return;
                 }
@@ -3952,22 +4074,7 @@ impl State {
             10 if notification == CBN_SELCHANGE as u16 => {
                 self.polling.abandon();
                 self.insights.abandon();
-                if self.page == 1 {
-                    self.selected_device = self
-                        .device_rows()
-                        .get(self.choice(10))
-                        .map(|(d, _)| d.key.clone());
-                    if let Some(index) = self
-                        .snapshot
-                        .devices
-                        .iter()
-                        .position(|d| Some(&d.reading.key) == self.selected_device.as_ref())
-                    {
-                        self.selected = index;
-                    }
-                } else {
-                    self.selected = self.choice(10);
-                }
+                self.selected = self.choice(10);
                 self.page_scroll = 0;
                 self.build();
                 self.read_polling();
@@ -3980,13 +4087,24 @@ impl State {
                 self.queue_dpi(None);
                 self.polling_controls();
             }
-            453 => match dpi_input(&self.text(451), self.dpi_limits().as_ref()) {
-                Ok(value) => {
-                    self.queue_dpi(Some(value));
-                    self.polling_controls();
+            453 => {
+                let selected = self.text(474);
+                let input = if selected == CUSTOM_DPI {
+                    self.text(451)
+                } else {
+                    selected.trim_end_matches(" DPI").replace(',', "")
+                };
+                match dpi_input(&input, self.dpi_limits().as_ref()) {
+                    Ok(value) => {
+                        self.queue_dpi(Some(value));
+                        self.polling_controls();
+                    }
+                    Err(message) => {
+                        self.set_control_text(455, &message);
+                        self.set_control_text(95, &message);
+                    }
                 }
-                Err(message) => self.set_control_text(455, &message),
-            },
+            }
             454 => {
                 if let Some(previous) = self.restorable_dpi() {
                     self.queue_dpi(Some(previous));
@@ -4062,6 +4180,14 @@ impl State {
                     }
                     self.settings.device_mut(&device.key).fullscreen_boost_rate = rate;
                     self.set_control_text(49, if rate.is_some() { "On" } else { "Off" });
+                    self.set_control_text(
+                        465,
+                        if rate.is_some() {
+                            "Restore your desktop rate after the game"
+                        } else {
+                            "Use a higher rate in fullscreen games"
+                        },
+                    );
                     self.save();
                     self.error = "Automatic boost settings saved".into();
                     self.set_control_text(95, user_message(&self.error));
@@ -4157,6 +4283,9 @@ impl State {
                     self.error = "Device settings saved".into();
                     self.set_control_text(96, &device_alert_summary(&self.settings, &key));
                     self.set_control_text(95, user_message(&self.error));
+                    // Recreate the quick alert selector too, including custom
+                    // thresholds entered in Device information.
+                    self.build();
                 }
             }
             16 => {
@@ -4229,8 +4358,17 @@ impl State {
                     .filter(|(i, _)| !self.checked(300 + *i as u16))
                     .map(|(_, p)| p.to_string())
                     .collect();
-                self.error = match dashboard_startup(self.checked(206)) {
-                    Ok(()) => "Settings saved".into(),
+                let startup = self.checked(206);
+                let startup_result = if self.startup_initial == Some(startup) {
+                    Ok(())
+                } else {
+                    dashboard_startup(startup)
+                };
+                self.error = match startup_result {
+                    Ok(()) => {
+                        self.startup_initial = Some(startup);
+                        "Settings saved".into()
+                    }
                     Err(e) => e.to_string(),
                 };
                 self.save();
@@ -4262,7 +4400,7 @@ impl State {
             }
             503 => {
                 self.page = 1;
-                self.device_section = 0;
+                self.workspace_sections = 0;
                 self.page_scroll = 0;
                 self.configuration_visibility();
                 let was_open = self.open_page();
@@ -4272,10 +4410,24 @@ impl State {
             }
             508 | 507 => {
                 self.page = 1;
-                self.device_section = if id == 508 { 1 } else { 3 };
+                self.workspace_sections = if id == 508 {
+                    BATTERY_SECTION
+                } else {
+                    INFO_SECTION
+                };
                 self.page_scroll = 0;
                 self.configuration_visibility();
                 self.open_page();
+                if id == 507 {
+                    self.read_device_information(false);
+                }
+                let control = if id == 507 { 11 } else { 18 };
+                if let Some(&target) = self.controls.get(&control) {
+                    unsafe {
+                        let _ = SetFocus(Some(target));
+                    }
+                    self.keep_focus_visible();
+                }
             }
             509 => {
                 self.page = 3;
@@ -4382,7 +4534,10 @@ impl State {
         }
     }
     fn configuration_visibility(&mut self) {
-        if !self.dashboard_visible() || self.page != 1 || self.device_section != 4 {
+        if !self.dashboard_visible()
+            || self.page != 1
+            || self.workspace_sections & INFO_SECTION == 0
+        {
             self.information.clear();
         }
         self.runtime.send(Command::ConfigurationVisible(
@@ -4410,6 +4565,11 @@ impl State {
     }
     fn device_rows(&self) -> Vec<(ConfigurationDevice, Option<DeviceView>)> {
         merged_device_rows(&self.snapshot.devices, &self.configuration_devices)
+    }
+    fn borrowed_device_rows(
+        &self,
+    ) -> impl Iterator<Item = (DeviceDescriptorRef<'_>, Option<&DeviceView>)> {
+        borrowed_device_rows(&self.snapshot.devices, &self.configuration_devices)
     }
     fn current_device(&self) -> Option<(ConfigurationDevice, Option<DeviceView>)> {
         current_device_row(
@@ -4523,7 +4683,7 @@ impl State {
             .contains_key(&49)
             .then(|| (self.checked(49), self.text(50)));
         // Update only this group: an asynchronous hardware reply must not discard unsaved device edits.
-        for id in (40..=53).chain([98, 99]) {
+        for id in (40..=53).chain([98, 465]) {
             if let Some(h) = self.controls.remove(&id) {
                 unsafe {
                     let _ = DestroyWindow(h);
@@ -4538,16 +4698,6 @@ impl State {
         }
         self.page_height = 708 - PAGE_TOP;
         self.heading(98, "Polling rate", 20, 434, 750);
-        self.control(
-            99,
-            w!("STATIC"),
-            "How often your device sends updates. Higher rates can use more battery.\r\nClose games before changing the rate.",
-            WINDOW_STYLE::default(),
-            20,
-            468,
-            750,
-            38,
-        );
         if !self.settings.polling_controls {
             self.control(
                 44,
@@ -4611,21 +4761,18 @@ impl State {
         );
         let key = reading.key;
         let current = observation.as_ref().and_then(|o| o.rate);
-        self.label(
-            44,
-            &format!(
-                "Current rate · {}",
-                current.map_or_else(|| "not checked yet".into(), |r| format!("{} Hz", r.hz()))
-            ),
-            20,
-            510,
-            750,
-        );
+        let summary = unavailable.clone().unwrap_or_else(|| {
+            current.map_or_else(
+                || "Select Refresh to check the rate".into(),
+                |rate| format!("Current · {} Hz", device_overview::number(rate.hz())),
+            )
+        });
+        self.label(44, &summary, 20, 510, 750);
         let evidence = observation.as_ref().map_or_else(
             || {
                 unavailable
                     .clone()
-                    .unwrap_or_else(|| "Use Refresh rate to read this device.".into())
+                    .unwrap_or_else(|| "Select Refresh to check the current rate.".into())
             },
             |o| {
                 format!(
@@ -4652,7 +4799,10 @@ impl State {
             46,
             &format!(
                 "Startup choice · {} (when restore at startup is enabled).",
-                requested.map_or_else(|| "none".into(), |r| format!("{} Hz", r.hz()))
+                requested.map_or_else(
+                    || "none".into(),
+                    |r| format!("{} Hz", device_overview::number(r.hz()))
+                )
             ),
             20,
             584,
@@ -4667,7 +4817,7 @@ impl State {
             .unwrap_or(0);
         let options = supported
             .iter()
-            .map(|r| format!("{} Hz", r.hz()))
+            .map(|r| format!("{} Hz", device_overview::number(r.hz())))
             .collect::<Vec<_>>();
         let chosen = rate_draft
             .as_ref()
@@ -4709,7 +4859,8 @@ impl State {
         );
         if boost_supported {
             self.page_height = 920 - PAGE_TOP;
-            self.heading(48, "Automatic fullscreen boost", 20, 708, 750);
+            self.heading(48, "Fullscreen boost", 20, 708, 750);
+            self.label(465, "", 20, 750, 380);
             let saved = self
                 .settings
                 .device(&key)
@@ -4727,17 +4878,18 @@ impl State {
                 .filter(|r| r.hz() > 1000)
                 .copied()
                 .collect();
-            let labels: Vec<_> = rates.iter().map(|r| format!("{} Hz", r.hz())).collect();
+            let labels: Vec<_> = rates
+                .iter()
+                .map(|r| format!("{} Hz", device_overview::number(r.hz())))
+                .collect();
             let selected = boost_draft
                 .as_ref()
                 .and_then(|d| labels.iter().position(|label| label == &d.1))
                 .or_else(|| saved.and_then(|r| rates.iter().position(|v| *v == r)))
                 .unwrap_or(0);
             self.combo(50, &labels, selected, 20, 792, 230);
-            self.button(51, "Save boost settings", 270, 792, 210);
             self.enable_control(49, !pending && (!rates.is_empty() || saved.is_some()));
             self.enable_control(50, !pending && !rates.is_empty());
-            self.enable_control(51, !pending && (!rates.is_empty() || saved.is_some()));
             self.control(52, w!("STATIC"),
                 "Uses Windows fullscreen gaming detection; some borderless games are missed.\r\nBoosts after 10 seconds; restores after 15 seconds back on the desktop.\r\nRestores after restart when possible. Anti-cheat compatibility isn't guaranteed.",
                 WINDOW_STYLE::default(), 20, 838, 750, 62);
@@ -4794,7 +4946,6 @@ impl State {
             return;
         }
         self.dpi.next = self.dpi.next.wrapping_add(1);
-        self.dpi.attempted = Some((device.key.clone(), self.polling.generation));
         let request = DpiRequest {
             request: self.dpi.next,
             target: ControlTarget {
@@ -4815,7 +4966,8 @@ impl State {
     }
     fn build_dpi_controls(&mut self) {
         let draft = self.controls.contains_key(&451).then(|| self.text(451));
-        for id in 450..=458 {
+        let preset = self.controls.contains_key(&474).then(|| self.text(474));
+        for id in (450..=458).chain([474]) {
             if let Some(h) = self.controls.remove(&id) {
                 unsafe {
                     let _ = DestroyWindow(h);
@@ -4828,26 +4980,26 @@ impl State {
         if device.kind != "mouse" || !hb_providers::dpi::candidate(&device) {
             return;
         }
-        if self.device_section == 2
-            && self.dpi.attempted.as_ref() != Some(&(device.key.clone(), self.polling.generation))
-            && self.dpi.pending.is_none()
-        {
-            self.queue_dpi(None);
-        }
         let y = self.page_height + PAGE_TOP + 12;
         self.page_height = y + 276 - PAGE_TOP;
-        self.heading(450, "Sensitivity (DPI)", 20, y, 750);
+        self.heading(450, "Sensitivity", 20, y, 750);
         let observed = self
             .dpi
             .outcome
             .as_ref()
             .filter(|o| o.key == device.key && o.generation == self.polling.generation)
             .cloned();
-        let current = observed.as_ref().and_then(|o| o.current.as_ref());
+        let current = observed
+            .as_ref()
+            .filter(|o| o.failure.is_none())
+            .and_then(|o| o.current.as_ref());
         let display = current
             .map(|s| {
                 if s.value.x == s.value.y {
-                    format!("Current DPI: {}", s.value.x)
+                    format!(
+                        "Current · {} DPI",
+                        device_overview::number(u32::from(s.value.x))
+                    )
                 } else {
                     format!(
                         "Current DPI: {} horizontal / {} vertical",
@@ -4872,20 +5024,48 @@ impl State {
             48,
         );
         let default = current.map(|s| s.value.x.to_string()).unwrap_or_default();
-        let text = if self.dpi.shown_key.as_ref() == Some(&device.key) {
+        let same_device = self.dpi.shown_key.as_ref() == Some(&device.key);
+        let text = if same_device {
             draft.unwrap_or(default)
         } else {
             default
         };
         self.dpi.shown_key = Some(device.key.clone());
         self.edit(451, &text, 20, y + 126, 150);
-        self.button(453, "Apply DPI", 190, y + 126, 150);
+        let mut values = vec![400, 800, 1200, 1600, 2400, 3200];
+        let current_uniform = current
+            .filter(|s| s.value.x == s.value.y)
+            .map(|s| s.value.x);
+        values.extend(current_uniform);
+        values.sort_unstable();
+        values.dedup();
+        let mut labels = vec!["Select DPI".to_owned()];
+        labels.extend(
+            values
+                .into_iter()
+                .filter(|v| dpi_input(&v.to_string(), limits.as_ref()).is_ok())
+                .map(|v| format!("{} DPI", device_overview::number(u32::from(v)))),
+        );
+        labels.push(CUSTOM_DPI.to_owned());
+        let confirmed =
+            current_uniform.map(|v| format!("{} DPI", device_overview::number(u32::from(v))));
+        let selected = preset
+            .as_ref()
+            .filter(|_| same_device)
+            .or(confirmed.as_ref())
+            .and_then(|v| labels.iter().position(|l| l == v))
+            .unwrap_or(0);
+        self.combo(474, &labels, selected, 20, y + 126, 94);
+        if current.is_some() {
+            self.button(453, "Apply", 190, y + 126, 150);
+        }
         self.button(452, "Read current", 355, y + 126, 150);
         self.button(454, "Restore previous DPI", 520, y + 126, 240);
         let ready = self.settings.polling_controls && device.online() && self.dpi.pending.is_none();
         self.enable_control(451, ready);
         self.enable_control(452, ready);
-        self.enable_control(453, ready && current.is_some());
+        self.enable_control(474, ready && current.is_some());
+        self.enable_control(453, ready && selected != 0);
         let restore = self.restorable_dpi().is_some();
         self.enable_control(454, ready && restore);
         let status = if self.dpi.pending.is_some() {
@@ -4918,7 +5098,7 @@ impl State {
     }
     fn build_sleep_controls(&mut self) {
         let draft = self.controls.contains_key(&431).then(|| self.choice(431));
-        for id in 430..=435 {
+        for id in (430..=435).chain([475]) {
             if let Some(h) = self.controls.remove(&id) {
                 unsafe {
                     let _ = DestroyWindow(h);
@@ -4986,6 +5166,20 @@ impl State {
             20,
             y + 46,
             230,
+        );
+        let current = observed
+            .as_ref()
+            .and_then(|o| o.seconds)
+            .and_then(|secs| choices.iter().position(|s| *s == secs));
+        self.label(
+            475,
+            &current.map_or_else(
+                || "Choose a sleep time".to_owned(),
+                |i| format!("Current · {}", labels[i]),
+            ),
+            20,
+            y + 96,
+            250,
         );
         self.button(433, "Apply sleep time", 270, y + 46, 180);
         self.button(432, "Read current", 470, y + 46, 180);
@@ -5243,9 +5437,6 @@ impl State {
         self.polling_controls();
     }
     fn read_polling(&mut self) {
-        if self.page == 1 && self.device_section == 4 {
-            return;
-        }
         if self.dashboard_visible()
             && let Some(reading) = self.visible_polling_device()
             && reading.online()
@@ -5291,8 +5482,8 @@ impl State {
         match self.polling.begin(reading, intent) {
             Ok(request) => match self.runtime.submit_control(request.clone()) {
                 Ok(()) => {
-                    if let PollingIntent::Apply { rate, .. } = intent {
-                        self.record_polling_intent(&key, request.request, rate);
+                    if let PollingIntent::Apply { rate, restore } = intent {
+                        self.record_polling_intent(&key, request.request, rate, restore);
                     }
                 }
                 Err(error) => {
@@ -5306,8 +5497,9 @@ impl State {
         }
         self.polling_controls();
     }
-    fn record_polling_intent(&mut self, key: &str, request: u64, rate: PollingRate) {
-        self.polling_intents.insert(key.into(), (request, rate));
+    fn record_polling_intent(&mut self, key: &str, request: u64, rate: PollingRate, restore: bool) {
+        self.polling_intents
+            .insert(key.into(), (request, rate, restore));
         // A page close can abandon its UI request while a submitted write still
         // completes. Revoke evidence in both surfaces before the worker replies.
         self.polling.revoke_observation(key);
@@ -5316,16 +5508,23 @@ impl State {
         self.sync_trays(TrayUpdate::Changed);
     }
     fn polling_outcome(&mut self, outcome: ControlOutcome) {
+        let generation = self.polling.generation.max(self.tray_polling.generation);
         cache_tooltip_rate(
             &mut self.tooltip_rates,
             &outcome,
-            self.polling.generation.max(self.tray_polling.generation),
+            generation,
             self.settings.polling_controls,
         );
         self.sync_trays(TrayUpdate::Changed);
-        if outcome.request & crate::runtime::STARTUP_POLLING_REQUEST_BIT != 0 {
-            self.polling.observe_background(&outcome);
-            self.tray_polling.observe_background(&outcome);
+        let startup = outcome.request & crate::runtime::STARTUP_POLLING_REQUEST_BIT != 0;
+        let automatic =
+            outcome.request & (crate::battery_saver::REQUEST_BIT | crate::boost::REQUEST_BIT) != 0;
+        if startup || automatic {
+            // Automation updates the confirmed rate, but does not become a manual undo.
+            self.polling
+                .observe_background(&outcome, startup && !automatic);
+            self.tray_polling
+                .observe_background(&outcome, startup && !automatic);
         }
         if outcome.request & crate::battery_saver::REQUEST_BIT != 0 {
             let message = outcome
@@ -5351,12 +5550,9 @@ impl State {
             self.polling_controls();
             return;
         }
-        if outcome.request & crate::runtime::STARTUP_POLLING_REQUEST_BIT != 0 {
+        if startup {
             let initial_read = outcome.request & crate::runtime::STARTUP_POLLING_READ_BIT != 0;
-            if let Some(observation) = self.tooltip_rates.get(&outcome.key) {
-                self.tray_polling
-                    .observations
-                    .insert(outcome.key.clone(), observation.clone());
+            if self.tray_polling.observations.contains_key(&outcome.key) {
                 self.tray_polling.status.insert(
                     outcome.key.clone(),
                     if initial_read {
@@ -5366,15 +5562,6 @@ impl State {
                     }
                     .into(),
                 );
-                if !initial_read && let Some(previous) = outcome.previous {
-                    self.tray_polling
-                        .previous
-                        .insert(outcome.key.clone(), previous);
-                    self.tray_polling.previous_devices.insert(
-                        outcome.key.clone(),
-                        Box::new(observation.target.device.clone()),
-                    );
-                }
             } else if let Some(failure) = &outcome.failure {
                 self.tray_polling.status.insert(
                     outcome.key.clone(),
@@ -5390,17 +5577,29 @@ impl State {
             self.polling_controls();
             return;
         }
-        // Preserve explicit intent even when the user has left the page; never use an observation as a setting.
-        if let Some(&(request, rate)) = self.polling_intents.get(&outcome.key)
-            && request == outcome.request
-        {
+        // A verified explicit choice survives page navigation. A rejected or
+        // uncertain write must not turn into a fresh write on the next launch.
+        let manual = self
+            .polling_intents
+            .get(&outcome.key)
+            .copied()
+            .filter(|(request, _, _)| *request == outcome.request);
+        if let Some((_, rate, _)) = manual {
             self.polling_intents.remove(&outcome.key);
-            self.polling.revoke_observation(&outcome.key);
-            self.tray_polling.revoke_observation(&outcome.key);
-            self.settings
-                .device_mut(&outcome.key)
-                .requested_polling_rate = Some(rate);
-            self.save();
+            if self.settings.polling_controls
+                && confirmed_polling(&outcome, generation)
+                    .is_some_and(|observation| observation.rate == Some(rate))
+                && self
+                    .settings
+                    .device(&outcome.key)
+                    .and_then(|p| p.requested_polling_rate)
+                    != Some(rate)
+            {
+                self.settings
+                    .device_mut(&outcome.key)
+                    .requested_polling_rate = Some(rate);
+                self.save();
+            }
         }
         let tray_key = self
             .tray_polling
@@ -5423,9 +5622,8 @@ impl State {
                         "Hardware rate read. Select a rate in the polling menu to apply.".into(),
                     );
                 }
-                // A tray operation invalidates the dashboard's cached read so it
-                // cannot present the previous rate as the newly confirmed value.
-                self.polling.observations.remove(&key);
+                self.polling
+                    .mirror_manual_readback(&self.tray_polling, &key);
                 self.tray_polling_feedback(&key);
                 self.polling_controls();
             }
@@ -5433,11 +5631,28 @@ impl State {
         }
         let key = self.visible_polling_device().map(|r| r.key);
         if self.polling.accept(&outcome, key.as_deref()) {
-            self.tray_polling.observations.remove(&outcome.key);
+            self.tray_polling
+                .mirror_manual_readback(&self.polling, &outcome.key);
+            self.polling_controls();
+            self.set_control_text(95, &self.text(47));
+        } else if let Some((_, _, restore)) = manual
+            && self.settings.polling_controls
+        {
+            // The initiating dashboard may have closed while the write finished.
+            for polling in [&mut self.polling, &mut self.tray_polling] {
+                polling.observe_background(&outcome, !restore);
+                polling.status.remove(&outcome.key);
+            }
             self.polling_controls();
         }
     }
+    fn cancel_history(&self) {
+        if let Some((_, cancelled)) = &self.history_pending {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
     fn release_history(&mut self) {
+        self.cancel_history();
         self.history_queued = None;
         self.try_release_history_cache();
         self.request = self.request.wrapping_add(1);
@@ -5452,7 +5667,11 @@ impl State {
         }
     }
     fn history_outcome(&mut self, id: u64, result: Result<HistorySeries, ProviderError>) {
-        if self.history_pending == Some(id) {
+        if self
+            .history_pending
+            .as_ref()
+            .is_some_and(|(request, _)| *request == id)
+        {
             self.history_pending = None;
             if let Some(command) = self.history_queued.take()
                 && self.dashboard.is_some()
@@ -5488,6 +5707,7 @@ impl State {
         }
     }
     fn query(&mut self) {
+        self.cancel_history();
         self.request = self.request.wrapping_add(1);
         self.series = HistorySeries {
             axis: self.history.axis,
@@ -5520,13 +5740,18 @@ impl State {
         }
     }
     fn submit_history(&mut self, command: Command) {
-        let request = match &command {
-            Command::History { request, .. } | Command::UsageHistory { request, .. } => *request,
+        let (request, cancelled) = match &command {
+            Command::History {
+                request, cancelled, ..
+            }
+            | Command::UsageHistory {
+                request, cancelled, ..
+            } => (*request, cancelled.clone()),
             _ => return,
         };
         match self.runtime.request_history(command) {
             Ok(()) => {
-                self.history_pending = Some(request);
+                self.history_pending = Some((request, cancelled));
                 self.history_cache_active = true;
             }
             Err(error) => self.history_outcome(request, Err(error)),
@@ -5578,8 +5803,13 @@ impl State {
                     {
                         self.sleep.pending = None;
                         self.sleep.shown_key = None;
+                        let selected =
+                            self.selected_device.as_deref() == Some(outcome.key.as_str());
                         self.sleep.outcome = Some(*outcome);
                         self.polling_controls();
+                        if selected && self.page == 1 {
+                            self.set_control_text(95, &self.text(434));
+                        }
                     }
                 }
                 Event::DeviceInfo(outcome) => self.device_information_outcome(outcome),
@@ -5606,6 +5836,13 @@ impl State {
                             self.dpi.outcome = Some(*outcome);
                         }
                         self.polling_controls();
+                        if self.page == 1
+                            && self.dpi.outcome.as_ref().is_some_and(|o| {
+                                self.selected_device.as_deref() == Some(o.key.as_str())
+                            })
+                        {
+                            self.set_control_text(95, &self.text(455));
+                        }
                     }
                 }
                 Event::Polling(outcome) => polling_outcomes.push(*outcome),
@@ -5653,7 +5890,9 @@ impl State {
         }
         if let Some(timestamp) = heartbeat {
             self.snapshot.timestamp = timestamp;
-            self.refresh_device_details();
+            if self.dashboard_visible() {
+                self.refresh_workspace_freshness();
+            }
             self.refresh_trays_on_heartbeat();
         }
         if let Some(s) = latest {
@@ -5776,20 +6015,7 @@ impl State {
                     }
                 }
                 unsafe {
-                    let selection = if self.page == 1 {
-                        self.selected_device
-                            .as_ref()
-                            .and_then(|key| {
-                                device_row_index(
-                                    &self.snapshot.devices,
-                                    &self.configuration_devices,
-                                    key,
-                                )
-                            })
-                            .unwrap_or(0)
-                    } else {
-                        self.selected
-                    };
+                    let selection = self.selected;
                     if send(*h, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 != selection as isize {
                         send(*h, CB_SETCURSEL, WPARAM(selection), LPARAM(0));
                     }
@@ -5840,18 +6066,14 @@ impl State {
             self.try_release_history_cache();
         }
     }
-    fn refresh_device_details(&self) {
+    fn refresh_device_details(&mut self) {
         if self.dashboard_visible() {
-            self.refresh_overview_cards();
+            let reflow = self.refresh_overview_cards();
+            self.refresh_workspace_freshness();
             self.render_device_information();
-        }
-        if self.dashboard_visible()
-            && self.page == 1
-            && self.controls.contains_key(&91)
-            && let Some((_, Some(d))) = self.current_device()
-        {
-            self.set_control_text(91, &device_detail(&d));
-            self.set_control_text(88, &battery_summary(&d));
+            if reflow {
+                self.layout_page();
+            }
         }
     }
     fn refresh_trays_on_heartbeat(&mut self) {
@@ -6118,7 +6340,7 @@ impl State {
                 }
                 let was_open = self.dashboard.is_some();
                 self.selected_device = Some(selected.clone());
-                self.device_section = 0;
+                self.workspace_sections = 0;
                 self.page = 1;
                 self.page_scroll = 0;
                 self.configuration_visibility();
@@ -6209,8 +6431,8 @@ impl State {
         match self.tray_polling.begin_tray(device, intent) {
             Ok(request) => match self.runtime.submit_control(request.clone()) {
                 Ok(()) => {
-                    if let PollingIntent::Apply { rate, .. } = intent {
-                        self.record_polling_intent(key, request.request, rate);
+                    if let PollingIntent::Apply { rate, restore } = intent {
+                        self.record_polling_intent(key, request.request, rate, restore);
                     }
                 }
                 Err(error) => {
@@ -6373,13 +6595,6 @@ fn device_alert_summary(settings: &Settings, key: &str) -> String {
     }
 }
 
-fn battery_summary(d: &DeviceView) -> String {
-    match d.reading.level {
-        Some(level) if d.reading.online() => format!("{level}% battery"),
-        Some(level) => format!("{level}% battery · Last known"),
-        None => "Battery level unavailable".into(),
-    }
-}
 fn device_detail(d: &DeviceView) -> String {
     let age = SystemClock::default()
         .unix()
@@ -6879,6 +7094,7 @@ struct PopupAppearance {
     items: Vec<PopupItem>,
     font: HFONT,
     heading_font: HFONT,
+    battery_font: HFONT,
     background: HBRUSH,
     width: u32,
     row_height: u32,
@@ -6889,6 +7105,7 @@ impl Drop for PopupAppearance {
         unsafe {
             let _ = DeleteObject(self.font.into());
             let _ = DeleteObject(self.heading_font.into());
+            let _ = DeleteObject(self.battery_font.into());
             let _ = DeleteObject(self.background.into());
         }
     }
@@ -6915,35 +7132,14 @@ impl PopupAppearance {
         }
         unsafe {
             let dpi = GetDpiForWindow(owner).max(96);
-            let padding = (18 * dpi / 96) as i32;
-            let font = CreateFontW(
-                -((14 * dpi / 96) as i32),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                w!("Segoe UI"),
-            );
-            let mut appearance = Self {
-                menu,
-                menus: Vec::new(),
-                palette,
-                items: Vec::new(),
-                font,
-                heading_font: CreateFontW(
-                    -((14 * dpi / 96) as i32),
+            let padding = (13 * dpi / 96) as i32;
+            let make_font = |size, weight| {
+                CreateFontW(
+                    -((size * dpi / 96) as i32),
                     0,
                     0,
                     0,
-                    600,
+                    weight,
                     0,
                     0,
                     0,
@@ -6953,14 +7149,25 @@ impl PopupAppearance {
                     CLEARTYPE_QUALITY,
                     DEFAULT_PITCH.0 as u32,
                     w!("Segoe UI"),
-                ),
+                )
+            };
+            let font = make_font(13, 400);
+            let mut appearance = Self {
+                menu,
+                menus: Vec::new(),
+                palette,
+                items: Vec::new(),
+                font,
+                heading_font: make_font(14, 600),
+                battery_font: make_font(18, 600),
                 background: CreateSolidBrush(palette.surface),
                 width: 0,
-                row_height: 40 * dpi / 96,
+                row_height: 34 * dpi / 96,
                 padding,
             };
             if appearance.font.is_invalid()
                 || appearance.heading_font.is_invalid()
+                || appearance.battery_font.is_invalid()
                 || appearance.background.is_invalid()
             {
                 return None;
@@ -7033,7 +7240,7 @@ impl PopupAppearance {
                                     *unit = 32;
                                 }
                             }
-                            DrawTextW(hdc, &mut line, &mut rect, DT_SINGLELINE | DT_CALCRECT);
+                            draw_utf16(hdc, &mut line, &mut rect, DT_SINGLELINE | DT_CALCRECT);
                             (rect.right - rect.left).max(0) as u32
                         })
                         .max()
@@ -7045,7 +7252,7 @@ impl PopupAppearance {
                         .map_or(0, |index| {
                             let mut value = text[index + 1..].to_vec();
                             let mut bounds = RECT::default();
-                            DrawTextW(hdc, &mut value, &mut bounds, DT_SINGLELINE | DT_CALCRECT);
+                            draw_utf16(hdc, &mut value, &mut bounds, DT_SINGLELINE | DT_CALCRECT);
                             (bounds.right - bounds.left).max(0)
                         });
                     let gutters = if menu == appearance.menu && !header {
@@ -7076,17 +7283,18 @@ impl PopupAppearance {
             ReleaseDC(Some(owner), hdc);
             for (menu, _) in &appearance.menus {
                 let root = *menu == appearance.menu;
-                let width = appearance
-                    .items
-                    .iter()
-                    .filter(|item| item.menu == *menu)
-                    .map(|item| item.width)
-                    .max()
-                    .unwrap_or(0)
-                    .clamp(
-                        (if root { 280 } else { 190 }) * dpi / 96,
-                        (if root { 380 } else { 440 }) * dpi / 96,
-                    );
+                let width = if root {
+                    236 * dpi / 96
+                } else {
+                    appearance
+                        .items
+                        .iter()
+                        .filter(|item| item.menu == *menu)
+                        .map(|item| item.width)
+                        .max()
+                        .unwrap_or(0)
+                        .clamp(190 * dpi / 96, 440 * dpi / 96)
+                };
                 for item in &mut appearance.items {
                     if item.menu == *menu {
                         item.width = width;
@@ -7182,6 +7390,75 @@ impl PopupAppearance {
         };
         LRESULT((index | action << 16) as isize)
     }
+    unsafe fn draw_header(
+        &self,
+        item: &DRAWITEMSTRUCT,
+        rect: RECT,
+        text: &mut [u16],
+        flags: DRAW_TEXT_FORMAT,
+    ) {
+        unsafe {
+            let dc = item.hDC;
+            let unit = self.row_height as i32;
+            let inset = (unit / 7).max(1);
+            let frame = RECT {
+                left: item.rcItem.left + inset,
+                right: item.rcItem.right - inset,
+                top: rect.top + inset,
+                bottom: rect.bottom,
+            };
+            let fill = self.palette.inset();
+            rounded_surface(dc, &frame, fill, fill, inset * 2);
+            let split = text.iter().position(|c| *c == 10).unwrap_or(text.len());
+            let tab = text[..split].iter().position(|c| *c == 9);
+            let mut title = RECT {
+                top: frame.top + unit / 6,
+                bottom: frame.top + unit,
+                ..rect
+            };
+            SelectObject(dc, self.heading_font.into());
+            SetTextColor(dc, self.palette.text);
+            if let Some(tab) = tab {
+                title.right -= unit * 3 / 2;
+                let mut value = RECT {
+                    left: title.right,
+                    right: rect.right,
+                    ..title
+                };
+                SelectObject(dc, self.battery_font.into());
+                SetTextColor(dc, self.palette.accent);
+                draw_utf16(dc, &mut text[tab + 1..split], &mut value, flags | DT_RIGHT);
+                if let Some(fraction) = crate::dashboard_widgets::battery_fraction(
+                    &String::from_utf16_lossy(&text[tab + 1..split]),
+                ) {
+                    crate::dashboard_widgets::meter(
+                        dc,
+                        RECT {
+                            top: frame.bottom - inset * 3,
+                            bottom: frame.bottom - inset * 2,
+                            ..rect
+                        },
+                        fraction,
+                        self.palette,
+                        false,
+                    );
+                }
+                SelectObject(dc, self.heading_font.into());
+                SetTextColor(dc, self.palette.text);
+            }
+            draw_utf16(dc, &mut text[..tab.unwrap_or(split)], &mut title, flags);
+            if split < text.len() {
+                let mut detail = RECT {
+                    top: title.bottom,
+                    bottom: title.bottom + unit / 2,
+                    ..rect
+                };
+                SelectObject(dc, self.font.into());
+                SetTextColor(dc, self.palette.disabled);
+                draw_utf16(dc, &mut text[split + 1..], &mut detail, flags);
+            }
+        }
+    }
     fn message(&self, message: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         if !matches!(message, WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
             return None;
@@ -7211,7 +7488,9 @@ impl PopupAppearance {
                 item.itemWidth = entry.width;
                 item.itemHeight = if entry.separator {
                     (self.row_height / 3).max(1)
-                } else if entry.header || entry.text.contains(&10) {
+                } else if entry.header {
+                    self.row_height * 23 / 10
+                } else if entry.text.contains(&10) {
                     self.row_height * 2
                 } else {
                     self.row_height
@@ -7274,7 +7553,9 @@ impl PopupAppearance {
                 if item.itemState.0 & ODS_NOACCEL.0 != 0 {
                     flags |= DT_HIDEPREFIX;
                 }
-                if entry.header || text.contains(&10) {
+                if entry.header {
+                    self.draw_header(item, rect, &mut text, flags);
+                } else if text.contains(&10) {
                     SelectObject(item.hDC, self.heading_font.into());
                     let split = text.iter().position(|unit| *unit == 10);
                     let title_end = split.unwrap_or(text.len());
@@ -7288,14 +7569,14 @@ impl PopupAppearance {
                             self.palette.text
                         },
                     );
-                    DrawTextW(item.hDC, &mut text[..title_end], &mut title_rect, flags);
+                    draw_utf16(item.hDC, &mut text[..title_end], &mut title_rect, flags);
                     if let Some(split) = split {
                         SelectObject(item.hDC, self.font.into());
                         let mut detail_rect = rect;
                         detail_rect.top = title_rect.bottom - self.row_height as i32 / 6;
                         detail_rect.bottom -= self.row_height as i32 / 6;
                         SetTextColor(item.hDC, self.palette.disabled);
-                        DrawTextW(item.hDC, &mut text[split + 1..], &mut detail_rect, flags);
+                        draw_utf16(item.hDC, &mut text[split + 1..], &mut detail_rect, flags);
                     }
                 } else if !text.is_empty() {
                     if entry.menu == self.menu {
@@ -7305,7 +7586,7 @@ impl PopupAppearance {
                             508 => "battery",
                             500 => "dashboard",
                             509 => "settings",
-                            503 => "sliders",
+                            503 => "dashboard",
                             _ => {
                                 let label = String::from_utf16_lossy(&text);
                                 if label.contains("Polling") {
@@ -7316,8 +7597,10 @@ impl PopupAppearance {
                                     "battery"
                                 } else if label.contains("Displays") {
                                     "display"
-                                } else if label.contains("Other") {
+                                } else if label.contains("Switch device") {
                                     "devices"
+                                } else if label.contains("More options") {
+                                    "more"
                                 } else {
                                     "settings"
                                 }
@@ -7337,7 +7620,7 @@ impl PopupAppearance {
                             if selected {
                                 self.palette.accent
                             } else {
-                                self.palette.text
+                                self.palette.disabled
                             },
                         );
                         rect.left += size + self.padding / 2;
@@ -7358,7 +7641,7 @@ impl PopupAppearance {
                                 self.palette.disabled
                             },
                         );
-                        DrawTextW(item.hDC, &mut text[tab + 1..], &mut right, flags | DT_RIGHT);
+                        draw_utf16(item.hDC, &mut text[tab + 1..], &mut right, flags | DT_RIGHT);
                         text.truncate(tab);
                         rect.right = right.left - self.padding;
                         SetTextColor(
@@ -7372,13 +7655,13 @@ impl PopupAppearance {
                             },
                         );
                     }
-                    DrawTextW(item.hDC, &mut text, &mut rect, flags);
+                    draw_utf16(item.hDC, &mut text, &mut rect, flags);
                 }
                 if item.itemState.0 & ODS_CHECKED.0 != 0 {
                     let mut check_rect = item.rcItem;
                     check_rect.right = check_rect.left + self.padding;
                     let mut check = ['✓' as u16];
-                    DrawTextW(
+                    draw_utf16(
                         item.hDC,
                         &mut check,
                         &mut check_rect,
@@ -7389,7 +7672,7 @@ impl PopupAppearance {
                     let mut arrow_rect = item.rcItem;
                     arrow_rect.left = arrow_rect.right - self.padding;
                     let mut arrow = ['›' as u16];
-                    DrawTextW(
+                    draw_utf16(
                         item.hDC,
                         &mut arrow,
                         &mut arrow_rect,
@@ -7541,8 +7824,8 @@ fn append_polling_menu(menu: HMENU, choices: &[TrayPollingChoice]) -> windows::c
         }
         InsertMenuW(
             menu,
-            2,
-            MF_BYPOSITION | MF_POPUP,
+            504,
+            MF_BYCOMMAND | MF_POPUP,
             submenu.0.0 as usize,
             w!("&Polling rate"),
         )?;
@@ -7565,6 +7848,21 @@ fn wide_menu_data(value: &str) -> Vec<u16> {
     text.push(0);
     text
 }
+fn named_submenu(menu: HMENU, label: &str) -> Option<HMENU> {
+    unsafe {
+        (0..GetMenuItemCount(Some(menu))).find_map(|index| {
+            let mut text = [0u16; 64];
+            let length = GetMenuStringW(menu, index as u32, Some(&mut text), MF_BYPOSITION);
+            if String::from_utf16_lossy(&text[..length.max(0) as usize]) == label {
+                let child = GetSubMenu(menu, index);
+                (!child.is_invalid()).then_some(child)
+            } else {
+                None
+            }
+        })
+    }
+}
+
 fn popup_menu(
     snapshot: &Snapshot,
     settings: &Settings,
@@ -7575,10 +7873,38 @@ fn popup_menu(
         let selected = key.and_then(|key| snapshot.devices.iter().find(|d| d.reading.key == key));
         if let Some(d) = selected {
             let text = wide_menu_data(&d.text);
-            let _ = AppendMenuW(menu.0, MF_STRING | MF_DISABLED, 0, PCWSTR(text.as_ptr()));
-            let _ = AppendMenuW(menu.0, MF_STRING, 503, w!("Device &settings"));
+            AppendMenuW(menu.0, MF_STRING | MF_DISABLED, 0, PCWSTR(text.as_ptr()))?;
+        }
+        if settings.fluent_menu {
+            let others = Popup(CreatePopupMenu()?);
+            for (i, d) in snapshot
+                .devices
+                .iter()
+                .enumerate()
+                // 600..999 are battery-menu IDs; 1000 starts dashboard rows.
+                .take(400)
+                .filter(|(_, d)| !d.hidden && Some(d.reading.key.as_str()) != key)
+            {
+                let text = wide_menu_data(&d.text);
+                AppendMenuW(others.0, MF_STRING, 600 + i, PCWSTR(text.as_ptr()))?;
+            }
+            if GetMenuItemCount(Some(others.0)) > 0 {
+                AppendMenuW(menu.0, MF_POPUP, others.0.0 as usize, w!("&Switch device"))?;
+                std::mem::forget(others);
+            }
+        }
+        if selected.is_some() {
+            AppendMenuW(menu.0, MF_STRING, 503, w!("Device &controls"))?;
+            AppendMenuW(menu.0, MF_STRING, 504, w!("Battery &history"))?;
+        } else {
+            AppendMenuW(menu.0, MF_STRING, 500, w!("Open &dashboard"))?;
+            AppendMenuW(menu.0, MF_STRING, 501, w!("&Refresh"))?;
+        }
+        AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
+        AppendMenuW(menu.0, MF_STRING, 509, w!("&Settings"))?;
+        if selected.is_some() {
             let options = Popup(CreatePopupMenu()?);
-            AppendMenuW(options.0, MF_STRING, 508, w!("Battery and &sleep settings"))?;
+            AppendMenuW(options.0, MF_STRING, 508, w!("Battery and &alerts"))?;
             AppendMenuW(options.0, MF_STRING, 506, w!("Battery &insights"))?;
             AppendMenuW(
                 options.0,
@@ -7588,44 +7914,13 @@ fn popup_menu(
             )?;
             AppendMenuW(options.0, MF_STRING, 505, w!("&Hide tray icon"))?;
             AppendMenuW(options.0, MF_STRING, 501, w!("&Refresh devices"))?;
-            AppendMenuW(
-                menu.0,
-                MF_POPUP,
-                options.0.0 as usize,
-                w!("Battery &and sleep"),
-            )?;
+            AppendMenuW(options.0, MF_SEPARATOR, 0, None)?;
+            AppendMenuW(options.0, MF_STRING, 502, w!("E&xit Halo Continued"))?;
+            AppendMenuW(menu.0, MF_POPUP, options.0.0 as usize, w!("&More options"))?;
             std::mem::forget(options);
+        } else {
+            AppendMenuW(menu.0, MF_STRING, 502, w!("E&xit Halo Continued"))?;
         }
-        if settings.fluent_menu {
-            let others = Popup(CreatePopupMenu()?);
-            for (i, d) in snapshot
-                .devices
-                .iter()
-                .enumerate()
-                // 600..999 are battery-menu IDs; 1000 starts dashboard cards.
-                .take(400)
-                .filter(|(_, d)| !d.hidden && Some(d.reading.key.as_str()) != key)
-            {
-                let text = wide_menu_data(&d.text);
-                let _ = AppendMenuW(others.0, MF_STRING, 600 + i, PCWSTR(text.as_ptr()));
-            }
-            if GetMenuItemCount(Some(others.0)) > 0 {
-                AppendMenuW(menu.0, MF_POPUP, others.0.0 as usize, w!("Other &devices"))?;
-                std::mem::forget(others);
-            }
-        }
-        if selected.is_some() {
-            AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
-            AppendMenuW(menu.0, MF_STRING, 504, w!("Battery &history"))?;
-        }
-        let _ = AppendMenuW(menu.0, MF_STRING, 500, w!("Open &dashboard"));
-        if selected.is_none() {
-            let _ = AppendMenuW(menu.0, MF_STRING, 501, w!("&Refresh"));
-        }
-        let _ = AppendMenuW(menu.0, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu.0, MF_STRING, 509, w!("&Settings"));
-        let _ = AppendMenuW(menu.0, MF_STRING, 502, w!("E&xit Halo Continued"));
-
         Ok(menu)
     }
 }
@@ -7793,7 +8088,20 @@ mod popup_tests {
     #[test]
     fn native_polling_submenu_keeps_ids_disabled_states_and_checkmarks() {
         let _guard = NATIVE_TEST_LOCK.lock().unwrap();
-        let menu = popup_menu(&Snapshot::default(), &Settings::default(), None).unwrap();
+        let reading = Reading::new("test-mouse", "Test mouse", "simulation", 0);
+        let snapshot = Snapshot {
+            devices: vec![DeviceView {
+                reading,
+                name: "Test mouse".into(),
+                icon: "mouse".into(),
+                low_alert_at: 20,
+                seconds_left: None,
+                text: "Test mouse: 70%".into(),
+                hidden: false,
+            }],
+            ..Snapshot::default()
+        };
+        let menu = popup_menu(&snapshot, &Settings::default(), Some("test-mouse")).unwrap();
         let rate = PollingRate::try_from(8000).unwrap();
         let choices = vec![
             TrayPollingChoice {
@@ -7820,7 +8128,7 @@ mod popup_tests {
         ];
         append_polling_menu(menu.0, &choices).unwrap();
         unsafe {
-            let child = GetSubMenu(menu.0, 2);
+            let child = named_submenu(menu.0, "&Polling rate").unwrap();
             assert!(!child.is_invalid());
             assert_eq!(GetMenuItemCount(Some(child)), 3);
             assert_ne!(GetMenuState(child, 0, MF_BYPOSITION) & MF_GRAYED.0, 0);
@@ -7856,7 +8164,7 @@ mod popup_tests {
             assert_ne!(GetMenuState(menu.0, 0, MF_BYPOSITION) & MF_DISABLED.0, 0);
             assert_eq!(GetMenuItemID(menu.0, 1), 503);
             assert!(menu_text(menu.0, 1).contains('&'));
-            let options = GetSubMenu(menu.0, 2);
+            let options = named_submenu(menu.0, "&More options").unwrap();
             assert!(!options.is_invalid());
             assert_eq!(GetMenuItemID(options, 0), 508);
             assert_eq!(GetMenuItemID(options, 3), 505);
@@ -7921,7 +8229,8 @@ mod popup_tests {
                 None
             );
         }
-        assert!(menu_text(menu.0, 1).contains("&settings"));
+        assert_eq!(menu_text(menu.0, 1), "&Switch device");
+        assert_eq!(menu_text(menu.0, 2), "Device &controls");
     }
 
     #[test]
@@ -8063,7 +8372,7 @@ mod popup_theme_tests {
                     LPARAM(&mut measured as *mut _ as isize),
                 )
                 .unwrap();
-            assert_eq!(measured.itemHeight, appearance.row_height * 2);
+            assert!(measured.itemHeight > appearance.row_height * 2);
             assert_eq!(measured.itemWidth, appearance.width);
             appearance.restore_native();
         }
@@ -8294,7 +8603,7 @@ mod polling_tests {
                 _ => reply.observation.as_mut().unwrap().target.generation = 6,
             }
             for ui in [&mut dashboard, &mut tray] {
-                ui.observe_background(&reply);
+                ui.observe_background(&reply, true);
                 assert!(!ui.observations.contains_key("mouse"));
                 assert!(!ui.previous.contains_key("mouse"));
                 assert!(
@@ -8317,7 +8626,7 @@ mod polling_tests {
         let mut reply = outcome(1 << 63, 7, Some(4000));
         reply.previous = Some(rate(1000));
         reply.may_have_changed = true;
-        ui.observe_background(&reply);
+        ui.observe_background(&reply, true);
         assert_eq!(ui.observations["mouse"].rate, Some(rate(4000)));
         assert_eq!(ui.previous["mouse"], rate(1000));
     }
@@ -8370,6 +8679,46 @@ mod polling_tests {
         assert!(ui.accept(&outcome(request.request, 3, Some(1000)), Some("mouse")));
         assert!(ui.observations.is_empty());
     }
+    #[test]
+    fn manual_confirmations_and_restore_values_are_shared_between_surfaces() {
+        let mut dashboard = PollingUi::default();
+        let mut tray = PollingUi::default();
+        read(&mut dashboard, 2, 1000);
+        tray.mirror_manual_readback(&dashboard, "mouse");
+
+        let req = dashboard
+            .begin(
+                reading(),
+                PollingIntent::Apply {
+                    rate: rate(8000),
+                    restore: false,
+                },
+            )
+            .unwrap();
+        let mut result = outcome(req.request, 2, Some(8000));
+        result.previous = Some(rate(1000));
+        assert!(dashboard.accept(&result, Some("mouse")));
+        tray.mirror_manual_readback(&dashboard, "mouse");
+
+        let req = tray
+            .begin_tray(
+                reading(),
+                PollingIntent::Apply {
+                    rate: rate(4000),
+                    restore: false,
+                },
+            )
+            .unwrap();
+        let mut result = outcome(req.request, 2, Some(4000));
+        result.previous = Some(rate(8000));
+        assert!(tray.accept(&result, Some("mouse")));
+        dashboard.mirror_manual_readback(&tray, "mouse");
+        assert_eq!(dashboard.observations["mouse"].rate, Some(rate(4000)));
+        assert_eq!(dashboard.previous["mouse"], rate(8000));
+        read(&mut dashboard, 2, 4000);
+        assert_eq!(dashboard.previous["mouse"], rate(8000));
+    }
+
     #[test]
     fn restore_uses_latest_verified_before_value_and_survives_partial_failure() {
         let mut ui = PollingUi::default();
@@ -8674,7 +9023,7 @@ mod configuration_device_ui_tests {
             );
             if let Some(key) = selected {
                 assert_eq!(
-                    device_row_index(&batteries, &configured, key),
+                    borrowed_device_rows(&batteries, &configured).position(|(d, _)| d.key == key),
                     rows.iter().position(|(d, _)| d.key == key)
                 );
             }
@@ -8793,6 +9142,7 @@ mod history_tests {
             until,
             width,
             request,
+            ..
         } = selection.command("mouse".into(), 123456, 640, 7)
         else {
             panic!("Usage history must not use calendar timestamps")
@@ -9379,7 +9729,7 @@ mod dashboard_lifecycle_tests {
             }
         }
         unsafe {
-            for id in [1000, 43, 17] {
+            for id in [1000, 43, 18, 24] {
                 let count = Cell::new(0u32);
                 let watch = Watch(state.controls[&id]);
                 assert!(
@@ -9649,7 +9999,8 @@ mod dashboard_lifecycle_tests {
         let original_chart = HistorySeries::calendar(vec![reading], 0, 100);
         state.series = original_chart.clone();
         // Keep a previous query pending while the same key changes physical unit.
-        state.history_pending = Some(old_request);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.history_pending = Some((old_request, cancelled.clone()));
         state.history_queued = None;
         let mut replacement = state.snapshot.clone();
         replacement.devices[0].reading.serial = Some("replacement-unit".into());
@@ -9663,6 +10014,7 @@ mod dashboard_lifecycle_tests {
             "Replacement hardware retained the old chart"
         );
         assert_ne!(state.request, old_request);
+        assert!(cancelled.load(Ordering::Relaxed));
         assert!(
             state.history_queued.is_some(),
             "Replacement hardware needs a fresh history query"
@@ -9680,20 +10032,50 @@ mod dashboard_lifecycle_tests {
     unsafe fn exercise_overview_audit(context: &UiContext) {
         unsafe {
             let mut state = context.state.borrow_mut();
+            let status = state.text(95);
+            for caption in [
+                "",
+                "Battery · 73%",
+                "Mouse 🖱️",
+                &"🖱".repeat(128),
+                &"x".repeat(255),
+            ] {
+                state.set_control_text(95, caption);
+                assert!(control_text_matches(state.controls[&95], caption));
+                assert!(!control_text_matches(
+                    state.controls[&95],
+                    "Different caption"
+                ));
+            }
+            let caption = "Monitoring active";
+            state.set_control_text(95, caption);
+            let (_, previous) = crate::allocation_counter::measure(|| {
+                for _ in 0..1000 {
+                    assert_eq!(state.text(95), caption);
+                }
+            });
+            let (_, actual) = crate::allocation_counter::measure(|| {
+                for _ in 0..1000 {
+                    state.set_control_text(95, caption);
+                }
+            });
+            eprintln!("1,000 unchanged UI labels: previous={previous:?}, actual={actual:?}");
+            assert_eq!(actual.calls, 0);
+            state.set_control_text(95, &status);
             let snapshot = state.snapshot.clone();
             let configuration = state.configuration_devices.clone();
             let settings = state.settings.clone();
             let selected = state.selected_device.clone();
-            let section = state.device_section;
+            let section = state.workspace_sections;
             let observations = state.polling.observations.clone();
             state.page = 1;
             state.snapshot.devices.clear();
             state.configuration_devices.clear();
             state.selected_device = None;
             state.build();
-            assert!(state.text(464).starts_with("0 connected"));
+            assert!(state.text(91).starts_with("No devices found"));
             assert!(
-                IsWindowVisible(state.controls[&5]).as_bool(),
+                IsWindowVisible(state.controls[&496]).as_bool(),
                 "Support report must remain reachable"
             );
 
@@ -9709,14 +10091,21 @@ mod dashboard_lifecycle_tests {
             device.capability = PollingCapability::Unavailable("No polling controls".into());
             state.configuration_devices = vec![device];
             state.selected_device = Some(reading.key.clone());
-            state.device_section = 1;
+            state.workspace_sections = 1;
             let sequence = state.polling.sequence;
             state.build();
-            assert!(
-                windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(state.controls[&18])
-                    .as_bool()
-            );
-            assert_eq!(state.text(18), "Sleep");
+            assert!(!state.controls.contains_key(&18));
+            assert!(IsWindowVisible(state.controls[&498]).as_bool());
+            assert!(IsWindowVisible(state.controls[&499]).as_bool());
+            state.set_control_text(498, "Outdated status");
+            state.refresh_mouse_acceleration();
+            assert_ne!(state.text(498), "Outdated status");
+            let mouse = state.configuration_devices[0].clone();
+            state.configuration_devices[0].kind = "keyboard".into();
+            state.build();
+            assert!(!state.controls.contains_key(&498));
+            state.configuration_devices[0] = mouse;
+            state.build();
             assert!(IsWindowVisible(state.controls[&431]).as_bool());
             assert!(
                 !state.controls.contains_key(&469),
@@ -9744,10 +10133,19 @@ mod dashboard_lifecycle_tests {
             state.build();
             let pending = state
                 .history_pending
+                .as_ref()
+                .map(|(id, _)| *id)
                 .expect("History queued its first query");
             for _ in 0..100 {
                 state.query();
-                assert_eq!(state.history_pending, Some(pending));
+                assert!(
+                    state
+                        .history_pending
+                        .as_ref()
+                        .is_some_and(|(id, cancelled)| {
+                            *id == pending && cancelled.load(Ordering::Relaxed)
+                        })
+                );
             }
             let newest = state.request;
             assert!(
@@ -9763,9 +10161,12 @@ mod dashboard_lifecycle_tests {
             state.query();
             let newest = state.request;
             state.history_outcome(pending, Ok(HistorySeries::default()));
-            assert_eq!(state.history_pending, Some(newest));
+            let (id, cancelled) = state.history_pending.as_ref().unwrap();
+            assert_eq!(*id, newest);
+            let cancelled = cancelled.clone();
             assert!(state.history_queued.is_none());
             state.command(1, 0);
+            assert!(cancelled.load(Ordering::Relaxed));
             assert!(state.history_queued.is_none());
             state.history_outcome(newest, Ok(HistorySeries::default()));
             assert!(state.history_pending.is_none());
@@ -9787,35 +10188,29 @@ mod dashboard_lifecycle_tests {
                     .is_none_or(|d| d.low_battery_mode.is_none()),
                 "Rebuilding must not save an unfinished draft"
             );
-            state.device_section = 0;
-            state.control_details = false;
+            state.workspace_sections = 0;
             state.layout_page();
-            assert!(IsWindowVisible(state.controls[&23]).as_bool());
-            assert!(!IsWindowVisible(state.controls[&42]).as_bool());
-            state.command(23, BN_CLICKED as u16);
             assert!(IsWindowVisible(state.controls[&42]).as_bool());
-            state.sleep.details = false;
+            assert!(IsWindowVisible(state.controls[&431]).as_bool());
+            assert!(!IsWindowVisible(state.controls[&469]).as_bool());
+            assert!(!IsWindowVisible(state.controls[&484]).as_bool());
             state.command(18, BN_CLICKED as u16);
-            assert!(
-                !state.sleep.details,
-                "Performance details must not expand sleep details"
-            );
-            assert_eq!(state.text(23), "More details");
-            state.command(23, BN_CLICKED as u16);
-            assert!(state.sleep.details);
-            state.command(17, BN_CLICKED as u16);
-            assert!(
-                state.control_details,
-                "Sleep details must not close performance details"
-            );
+            assert!(IsWindowVisible(state.controls[&469]).as_bool());
+            state.command(24, BN_CLICKED as u16);
+            assert!(IsWindowVisible(state.controls[&484]).as_bool());
+            assert!(IsWindowVisible(state.controls[&469]).as_bool());
+            state.command(24, BN_CLICKED as u16);
+            assert!(!IsWindowVisible(state.controls[&484]).as_bool());
+            assert!(IsWindowVisible(state.controls[&469]).as_bool());
+            state.command(18, BN_CLICKED as u16);
             assert_stable_overview_visibility(&mut state);
             let mut panel = RECT::default();
             let mut button = RECT::default();
             GetWindowRect(state.controls[&460], &mut panel).unwrap();
             GetWindowRect(state.controls[&42], &mut button).unwrap();
             assert!(
-                button.bottom <= panel.bottom - 8,
-                "Restore button extends outside polling panel"
+                button.top >= panel.bottom,
+                "Restore is beneath the workspace panel"
             );
             let descriptor = ConfigurationDevice::from_reading(&reading);
             let observation = PollingObservation {
@@ -9845,19 +10240,66 @@ mod dashboard_lifecycle_tests {
                 [(549, None)],
                 "A 1000 Hz connection may only disable its saved boost"
             );
-            let boost_menu = GetSubMenu(menu.0, 3);
+            let options = named_submenu(menu.0, "&More options").unwrap();
+            let boost_menu = GetSubMenu(options, 0);
             assert_eq!(
                 GetMenuState(boost_menu, 549, MF_BYCOMMAND) & (MF_GRAYED.0 | MF_DISABLED.0),
                 0
             );
             drop(menu);
 
+            // Saving preferences must update the separate quick alert control,
+            // including values absent from its standard list.
+            state.workspace_sections = BATTERY_SECTION | INFO_SECTION;
+            state.build();
+            state.set_control_text(13, "23");
+            state.command(15, BN_CLICKED as u16);
+            assert_eq!(state.text(469), "23%");
+            assert_eq!(state.settings.device(&reading.key).unwrap().low, Some(23));
+
+            // A sleeping row is shorter than its wireless connection label.
+            // Waking it must reflow immediately without needing a page switch.
+            state.snapshot.devices[0].reading.connection = Connection::Sleeping;
+            state.build();
+            state.snapshot.devices[0].reading.connection = Connection::Online;
+            state.refresh_device_details();
+            let card = state.controls[&1000];
+            let dpi = GetDpiForWindow(card).max(96) as i32;
+            let expected =
+                crate::dashboard_widgets::roster_height(card, &state.text(1000), state.font);
+            let mut bounds = RECT::default();
+            GetClientRect(card, &mut bounds).unwrap();
+            assert_eq!(bounds.bottom, expected * dpi / 96);
+
+            // Long firmware replies and wrapped verification text must fit and
+            // push later controls down instead of drawing over one another.
+            state.set_control_text(
+                483,
+                &"Firmware information for this connection. ".repeat(12),
+            );
+            state.layout_page();
+            for (id, following) in [(483, 484), (486, 489), (488, 489)] {
+                let control = state.controls[&id];
+                let mut bounds = RECT::default();
+                GetClientRect(control, &mut bounds).unwrap();
+                let needed = crate::dashboard_widgets::label_height(
+                    control,
+                    &state.text(id),
+                    bounds.right * 96 / dpi,
+                    state.small_font,
+                );
+                assert!(bounds.bottom >= needed * dpi / 96, "Label {id} is clipped");
+                let mut next = RECT::default();
+                GetWindowRect(control, &mut bounds).unwrap();
+                GetWindowRect(state.controls[&following], &mut next).unwrap();
+                assert!(next.top >= bounds.bottom, "Label {id} overlaps {following}");
+            }
+
             state.snapshot = snapshot;
             state.configuration_devices = configuration;
             state.settings = settings;
             state.selected_device = selected;
-            state.device_section = section;
-            state.control_details = false;
+            state.workspace_sections = section;
             state.polling.observations = observations;
             state.build();
             let window = state.dashboard.unwrap();
@@ -9883,7 +10325,7 @@ mod dashboard_lifecycle_tests {
                 let mut origin = POINT::default();
                 ClientToScreen(window, &mut origin).unwrap();
                 assert!(
-                    (origin.x + client.right - refresh.right - 40 * dpi / 96).abs() <= 2,
+                    (origin.x + client.right - refresh.right - 10 * dpi / 96).abs() <= 2,
                     "Refresh must follow the right window margin"
                 );
             }
@@ -9992,19 +10434,39 @@ mod dashboard_lifecycle_tests {
             let state = context.state.borrow();
             assert_eq!(state.selected, 1);
             assert_eq!(state.selected_device.as_deref(), Some("synthetic:second"));
-            assert_eq!(
-                state.choice(10),
-                1,
-                "Clicked tray device must match the visible form"
-            );
+            if page != 1 {
+                assert_eq!(
+                    state.choice(10),
+                    1,
+                    "Clicked tray device must match the visible form"
+                );
+            }
             match page {
-                1 => assert_eq!(state.text(11), "Second mouse"),
+                1 => {
+                    assert_eq!(state.text(88), "Second mouse");
+                    assert_eq!(state.text(11), "Second mouse");
+                    assert_eq!(
+                        unsafe { GetWindowLongPtrW(state.controls[&1001], GWLP_USERDATA) },
+                        1
+                    );
+                }
                 2 => assert_ne!(state.request, history_request),
                 6 => assert_eq!(state.insights.key.as_deref(), Some("synthetic:second")),
                 _ => unreachable!(),
             }
         }
         let mut state = context.state.borrow_mut();
+        state.command(507, 0);
+        assert_eq!(state.page, 1);
+        assert_eq!(state.text(11), "Second mouse");
+        unsafe {
+            let mut field = RECT::default();
+            let mut viewport = RECT::default();
+            GetWindowRect(state.controls[&11], &mut field).unwrap();
+            GetWindowRect(state.page_host.unwrap(), &mut viewport).unwrap();
+            assert!(field.top >= viewport.top && field.bottom <= viewport.bottom);
+        }
+        state.workspace_sections = 0;
         state.snapshot = Snapshot::default();
         state.selected = 0;
         state.selected_device = None;
@@ -10103,6 +10565,7 @@ mod dashboard_lifecycle_tests {
                         },
                         itemState: windows::Win32::UI::Controls::ODS_FLAGS(
                             (if entry.enabled { 0 } else { ODS_DISABLED.0 })
+                                | ODS_NOACCEL.0
                                 | if GetMenuState(entry.menu, entry.position, MF_BYPOSITION)
                                     & MF_CHECKED.0
                                     != 0
@@ -10197,11 +10660,13 @@ mod dashboard_lifecycle_tests {
                 hInstance: instance.into(),
                 lpszClassName: class,
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
+                hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as _)).unwrap_or_default(),
                 hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut _),
                 ..Default::default()
             };
             assert_ne!(RegisterClassW(&wc), 0);
             let context = Box::new(UiContext {
+                power: runtime.power_signals(),
                 state: RefCell::new(State {
                     context: std::ptr::null(),
                     runtime,
@@ -10231,7 +10696,6 @@ mod dashboard_lifecycle_tests {
                     hdr_pending: false,
                     history_cache_active: false,
                     history_queued: None,
-                    taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
                     notify: None,
                     animating: false,
                     tray_theme: TrayThemeCache::default(),
@@ -10246,8 +10710,8 @@ mod dashboard_lifecycle_tests {
                     wheel_remainder: 0,
                     page_height: 0,
                     more_options: false,
-                    device_section: 0,
-                    control_details: false,
+                    startup_initial: None,
+                    workspace_sections: 0,
                     overview_keys: Vec::new(),
                     overview_visibility: None,
                     polling: PollingUi::default(),
@@ -10260,6 +10724,7 @@ mod dashboard_lifecycle_tests {
                     tooltip_rates: BTreeMap::new(),
                 }),
                 monitor: Cell::new(HWND::default()),
+                taskbar: RegisterWindowMessageW(w!("TaskbarCreated")),
                 paint: RefCell::new(None),
                 popup: RefCell::new(None),
                 deferred: DeferredDashboard::default(),
@@ -10332,37 +10797,60 @@ mod dashboard_lifecycle_tests {
                     String::from_utf16(tray.data.szTip.split(|u| *u == 0).next().unwrap()).unwrap();
                 assert!(text.contains(&expected_tip), "{text}");
                 let previous_generation = state.tray_polling.generation;
-                // Exercise the real dispatcher for startup, boost and saver
-                // completions: an uncertain write must clear both UI caches.
-                let observed = state.tooltip_rates["simulated:mouse"].clone();
-                for bit in [
-                    0,
-                    crate::boost::REQUEST_BIT,
-                    crate::battery_saver::REQUEST_BIT,
+                let key = "simulated:mouse";
+                let observed = state.tooltip_rates[key].clone();
+                let saved_rate = state.settings.device(key).unwrap().requested_polling_rate;
+                let rejected = PollingRate::try_from(8000).unwrap();
+                for (id, uncertain) in [(91, false), (92, true)] {
+                    state.record_polling_intent(key, id, rejected, false);
+                    state.polling_outcome(ControlOutcome {
+                        request: id,
+                        key: key.into(),
+                        observation: None,
+                        previous: observed.rate,
+                        may_have_changed: uncertain,
+                        failure: Some("Synthetic failed manual rate change".into()),
+                    });
+                    assert_eq!(
+                        state.settings.device(key).unwrap().requested_polling_rate,
+                        saved_rate
+                    );
+                    assert!(!state.polling_intents.contains_key(key));
+                }
+                let startup = crate::runtime::STARTUP_POLLING_REQUEST_BIT;
+                for request in [
+                    startup | 17,
+                    crate::boost::REQUEST_BIT | 18,
+                    crate::battery_saver::REQUEST_BIT | 19,
                 ] {
+                    let mut verified = observed.clone();
+                    verified.rate = PollingRate::try_from(4000).ok();
                     let mut reply = ControlOutcome {
-                        request: crate::runtime::STARTUP_POLLING_REQUEST_BIT | bit,
-                        key: "simulated:mouse".into(),
-                        observation: Some(observed.clone()),
-                        previous: None,
+                        request,
+                        key: key.into(),
+                        observation: Some(verified.clone()),
+                        previous: observed.rate,
                         may_have_changed: true,
-                        failure: Some("Synthetic uncertain rate change".into()),
+                        failure: None,
                     };
                     state.polling_outcome(reply.clone());
+                    assert_eq!(state.polling.observations[key].rate, verified.rate);
+                    assert_eq!(state.tray_polling.observations[key].rate, verified.rate);
+                    assert_eq!(state.tooltip_rates[key].rate, verified.rate);
+                    reply.failure = Some("Synthetic uncertain rate change".into());
+                    state.polling_outcome(reply);
                     assert!(state.polling.observations.is_empty());
                     assert!(state.tray_polling.observations.is_empty());
                     assert!(state.tooltip_rates.is_empty());
-                    reply.failure = None;
-                    state.polling_outcome(reply);
-                    assert_eq!(
-                        state.polling.observations["simulated:mouse"].rate,
-                        observed.rate
-                    );
-                    assert_eq!(
-                        state.tray_polling.observations["simulated:mouse"].rate,
-                        observed.rate
-                    );
                 }
+                state.polling_outcome(ControlOutcome {
+                    request: startup | crate::runtime::STARTUP_POLLING_READ_BIT,
+                    key: key.into(),
+                    observation: Some(observed),
+                    previous: None,
+                    may_have_changed: false,
+                    failure: None,
+                });
                 state.runtime.send(Command::Refresh);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while state.tray_polling.generation == previous_generation
@@ -10521,7 +11009,7 @@ mod dashboard_lifecycle_tests {
                 }];
                 state.selected_device = Some(r.key.clone());
                 state.settings.polling_controls = false;
-                state.device_section = 4;
+                state.workspace_sections = 4;
                 let h = state.dashboard.unwrap();
                 state.close_dashboard(h);
                 state.open();
@@ -10559,7 +11047,7 @@ mod dashboard_lifecycle_tests {
                 state.selected_device = saved_selection;
                 state.settings = saved_settings;
             }
-            context.state.borrow_mut().device_section = 0;
+            context.state.borrow_mut().workspace_sections = 0;
             context.state.borrow_mut().build();
             let first = context.state.borrow().dashboard.unwrap();
             assert!(IsWindowVisible(first).as_bool());
@@ -10637,13 +11125,17 @@ mod dashboard_lifecycle_tests {
                 state.build();
                 assert_eq!(state.device_rows().len(), 1);
                 assert_eq!(state.overview_keys, ["keyboard-only"]);
-                assert!(state.text(1000).contains("No battery"));
-                assert!(
-                    !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
-                        state.controls[&18]
-                    )
-                    .as_bool()
+                assert!(state.text(1000).contains("USB powered"));
+                assert!(state.text(476).contains("No battery"));
+                assert!(!state.controls.contains_key(&18));
+                assert!(state.text(44).contains("rate controls are unavailable"));
+                let menu =
+                    popup_menu(&state.snapshot, &state.settings, Some("application")).unwrap();
+                assert_eq!(
+                    state.append_configuration_menu(menu.0, Some("application")),
+                    [(33000, "keyboard-only".into())]
                 );
+                assert!(named_submenu(menu.0, "&Switch device").is_some());
                 assert!(state.controls.contains_key(&11));
                 assert!(!state.controls.contains_key(&12));
                 assert!(!state.controls.contains_key(&13));
@@ -10968,7 +11460,7 @@ mod dashboard_lifecycle_tests {
                 let font = HFONT(send(label, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as _);
                 SelectObject(dc, font.into());
                 let mut text = wide(&state.text(79));
-                DrawTextW(
+                draw_utf16(
                     dc,
                     &mut text,
                     &mut bounds,
@@ -11043,7 +11535,6 @@ mod dashboard_lifecycle_tests {
                     profile: None,
                     stage: Some(1),
                 };
-                state.dpi.attempted = Some((key.clone(), generation));
                 state.dpi.outcome = Some(DpiOutcome {
                     limits: None,
                     request: 1,
@@ -11055,8 +11546,20 @@ mod dashboard_lifecycle_tests {
                     failure: None,
                 });
                 state.dpi.previous = Some((key.clone(), generation, original.clone()));
-                state.device_section = 2;
+                state.workspace_sections = 0;
                 state.build();
+                let dpi = state.controls[&474];
+                let custom = wide(CUSTOM_DPI);
+                let custom_index = send(
+                    dpi,
+                    CB_FINDSTRINGEXACT,
+                    WPARAM(usize::MAX),
+                    LPARAM(custom.as_ptr() as isize),
+                )
+                .0;
+                assert!(custom_index > 0);
+                send(dpi, CB_SETCURSEL, WPARAM(custom_index as usize), LPARAM(0));
+                state.command(474, CBN_SELCHANGE as u16);
                 assert_eq!(state.text(451), "800");
                 assert_eq!(state.text(458), "Supported DPI: 100–45,000 (model range)");
                 assert!(state.text(457).contains("800 horizontal / 1200 vertical"));
@@ -11066,13 +11569,26 @@ mod dashboard_lifecycle_tests {
                 let dpi_request = state.dpi.next;
                 let rate_request = state.polling.sequence;
                 let edit = state.controls[&451];
-                state.command(17, 0);
+                send(state.controls[&474], CB_SETCURSEL, WPARAM(1), LPARAM(0));
+                state.command(474, CBN_SELCHANGE as u16);
                 assert!(!IsWindowVisible(edit).as_bool());
                 assert!(IsWindowVisible(state.controls[&43]).as_bool());
-                state.command(19, 0);
+                send(
+                    state.controls[&474],
+                    CB_SETCURSEL,
+                    WPARAM(custom_index as usize),
+                    LPARAM(0),
+                );
+                state.command(474, CBN_SELCHANGE as u16);
                 assert!(IsWindowVisible(edit).as_bool());
-                assert_eq!(state.controls[&451], edit, "tabs retain native drafts");
-                assert_eq!(state.dpi.next, dpi_request, "tabs must not query hardware");
+                assert_eq!(
+                    state.controls[&451], edit,
+                    "workspace retains native drafts"
+                );
+                assert_eq!(
+                    state.dpi.next, dpi_request,
+                    "layout must not query hardware"
+                );
                 assert_eq!(
                     state.polling.sequence, rate_request,
                     "tabs must not query hardware"
@@ -11264,7 +11780,7 @@ mod dashboard_lifecycle_tests {
                     {
                         let mut state = context.state.borrow_mut();
                         state.page = page;
-                        state.device_section = 0;
+                        state.workspace_sections = 0;
                         state.error.clear();
                         state.more_options = advanced;
                         if page == 2
@@ -11444,11 +11960,10 @@ mod dashboard_lifecycle_tests {
                         }
                         if page == 1 {
                             assert!(state.controls.contains_key(&49));
-                            // Other supported settings can follow boost; reveal this section itself.
-                            state.scroll_page(708 - PAGE_TOP);
+                            // The primary settings fit together with no extra scroll.
                             let mut pane = RECT::default();
                             GetWindowRect(state.page_host.unwrap(), &mut pane).unwrap();
-                            for id in [49, 50, 465, 52] {
+                            for id in [49, 50, 465] {
                                 let mut bounds = RECT::default();
                                 GetWindowRect(state.controls[&id], &mut bounds).unwrap();
                                 assert!(
@@ -11459,7 +11974,7 @@ mod dashboard_lifecycle_tests {
                             // A hardware reply rebuilds this group at the current
                             // scroll position; it must retain the full range.
                             state.polling_controls();
-                            assert!(state.page_height >= 600 - PAGE_TOP);
+                            assert!(IsWindowVisible(state.controls[&49]).as_bool());
                             state.scroll_page(0);
                             assert!(!state.checked(49));
                             send(state.controls[&49], BM_SETCHECK, WPARAM(1), LPARAM(0));
@@ -11515,10 +12030,12 @@ mod dashboard_lifecycle_tests {
                             // color callback reenter the parent while State is
                             // held, exactly as during a page rebuild. Print the
                             // real controls, not a direct call to the helper.
+                            state.workspace_sections |= INFO_SECTION;
+                            state.layout_page();
                             let palette = state.theme.as_ref().unwrap().palette;
                             for (id, background) in [
-                                (10, palette.background),
-                                (91, palette.background),
+                                (43, palette.inset()),
+                                (464, palette.background),
                                 (11, palette.surface),
                             ] {
                                 let child = state.controls[&id];
@@ -11576,8 +12093,127 @@ mod dashboard_lifecycle_tests {
                             let _ = DeleteObject(bitmap.into());
                             let _ = DeleteDC(dc);
                             ReleaseDC(Some(reopened), source);
+                            state.workspace_sections = 0;
+                            state.layout_page();
                         }
                     }
+                    let workspace_fixture = if page == 1
+                        && std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
+                            .is_ok_and(|v| v == "workspace")
+                    {
+                        let mut state = context.state.borrow_mut();
+                        let saved = (
+                            std::mem::take(&mut state.snapshot.devices),
+                            std::mem::take(&mut state.configuration_devices),
+                            state.selected_device.take(),
+                            std::mem::take(&mut state.polling.observations),
+                            std::mem::take(&mut state.dpi),
+                            std::mem::take(&mut state.sleep),
+                        );
+                        let mut mouse = Reading::new(
+                            "razer:00bf:WORKSPACE-MOUSE",
+                            "Razer DeathAdder V4 Pro",
+                            "razer",
+                            0,
+                        );
+                        mouse.via = "usb".into();
+                        mouse.kind = "mouse".into();
+                        mouse.level = Some(62);
+                        mouse.charging = Some(false);
+                        let mut controller = Reading::new(
+                            "playstation:0ce6:WORKSPACE-PAD",
+                            "DualSense",
+                            "playstation",
+                            0,
+                        );
+                        controller.via = "bluetooth".into();
+                        controller.kind = "gamepad".into();
+                        controller.level = Some(44);
+                        controller.connection = Connection::Sleeping;
+                        let mut keyboard = ConfigurationDevice::from_reading(&Reading::new(
+                            "corsair:1bb3:WORKSPACE-KEYBOARD",
+                            "Corsair K70 RGB Pro",
+                            "corsair",
+                            0,
+                        ));
+                        keyboard.kind = "keyboard".into();
+                        keyboard.via = "usb".into();
+                        keyboard.capability =
+                            PollingCapability::Unavailable("Maintained software session".into());
+                        state.configuration_devices = vec![keyboard];
+                        let key = mouse.key.clone();
+                        state.selected_device = Some(key.clone());
+                        let generation = state.polling.generation;
+                        let rates = [125, 500, 1000, 2000, 4000, 8000]
+                            .map(|hz| PollingRate::try_from(hz).unwrap());
+                        state.polling.observations.insert(
+                            key.clone(),
+                            PollingObservation {
+                                target: ControlTarget {
+                                    device: ConfigurationDevice::from_reading(&mouse),
+                                    generation,
+                                    connection_stamp: None,
+                                },
+                                rate: Some(rates[2]),
+                                supported: rates.to_vec(),
+                                timestamp: 0,
+                                evidence: "Simulated".into(),
+                            },
+                        );
+                        state.settings.device_mut(&key).fullscreen_boost_rate = Some(rates[4]);
+                        state.dpi.outcome = Some(DpiOutcome {
+                            request: 1,
+                            key: key.clone(),
+                            generation,
+                            limits: None,
+                            current: Some(DpiState {
+                                value: DpiValue::uniform(1600),
+                                profile: None,
+                                stage: None,
+                            }),
+                            previous: None,
+                            may_have_changed: false,
+                            failure: None,
+                        });
+                        state.sleep.outcome = Some(SleepOutcome {
+                            request: 1,
+                            key,
+                            generation,
+                            connection_stamp: None,
+                            seconds: Some(300),
+                            may_have_changed: false,
+                            failure: None,
+                        });
+                        state.snapshot.devices = [mouse, controller]
+                            .into_iter()
+                            .map(|reading| DeviceView {
+                                name: reading.name.clone(),
+                                text: format!("{}: {}%", reading.name, reading.level.unwrap()),
+                                icon: reading.kind.clone(),
+                                seconds_left: (reading.kind == "mouse").then_some(36 * 3600),
+                                low_alert_at: 20,
+                                hidden: false,
+                                reading,
+                            })
+                            .collect();
+                        state.workspace_sections = 0;
+                        state.device_form_key = None;
+                        state.build();
+                        state.set_control_text(95, "Sample readings · Monitoring active");
+                        assert!(IsWindowVisible(state.controls[&498]).as_bool());
+                        // The Windows pointer check adds a row. Smaller windows
+                        // scroll; every disclosure must remain reachable.
+                        state.scroll_page(i32::MAX);
+                        let mut info = RECT::default();
+                        let mut host = RECT::default();
+                        GetWindowRect(state.controls[&24], &mut info).unwrap();
+                        GetWindowRect(state.page_host.unwrap(), &mut host).unwrap();
+                        assert!(info.top >= host.top && info.bottom <= host.bottom);
+                        state.scroll_page(0);
+                        Some(saved)
+                    } else {
+                        None
+                    };
                     if page == 1 {
                         let state = context.state.borrow();
                         exercise_overview_popup(&state, dark);
@@ -11626,8 +12262,7 @@ mod dashboard_lifecycle_tests {
                         state.selected_device = Some(device.key.clone());
                         let compact = std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
                             .is_ok_and(|s| s == "overview-battery");
-                        state.device_section = 1;
-                        state.sleep.details = !compact;
+                        state.workspace_sections = 1;
                         state.sleep.saver_details = !compact;
                         if compact {
                             state.settings.device_mut(&device.key).low = Some(20);
@@ -11646,20 +12281,16 @@ mod dashboard_lifecycle_tests {
                             device_information::show_fixture_information(&mut state);
                             state.error.clear();
                             state.set_control_text(95, "");
-                            for id in [480, 481, 483, 484, 485, 486, 487, 488] {
+                            for id in [24, 481, 483, 484, 485, 486, 487, 488] {
                                 assert!(IsWindowVisible(state.controls[&id]).as_bool());
                             }
                         } else if compact {
-                            for id in [430, 431, 432, 433, 439, 440, 467, 469, 470, 473] {
+                            for id in [430, 431, 433, 439, 440, 467, 469, 470, 473] {
                                 assert!(
                                     IsWindowVisible(state.controls[&id]).as_bool(),
                                     "Compact Battery control {id} missing"
                                 );
                             }
-                            assert!(
-                                !IsWindowVisible(state.controls[&7]).as_bool(),
-                                "Compact Battery should fit without scrolling"
-                            );
                             state.scroll_page(0);
                         } else {
                             state.scroll_page(i32::MAX);
@@ -11845,6 +12476,18 @@ mod dashboard_lifecycle_tests {
                     let _ = DeleteObject(bitmap.into());
                     let _ = DeleteDC(dc);
                     ReleaseDC(Some(reopened), source);
+                    if let Some((devices, configuration, selection, rates, dpi, sleep)) =
+                        workspace_fixture
+                    {
+                        let mut state = context.state.borrow_mut();
+                        state.settings.devices.remove("razer:00bf:WORKSPACE-MOUSE");
+                        state.snapshot.devices = devices;
+                        state.configuration_devices = configuration;
+                        state.selected_device = selection;
+                        state.polling.observations = rates;
+                        state.dpi = dpi;
+                        state.sleep = sleep;
+                    }
                     if let Some(saved) = sleep_capture {
                         let mut state = context.state.borrow_mut();
                         state
@@ -11961,6 +12604,23 @@ mod dashboard_lifecycle_tests {
                 assert_eq!(GetFocus(), state.controls[&215]);
                 state.set_control_text(215, "30");
                 state.set_control_text(201, "60");
+                let sign_in = state.checked(206);
+                let startup_writes = TEST_STARTUP_CHANGES.with(Cell::get);
+                state.command(210, 0);
+                assert_eq!(TEST_STARTUP_CHANGES.with(Cell::get), startup_writes);
+                send(
+                    state.controls[&206],
+                    BM_SETCHECK,
+                    WPARAM(usize::from(!sign_in)),
+                    LPARAM(0),
+                );
+                state.build();
+                assert_eq!(state.startup_initial, Some(sign_in));
+                assert_ne!(state.checked(206), sign_in);
+                state.command(210, 0);
+                assert_eq!(TEST_STARTUP_CHANGES.with(Cell::get), startup_writes + 1);
+                state.command(210, 0);
+                assert_eq!(TEST_STARTUP_CHANGES.with(Cell::get), startup_writes + 1);
                 let dpi = GetDpiForWindow(reopened).max(96) as i32;
                 SetWindowPos(
                     reopened,
@@ -12204,7 +12864,7 @@ mod dashboard_lifecycle_tests {
                 state.selected_device = Some("razer:00bf:SCROLL-TEST".into());
                 state.settings.polling_controls = true;
                 state.page = 1;
-                state.device_section = 1;
+                state.workspace_sections = 1;
                 state.sleep.saver_details = true;
                 state.build();
                 state.scroll_page(i32::MAX);
@@ -12283,20 +12943,19 @@ mod dashboard_lifecycle_tests {
                     state.selected_device = Some("razer:00bf:SYNTHETIC-SLEEP".into());
                     state.settings.polling_controls = true;
                     state.page = 1;
-                    state.device_section = 1;
+                    state.workspace_sections = 1;
                     state.sleep.saver_details = true;
                     state.build();
                     state.apply_theme(DashboardTheme::new(cycle % 2 == 0, false));
                     if cycle == 0 {
                         state.sleep.saver_details = false;
-                        state.sleep.details = false;
                         state.layout_page();
                         assert!(IsWindowVisible(state.controls[&469]).as_bool());
                         assert!(!IsWindowVisible(state.controls[&442]).as_bool());
                         assert!(IsWindowVisible(state.controls[&440]).as_bool());
                         assert!(IsWindowVisible(state.controls[&473]).as_bool());
-                        assert!(IsWindowVisible(state.controls[&432]).as_bool());
-                        assert_eq!(state.text(432), "Check current");
+                        assert!(IsWindowVisible(state.controls[&433]).as_bool());
+                        assert!(!IsWindowVisible(state.controls[&432]).as_bool());
                         state.sleep.outcome = Some(SleepOutcome {
                             request: 1,
                             key: "razer:00bf:SYNTHETIC-SLEEP".into(),
@@ -12346,11 +13005,12 @@ mod dashboard_lifecycle_tests {
                             state.text(466).contains("20%"),
                             "Summary must describe the saved threshold"
                         );
-                        state.command(23, BN_CLICKED as u16);
-                        assert!(state.sleep.details);
+                        state.command(24, BN_CLICKED as u16);
+                        assert!(IsWindowVisible(state.controls[&432]).as_bool());
+                        assert_eq!(state.text(432), "Check current");
                         assert!(
                             !state.sleep.saver_details,
-                            "Sleep details must not open Battery saver"
+                            "Information must not expand Battery saver"
                         );
                         state.command(473, BN_CLICKED as u16);
                         assert_eq!(
@@ -12359,7 +13019,7 @@ mod dashboard_lifecycle_tests {
                             "Closing settings must preserve an unsaved draft"
                         );
                         state.command(473, BN_CLICKED as u16);
-                        state.command(23, BN_CLICKED as u16);
+                        state.command(24, BN_CLICKED as u16);
                         state.set_control_text(11, "Unsaved name");
                         let index = send(
                             state.controls[&469],
@@ -12537,7 +13197,7 @@ mod dashboard_lifecycle_tests {
             assert!(context.state.borrow().dashboard_visible());
             context.state.borrow_mut().close_dashboard(posted_open);
             dispatch_monitor(monitor);
-            assert_eq!(context.deferred.0.get(), [None; 4]);
+            assert!(context.deferred.0.get().iter().all(Option::is_none));
             {
                 let mut state = context.state.borrow_mut();
                 assert!(state.dashboard.is_none());
@@ -12580,6 +13240,35 @@ mod dashboard_lifecycle_tests {
             }
             if !restore {
                 sample_closed_dashboard(&context, "after-40-cycles");
+                // TrackPopupMenu can dispatch these messages with State already
+                // borrowed. Revocation and resume must be signalled immediately.
+                let state = context.state.borrow_mut();
+                assert_ne!(context.taskbar, 0);
+                send(monitor, context.taskbar, WPARAM(0), LPARAM(0));
+                assert!(
+                    context
+                        .deferred
+                        .0
+                        .get()
+                        .contains(&Some((context.taskbar, 0)))
+                );
+                send(
+                    monitor,
+                    WM_POWERBROADCAST,
+                    WPARAM(PBT_APMSUSPEND as usize),
+                    LPARAM(0),
+                );
+                assert!(context.power.suspended());
+                send(
+                    monitor,
+                    WM_POWERBROADCAST,
+                    WPARAM(PBT_APMRESUMEAUTOMATIC as usize),
+                    LPARAM(0),
+                );
+                assert!(!context.power.suspended());
+                drop(state);
+                dispatch_monitor(monitor);
+                assert!(context.deferred.0.get().iter().all(Option::is_none));
             }
             context.state.borrow_mut().runtime.stop();
             DestroyWindow(monitor).unwrap();

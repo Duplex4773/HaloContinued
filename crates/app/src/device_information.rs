@@ -117,7 +117,7 @@ fn verification_text(device: &ConfigurationDevice, battery: bool) -> String {
 #[cfg(test)]
 pub(super) fn show_fixture_information(state: &mut State) {
     state.information.clear();
-    state.device_section = 4;
+    state.workspace_sections = 4;
     state.page_scroll = 0;
     state.build();
     let device = state.current_device().unwrap().0;
@@ -148,7 +148,7 @@ pub(super) fn exercise_native_information(state: &mut State) {
         let configuration = state.configuration_devices.clone();
         let selected = state.selected_device.clone();
         let settings = state.settings.clone();
-        let section = state.device_section;
+        let section = state.workspace_sections;
         let mut reading = Reading::new(
             "razer:00bf:INFO-TEST",
             "Razer DeathAdder V4 Pro",
@@ -172,12 +172,12 @@ pub(super) fn exercise_native_information(state: &mut State) {
             text: "Mouse: 50%".into(),
             hidden: false,
         }];
-        state.device_section = 0;
+        state.workspace_sections = 0;
         state.build();
         state.configuration_visibility();
         let polling_sequence = state.polling.sequence;
-        state.command(24, 0);
-        assert!(IsWindowVisible(state.controls[&480]).as_bool());
+        state.command(24, BN_CLICKED as u16);
+        assert!(IsWindowVisible(state.controls[&481]).as_bool());
         assert!(state.text(481).contains("Wireless"));
         assert!(state.text(483).contains("Reading"));
         let (request, cancel) = state.information.pending.as_ref().unwrap().clone();
@@ -228,7 +228,7 @@ pub(super) fn exercise_native_information(state: &mut State) {
             !state.text(483).contains("9.99"),
             "Late results must not replace a newer read"
         );
-        state.command(17, 0);
+        state.command(24, BN_CLICKED as u16);
         assert!(current_cancel.load(Ordering::Acquire));
         assert!(state.information.pending.is_none());
         assert!(state.information.outcome.is_none());
@@ -250,7 +250,7 @@ pub(super) fn exercise_native_information(state: &mut State) {
         state.selected_device = Some(keyboard.key.clone());
         state.configuration_devices = vec![keyboard];
         state.build();
-        state.command(24, 0);
+        state.command(24, BN_CLICKED as u16);
         assert!(state.information.pending.is_none());
         assert!(state.text(483).contains("not available"));
         assert!(!state.text(486).contains("Battery"));
@@ -271,7 +271,7 @@ pub(super) fn exercise_native_information(state: &mut State) {
         let sequence = state.polling.sequence;
         state.overview_select(1);
         assert_eq!(
-            state.device_section, 4,
+            state.workspace_sections, 4,
             "Selecting a device should retain the information view"
         );
         assert_eq!(state.polling.sequence, sequence);
@@ -281,13 +281,12 @@ pub(super) fn exercise_native_information(state: &mut State) {
         state.configuration_devices = configuration;
         state.selected_device = selected;
         state.settings = settings;
-        state.device_section = section;
+        state.workspace_sections = section;
         state.build();
     }
 }
 impl State {
     pub(super) fn build_device_information(&mut self) {
-        self.heading(480, "Device information", 24, 112, 600);
         self.label(481, "", 24, 112, 720);
         self.control(
             483,
@@ -331,7 +330,8 @@ impl State {
         );
     }
     pub(super) fn read_device_information(&mut self, force: bool) {
-        if self.dashboard.is_none() || self.page != 1 || self.device_section != 4 {
+        if self.dashboard.is_none() || self.page != 1 || self.workspace_sections & INFO_SECTION == 0
+        {
             return;
         }
         let Some((device, _)) = self.current_device() else {
@@ -377,9 +377,11 @@ impl State {
             }
         }
         self.render_device_information();
+        self.layout_page();
     }
     pub(super) fn device_information_outcome(&mut self, outcome: Box<DeviceInfoOutcome>) {
-        if self.dashboard.is_none() || self.page != 1 || self.device_section != 4 {
+        if self.dashboard.is_none() || self.page != 1 || self.workspace_sections & INFO_SECTION == 0
+        {
             return;
         }
         if let Some((device, _)) = self.current_device()
@@ -388,10 +390,14 @@ impl State {
                 .accept(outcome, &device, self.polling.generation)
         {
             self.render_device_information();
+            self.layout_page();
         }
     }
     pub(super) fn render_device_information(&self) {
-        if self.page != 1 || self.device_section != 4 || !self.controls.contains_key(&480) {
+        if self.page != 1
+            || self.workspace_sections & INFO_SECTION == 0
+            || !self.controls.contains_key(&481)
+        {
             return;
         }
         let Some((device, battery)) = self.current_device() else {

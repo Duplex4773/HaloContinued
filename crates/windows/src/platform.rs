@@ -363,32 +363,65 @@ impl BluetoothProvider {
                 node.fallback = Some(node.fallback.unwrap_or(false) || value != 0)
             }
         }
+        self.snapshot_from_nodes(nodes, c.clock, |provider, mac, node| {
+            // Keep existing WinRT handles until their status query fails.
+            provider
+                .links
+                .get(mac)
+                .and_then(|link| link.connected().ok())
+                .or_else(|| {
+                    provider.links.remove(mac);
+                    if let Err(error) = provider.connect(mac, node.le, c) {
+                        provider
+                            .diagnostics
+                            .push(format!("{mac}: {error}; using PnP connection fallback"));
+                    }
+                    provider
+                        .links
+                        .get(mac)
+                        .and_then(|link| link.connected().ok())
+                })
+        })
+    }
+
+    fn snapshot_from_nodes(
+        &mut self,
+        nodes: BTreeMap<String, Node>,
+        clock: &dyn Clock,
+        mut native_connection: impl FnMut(&mut Self, &str, &Node) -> Option<bool>,
+    ) -> PollResult {
         self.retain_inventory(&nodes);
         let mut out = Vec::new();
+        let mut confirmed = false;
+        let mut connection_error = None;
         self.diagnostics.clear();
         for (mac, node) in nodes {
-            // A node without battery evidence needs neither a WinRT connection
-            // object nor two-second status checks. A later PnP battery property
-            // will discover it through the existing minute/event refresh.
+            // Nodes without battery evidence do not need a WinRT link.
             let Some(level) = self.battery_level(&mac, node.level) else {
                 continue;
             };
-            // Reuse a successful status query within this snapshot. A failed
-            // query can require a new WinRT object, not a false disconnection.
-            let native = self.links.get(&mac).and_then(|d| d.connected().ok());
-            let native = native.or_else(|| {
-                self.links.remove(&mac);
-                if let Err(e) = self.connect(&mac, node.le, c) {
-                    self.diagnostics
-                        .push(format!("{mac}: {e}; using PnP connection fallback"));
+            let key = format!("bluetooth:{mac}");
+            match bluetooth_connection(native_connection(self, &mac, &node), node.fallback) {
+                Ok(connected) => {
+                    confirmed = true;
+                    if !connected {
+                        continue;
+                    }
                 }
-                self.links.get(&mac).and_then(|d| d.connected().ok())
-            });
-            // Non-battery nodes need no connection evidence. For a battery
-            // device, unknown state is a failed snapshot and retains its last
-            // reading through the existing bounded recovery path.
-            if !bluetooth_connection(native, node.fallback)? {
-                continue;
+                Err(error) => {
+                    self.diagnostics.push(format!("{mac}: {error}"));
+                    connection_error.get_or_insert(error);
+                    if let Some(previous) = self
+                        .readings
+                        .iter()
+                        .find(|reading| reading.key == key && reading.container == node.container)
+                    {
+                        let mut stale = previous.clone();
+                        stale.connection = Connection::Stale;
+                        out.push(stale);
+                    }
+                    continue;
+                }
             }
             let name = if !node.root_name.is_empty() {
                 node.root_name
@@ -397,12 +430,7 @@ impl BluetoothProvider {
             } else {
                 format!("Bluetooth {mac}")
             };
-            let mut r = Reading::new(
-                format!("bluetooth:{mac}"),
-                name,
-                "bluetooth",
-                c.clock.unix(),
-            );
+            let mut r = Reading::new(key, name, "bluetooth", clock.unix());
             r.level = Some(level);
             r.serial = Some(mac.clone());
             r.container = node.container;
@@ -419,6 +447,9 @@ impl BluetoothProvider {
                 r.approx = Some("Last battery level reported by Windows".into())
             }
             out.push(r);
+        }
+        if !confirmed && let Some(error) = connection_error {
+            return Err(error);
         }
         Ok(out)
     }
@@ -724,6 +755,53 @@ mod tests {
         assert_eq!(after.bytes, 0);
         println!("1,000 unrelated PnP IDs: before={before:?}; after={after:?}");
     }
+    #[test]
+    fn unknown_bluetooth_link_preserves_other_devices_and_its_last_reading() {
+        let mut provider = BluetoothProvider::default();
+        let mut previous = Reading::new("bluetooth:unknown", "Sleeping headset", "bluetooth", 10);
+        previous.level = Some(67);
+        provider.readings.push(previous);
+        let nodes = BTreeMap::from([
+            (
+                "unknown".into(),
+                Node {
+                    level: Some(88),
+                    ..Default::default()
+                },
+            ),
+            (
+                "working".into(),
+                Node {
+                    level: Some(42),
+                    fallback: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let readings = provider
+            .snapshot_from_nodes(nodes, &SystemClock::default(), |_, _, _| None)
+            .unwrap();
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0].connection, Connection::Stale);
+        assert_eq!(readings[0].level, Some(67));
+        assert_eq!(readings[0].timestamp, 10);
+        assert!(readings[1].online());
+        assert_eq!(readings[1].level, Some(42));
+
+        let unknown_only = BTreeMap::from([(
+            "unknown".into(),
+            Node {
+                level: Some(88),
+                ..Default::default()
+            },
+        )]);
+        assert!(
+            provider
+                .snapshot_from_nodes(unknown_only, &SystemClock::default(), |_, _, _| None)
+                .is_err()
+        );
+    }
+
     #[test]
     fn unknown_bluetooth_connection_is_not_confirmed_disconnection() {
         for native in [None, Some(false), Some(true)] {

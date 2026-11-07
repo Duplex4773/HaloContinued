@@ -55,12 +55,12 @@ pub(crate) fn execute(
             "device connection changed; refresh configuration before applying",
         );
     }
-    let devices = match hid.enumerate(0x046d) {
+    let devices = match hid.enumerate_shared(0x046d) {
         Ok(d) => d,
         Err(e) => return ControlOutcome::failed(request, e.message),
     };
     let mut groups: BTreeMap<(u16, String), Vec<&HidInfo>> = BTreeMap::new();
-    for info in &devices {
+    for info in devices.iter() {
         if info.vendor_id == 0x046d
             && info.usage_page == 0xff00
             && [1, 2].contains(&info.usage)

@@ -135,7 +135,7 @@ pub(crate) fn execute<'a>(
         .serial
         .as_deref()
         .ok_or_else(|| error("Verified mouse identity required."))?;
-    let infos = hid.enumerate(0x046d)?;
+    let infos = hid.enumerate_shared(0x046d)?;
     if infos.len() > 512 {
         return Err(error("Too many mouse collections."));
     }

@@ -6,6 +6,7 @@ use hb_storage::Store;
 use std::{
     collections::VecDeque,
     path::PathBuf,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 const MAX_RECOVERY_DEVICES: usize = 512;
@@ -42,6 +43,7 @@ fn record_activity(
                 && old.session == activity.session
                 && old.timestamp == activity.timestamp
                 && old.kind == activity.kind
+                && old.sequence == activity.sequence
         });
         if let Err(error) = flush_activities(database, pending) {
             if duplicate {
@@ -135,11 +137,54 @@ fn record_in_order(
     record_batch(db, observations, pending)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckpointAccess {
+    Replace,
+    Insert,
+    Preserve,
+}
+struct EstimatorCheckpoint {
+    access: CheckpointAccess,
+    pending: Option<Estimator>,
+}
+impl EstimatorCheckpoint {
+    fn new(loaded: bool) -> Self {
+        Self {
+            access: if loaded {
+                CheckpointAccess::Replace
+            } else {
+                CheckpointAccess::Insert
+            },
+            pending: None,
+        }
+    }
+    fn flush(&mut self, db: &mut Store) -> Result<(), ProviderError> {
+        let Some(state) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        match self.access {
+            CheckpointAccess::Replace => db.save_estimator(state)?,
+            CheckpointAccess::Insert => {
+                // We could not read the original at startup. Claim an empty
+                // database atomically, or leave its existing fit for next launch.
+                self.access = if db.create_estimator(state)? {
+                    CheckpointAccess::Replace
+                } else {
+                    CheckpointAccess::Preserve
+                };
+            }
+            CheckpointAccess::Preserve => {}
+        }
+        self.pending = None;
+        Ok(())
+    }
+}
+
 fn recover_and_flush(
     database: &mut Result<Store, ProviderError>,
     path: &std::path::Path,
     pending_usage: &mut Vec<UsageObservation>,
-    estimator: &mut Option<Estimator>,
+    estimator: &mut EstimatorCheckpoint,
 ) -> Result<(), ProviderError> {
     if database.is_err() {
         *database = Store::open(path);
@@ -148,7 +193,7 @@ fn recover_and_flush(
     db.flush()?;
     let recovered = std::mem::take(pending_usage);
     record_batch(db, recovered, pending_usage)?;
-    save_latest(estimator, |state| db.save_estimator(state))?;
+    estimator.flush(db)?;
     db.flush()
 }
 /// An explicit history request is also a recovery opportunity. Drain the
@@ -157,7 +202,7 @@ fn query_database<'a>(
     database: &'a mut Result<Store, ProviderError>,
     path: &std::path::Path,
     pending_usage: &mut Vec<UsageObservation>,
-    estimator: &mut Option<Estimator>,
+    estimator: &mut EstimatorCheckpoint,
     pending_activities: &mut VecDeque<PollingActivity>,
 ) -> Result<&'a Store, ProviderError> {
     recover_and_flush(database, path, pending_usage, estimator)?;
@@ -170,12 +215,19 @@ pub(super) fn run(
     boot: Sender<Estimator>,
     events: Events,
 ) {
-    let mut database = Store::open(&folder.join("history.db"));
-    let _ = boot.send(
-        database
-            .as_ref()
-            .map_or_else(|_| Estimator::default(), Store::load_estimator),
-    );
+    let path = folder.join("history.db");
+    let mut database = Store::open(&path);
+    let initial = database
+        .as_ref()
+        .ok()
+        .and_then(|db| db.try_load_estimator().ok())
+        .or_else(|| {
+            Store::read_only(&path)
+                .and_then(|db| db.try_load_estimator())
+                .ok()
+        });
+    let mut estimator = EstimatorCheckpoint::new(initial.is_some());
+    let _ = boot.send(initial.unwrap_or_default());
     let clock = SystemClock::default();
     if let Ok(db) = &mut database {
         let _ = db.prune(clock.unix());
@@ -183,7 +235,6 @@ pub(super) fn run(
         let _ = events.send(Event::Error(format!("History: {e}")));
     }
     let mut flush = Instant::now();
-    let mut estimator = None;
     let mut pending_settings = None;
     let mut pending_activities = VecDeque::new();
     let mut pending_usage: Vec<UsageObservation> = Vec::new();
@@ -221,16 +272,30 @@ pub(super) fn run(
                     Ok(())
                 }
             }
-            Ok(Storage::Insights(key, until, id)) => {
-                let result = query_database(
-                    &mut database,
-                    &folder.join("history.db"),
-                    &mut pending_usage,
-                    &mut estimator,
-                    &mut pending_activities,
-                )
-                .and_then(|db| db.query_insights(&key, until));
-                let _ = events.send(Event::Insights(id, result.map(Box::new)));
+            Ok(Storage::Insights(key, until, id, cancelled)) => {
+                if !cancelled.load(Ordering::Relaxed) {
+                    let result = query_database(
+                        &mut database,
+                        &path,
+                        &mut pending_usage,
+                        &mut estimator,
+                        &mut pending_activities,
+                    )
+                    .and_then(|db| {
+                        db.query_insights_if(&key, until, || !cancelled.load(Ordering::Relaxed))
+                    });
+                    if !cancelled.load(Ordering::Relaxed) {
+                        match result {
+                            Ok(Some(data)) => {
+                                let _ = events.send(Event::Insights(id, Ok(Box::new(data))));
+                            }
+                            Err(error) => {
+                                let _ = events.send(Event::Insights(id, Err(error)));
+                            }
+                            Ok(None) => {}
+                        }
+                    }
+                }
                 Ok(())
             }
             Ok(Storage::Save(settings)) => {
@@ -250,35 +315,53 @@ pub(super) fn run(
             Ok(Storage::State(state)) => {
                 // A newer checkpoint supersedes any failed/deferred one. Keep
                 // exactly the latest state until persistence succeeds.
-                estimator = Some(state);
+                if estimator.access != CheckpointAccess::Preserve {
+                    estimator.pending = Some(state);
+                }
                 if let Ok(db) = &mut database {
-                    save_latest(&mut estimator, |state| db.save_estimator(state))
+                    estimator.flush(db)
                 } else {
                     Ok(())
                 }
             }
-            Ok(Storage::History(key, since, until, width, id)) => {
-                let result = query_database(
-                    &mut database,
-                    &folder.join("history.db"),
-                    &mut pending_usage,
-                    &mut estimator,
-                    &mut pending_activities,
-                )
-                .and_then(|db| db.query_with_baseline(&key, since, until, width))
-                .map(|readings| HistorySeries::calendar(readings, since, until));
+            Ok(Storage::History(key, since, until, width, id, cancelled)) => {
+                let result = if cancelled.load(Ordering::Relaxed) {
+                    Err(ProviderError::new("History query cancelled"))
+                } else {
+                    query_database(
+                        &mut database,
+                        &path,
+                        &mut pending_usage,
+                        &mut estimator,
+                        &mut pending_activities,
+                    )
+                    .and_then(|db| {
+                        db.query_cancellable(cancelled, |db| {
+                            db.query_with_baseline(&key, since, until, width)
+                                .map(|readings| HistorySeries::calendar(readings, since, until))
+                        })
+                    })
+                };
                 let _ = events.send(Event::History(id, result));
                 Ok(())
             }
-            Ok(Storage::UsageHistory(key, seconds, until, width, id)) => {
-                let result = query_database(
-                    &mut database,
-                    &folder.join("history.db"),
-                    &mut pending_usage,
-                    &mut estimator,
-                    &mut pending_activities,
-                )
-                .and_then(|db| db.query_usage(&key, until, seconds, width));
+            Ok(Storage::UsageHistory(key, seconds, until, width, id, cancelled)) => {
+                let result = if cancelled.load(Ordering::Relaxed) {
+                    Err(ProviderError::new("History query cancelled"))
+                } else {
+                    query_database(
+                        &mut database,
+                        &path,
+                        &mut pending_usage,
+                        &mut estimator,
+                        &mut pending_activities,
+                    )
+                    .and_then(|db| {
+                        db.query_cancellable(cancelled, |db| {
+                            db.query_usage(&key, until, seconds, width)
+                        })
+                    })
+                };
                 let _ = events.send(Event::History(id, result));
                 Ok(())
             }
@@ -288,13 +371,9 @@ pub(super) fn run(
                 }) {
                     let _ = events.send(Event::Error(format!("Settings save: {e}")));
                 }
-                if let Err(e) = recover_and_flush(
-                    &mut database,
-                    &folder.join("history.db"),
-                    &mut pending_usage,
-                    &mut estimator,
-                )
-                .and_then(|_| flush_activities(&mut database, &mut pending_activities))
+                if let Err(e) =
+                    recover_and_flush(&mut database, &path, &mut pending_usage, &mut estimator)
+                        .and_then(|_| flush_activities(&mut database, &mut pending_activities))
                 {
                     let _ = events.send(Event::Error(format!("History flush: {e}")));
                 }
@@ -311,14 +390,10 @@ pub(super) fn run(
             }) {
                 let _ = events.send(Event::Error(format!("Settings save: {e}")));
             }
-            let result = recover_and_flush(
-                &mut database,
-                &folder.join("history.db"),
-                &mut pending_usage,
-                &mut estimator,
-            )
-            .and_then(|_| flush_activities(&mut database, &mut pending_activities))
-            .and_then(|_| database.as_mut().unwrap().prune_expired(clock.unix()));
+            let result =
+                recover_and_flush(&mut database, &path, &mut pending_usage, &mut estimator)
+                    .and_then(|_| flush_activities(&mut database, &mut pending_activities))
+                    .and_then(|_| database.as_mut().unwrap().prune_expired(clock.unix()));
             if let Err(e) = result {
                 let _ = events.send(Event::Error(format!("History: {e}")));
             }
@@ -350,7 +425,7 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
         save_latest(&mut pending, |s| hb_storage::save_settings(&path, s)).unwrap();
         assert!(pending.is_none());
-        assert_eq!(hb_storage::load_settings(&path).low, 15);
+        assert_eq!(hb_storage::load_settings(&path).unwrap().low, 15);
     }
 
     fn activity(timestamp: i64, kind: PollingActivityKind) -> PollingActivity {
@@ -358,6 +433,7 @@ mod tests {
             key: "synthetic:mouse".into(),
             timestamp,
             session: 1,
+            sequence: 1,
             kind,
             rate: PollingRate::try_from(4000).unwrap(),
             previous: PollingRate::try_from(1000).ok(),
@@ -387,7 +463,12 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(pending.len(), 2);
+        let same_second = PollingActivity {
+            sequence: 2,
+            ..activity(100, PollingActivityKind::Boost)
+        };
+        assert!(record_activity(&mut database, same_second, &mut pending).is_err());
+        assert_eq!(pending.len(), 3);
         database = Store::open(&path);
         // This duplicate represents replay after an uncertain previous commit.
         record_activity(
@@ -402,7 +483,7 @@ mod tests {
             .unwrap()
             .query_insights("synthetic:mouse", 300)
             .unwrap();
-        assert_eq!(insights.recent.boost_sessions, 1);
+        assert_eq!(insights.recent.boost_sessions, 2);
         assert_eq!(insights.recent.restores, 1);
         flush_activities(&mut database, &mut pending).unwrap();
         assert!(pending.is_empty());
@@ -557,20 +638,42 @@ mod tests {
         let mut database = Store::open(&path);
         assert!(database.is_err());
         let mut pending = vec![observation("synthetic", 100, 77)];
-        let mut state = Some(estimator(120.0));
+        let mut state = EstimatorCheckpoint::new(false);
+        state.pending = Some(estimator(120.0));
         assert!(recover_and_flush(&mut database, &path, &mut pending, &mut state).is_err());
         assert_eq!(pending.len(), 1);
-        assert!(state.is_some());
+        assert!(state.pending.is_some());
         std::fs::remove_dir(&path).unwrap();
         recover_and_flush(&mut database, &path, &mut pending, &mut state).unwrap();
         assert!(pending.is_empty());
-        assert!(state.is_none());
+        assert!(state.pending.is_none());
+        assert!(state.access == CheckpointAccess::Replace);
         let store = Store::read_only(&path).unwrap();
         assert_eq!(
             store.query("synthetic", 0, 200, 10).unwrap()[0].level,
             Some(77)
         );
         assert_eq!(store.load_estimator().devices["synthetic"].usage, 120.0);
+    }
+
+    #[test]
+    fn unreadable_boot_checkpoint_is_protected_when_the_database_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut store = Store::open(&path).unwrap();
+        store.save_estimator(&estimator(3600.0)).unwrap();
+        drop(store);
+
+        let mut database = Err(ProviderError::new("Synthetic inaccessible history"));
+        let mut checkpoint = EstimatorCheckpoint::new(false);
+        checkpoint.pending = Some(Estimator::default());
+        recover_and_flush(&mut database, &path, &mut Vec::new(), &mut checkpoint).unwrap();
+        assert!(checkpoint.access == CheckpointAccess::Preserve);
+        assert!(checkpoint.pending.is_none());
+        assert_eq!(
+            database.unwrap().load_estimator().devices["synthetic"].usage,
+            3600.0
+        );
     }
 
     fn observation(key: &str, timestamp: i64, level: u8) -> UsageObservation {

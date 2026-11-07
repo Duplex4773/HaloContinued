@@ -294,7 +294,10 @@ impl InsightsBuilder {
             let continuous = self.contiguous
                 && previous.is_some_and(|p| {
                     discharging(&p.reading)
-                        && delta.is_some_and(|seconds| (1..=600).contains(&seconds))
+                        && delta.is_some_and(|seconds| {
+                            (1..=i64::from(crate::usage_gap_seconds(p.reading.next_poll_seconds)))
+                                .contains(&seconds)
+                        })
                         && reading.via == p.reading.via
                         && observation.polling_rate == p.polling_rate
                         && observation.session == p.session
@@ -442,7 +445,10 @@ impl InsightsBuilder {
         let fresh = self.previous.as_ref().is_some_and(|previous| {
             timestamp
                 .checked_sub(previous.reading.timestamp)
-                .is_some_and(|age| (0..=600).contains(&age))
+                .is_some_and(|age| {
+                    (0..=i64::from(crate::usage_gap_seconds(previous.reading.next_poll_seconds)))
+                        .contains(&age)
+                })
         });
         if !fresh {
             self.previous_counted_rate = None;

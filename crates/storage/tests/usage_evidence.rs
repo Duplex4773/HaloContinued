@@ -115,3 +115,37 @@ fn legacy_database_without_metadata_retains_explicitly_observed_usage() {
         60
     );
 }
+
+#[test]
+fn scheduled_long_intervals_count_in_history_insights_and_estimates_without_counting_missed_polls()
+{
+    use hb_core::{Estimator, PollingRate};
+    use std::time::Duration;
+
+    for (with_schedule, expected) in [(false, 0), (true, 7 * 900)] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+        let mut estimator = Estimator::default();
+        let timestamps = (0..8).map(|index| index * 900).chain([9 * 900]);
+        for (index, timestamp) in timestamps.enumerate() {
+            let mut observation = sample(timestamp, Some(1));
+            observation.reading.level = Some(96 - index as u8 * 2);
+            observation.polling_rate = PollingRate::try_from(1000).ok();
+            if with_schedule {
+                observation.reading.set_next_poll(Duration::from_secs(900));
+            }
+            estimator.record(&observation.reading, timestamp as f64);
+            store.record_usage(&observation).unwrap();
+        }
+        store.flush().unwrap();
+        let graph = store.query_usage("synthetic", 9 * 900, 86400, 100).unwrap();
+        assert_eq!(graph.until, expected);
+        let insights = store.query_insights("synthetic", 9 * 900).unwrap();
+        assert_eq!(insights.coverage.awake_seconds, expected as u64);
+        assert_eq!(estimator.devices["synthetic"].usage, expected as f64);
+        assert_eq!(
+            estimator.seconds_left("synthetic", Some(80)).is_some(),
+            with_schedule
+        );
+    }
+}

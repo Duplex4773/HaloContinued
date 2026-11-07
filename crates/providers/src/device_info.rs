@@ -103,7 +103,7 @@ pub fn execute(
                 "The connection changed. Open Device info again.",
             ));
         }
-        let devices = hid.enumerate(0x1532)?;
+        let devices = hid.enumerate_shared(0x1532)?;
         if devices.len() > 512 {
             return Err(ProviderError::new(
                 "Device information is unavailable. Try Refresh information.",

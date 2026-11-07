@@ -19,6 +19,7 @@ pub use history::Estimator;
 pub use history_plot::{HistoryAxis, HistorySample, HistorySeries};
 use serde::{Deserialize, Serialize};
 pub use settings::{DevicePreferences, Settings};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,7 +57,19 @@ pub struct Reading {
     pub serial: Option<String>,
     pub container: Option<String>,
     pub timestamp: i64,
+    /// Planned delay to the next battery poll when it can exceed the legacy gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_poll_seconds: Option<u16>,
 }
+
+/// Count a scheduled long interval with modest room for query and queue latency.
+/// Legacy readings keep the original ten-minute ceiling.
+pub fn usage_gap_seconds(next_poll_seconds: Option<u16>) -> u16 {
+    next_poll_seconds
+        .filter(|seconds| *seconds <= 3600)
+        .map_or(600, |seconds| (seconds + 30).max(600))
+}
+
 impl Reading {
     pub fn new(
         key: impl Into<String>,
@@ -79,7 +92,13 @@ impl Reading {
             via: String::new(),
             serial: None,
             container: None,
+            next_poll_seconds: None,
         }
+    }
+    pub fn set_next_poll(&mut self, delay: Duration) {
+        self.next_poll_seconds = u16::try_from(delay.as_secs())
+            .ok()
+            .filter(|seconds| usage_gap_seconds(Some(*seconds)) > usage_gap_seconds(None));
     }
     pub fn online(&self) -> bool {
         self.connection == Connection::Online
@@ -157,7 +176,27 @@ pub trait HidTransport: Send + Sync {
         None
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError>;
+    /// Immutable metadata, safe to retain while a later connection generation
+    /// replaces the cache. Device access still revalidates generation/stamps.
+    fn enumerate_shared(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
+        self.enumerate(vendor).map(Into::into)
+    }
     fn open(&self, info: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError>;
+}
+/// No allocation for an empty inventory; populated snapshots share the existing
+/// immutable metadata until their last in-flight reader releases it.
+#[derive(Clone, Default)]
+pub struct HidSnapshot(Option<Arc<[HidInfo]>>);
+impl From<Vec<HidInfo>> for HidSnapshot {
+    fn from(devices: Vec<HidInfo>) -> Self {
+        Self((!devices.is_empty()).then(|| devices.into()))
+    }
+}
+impl std::ops::Deref for HidSnapshot {
+    type Target = [HidInfo];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().unwrap_or(&[])
+    }
 }
 pub trait Clock: Send + Sync {
     fn unix(&self) -> i64;

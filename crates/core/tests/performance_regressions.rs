@@ -8,6 +8,41 @@ use support::allocation_counter::{TrackingAllocator, measure};
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
 #[test]
+fn a_poll_does_not_copy_unrelated_device_metadata() {
+    let run = |name_length| {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut other = reading("other", 0, 80);
+        other.name = "x".repeat(name_length);
+        engine.apply("other", Ok(vec![other]), 0., false);
+        engine.apply("test", Ok(vec![reading("invented", 0, 80)]), 0., false);
+        let update = vec![reading("invented", 60, 80)];
+        let (_, allocations) = measure(|| {
+            assert!(engine.apply("test", Ok(update), 60., false).is_empty());
+        });
+        assert_eq!(
+            engine
+                .snapshot(60)
+                .devices
+                .iter()
+                .find(|d| d.reading.key == "other")
+                .unwrap()
+                .name
+                .len(),
+            name_length
+        );
+        allocations
+    };
+    let short = run(8);
+    let long = run(64 * 1024);
+    assert_eq!(short.calls, long.calls);
+    assert_eq!(
+        short.bytes, long.bytes,
+        "Unrelated metadata was copied: {short:?} -> {long:?}"
+    );
+    println!("Poll allocation independent of unrelated label size: {short:?}");
+}
+
+#[test]
 fn snapshot_allocation_budget_for_eight_devices() {
     let mut engine = Engine::new(Settings::default(), Estimator::default());
     engine.apply(

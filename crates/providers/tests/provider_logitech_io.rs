@@ -577,7 +577,11 @@ fn razer_every_catalog_preferred_id_is_reached_after_wrong_first_transaction() {
     use hb_providers::protocols::razer_request;
     let tids: std::collections::BTreeSet<_> = hb_providers::catalog::DEVICES
         .iter()
-        .filter(|d| d.provider == "razer" && ![0x555, 0x556].contains(&d.pid))
+        .filter(|d| {
+            d.provider == "razer"
+                && !d.variant.starts_with("pr:")
+                && ![0x555, 0x556].contains(&d.pid)
+        })
         .map(|d| d.parameter)
         .collect();
     assert_eq!(

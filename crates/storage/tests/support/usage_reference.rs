@@ -88,7 +88,7 @@ fn stream_usage(
         .map_err(sql_error)?;
     // Continuity needs only time and awake state, not another owned copy
     // of every reading and its strings during both chart passes.
-    let mut previous: Option<(i64, bool, Option<u64>)> = None;
+    let mut previous: Option<(i64, bool, Option<u64>, u16)> = None;
     let mut total = 0i64;
     while let Some(row) = rows.next().map_err(sql_error)? {
         let timestamp: i64 = row.get(0).map_err(sql_error)?;
@@ -123,17 +123,22 @@ fn stream_usage(
             },
         };
         let reading_awake = awake(&reading);
-        if let Some((timestamp, true, previous_session)) = previous
+        if let Some((timestamp, true, previous_session, limit)) = previous
             && reading_awake
             && previous_session == session
             && reading
                 .timestamp
                 .checked_sub(timestamp)
-                .is_some_and(|delta| (1..=600).contains(&delta))
+                .is_some_and(|delta| (1..=i64::from(limit)).contains(&delta))
         {
             total = total.saturating_add(reading.timestamp - timestamp);
         }
-        previous = Some((reading.timestamp, reading_awake, session));
+        previous = Some((
+            reading.timestamp,
+            reading_awake,
+            session,
+            hb_core::usage_gap_seconds(reading.next_poll_seconds),
+        ));
         visit(reading, total);
     }
     Ok(total)

@@ -26,8 +26,6 @@ pub enum Command {
     },
     ConfigurationVisible(bool),
     ConfigurationRefresh,
-    Suspend,
-    Resume,
     NotificationFailed(Notification),
     Settings(Settings),
     History {
@@ -36,6 +34,7 @@ pub enum Command {
         until: i64,
         width: usize,
         request: u64,
+        cancelled: Arc<AtomicBool>,
     },
     UsageHistory {
         key: String,
@@ -43,11 +42,13 @@ pub enum Command {
         until: i64,
         width: usize,
         request: u64,
+        cancelled: Arc<AtomicBool>,
     },
     Insights {
         key: String,
         until: i64,
         request: u64,
+        cancelled: Arc<AtomicBool>,
     },
     Polling(ControlRequest, u64, Option<u64>),
     Sleep(SleepRequest, u64, u64),
@@ -93,9 +94,9 @@ pub(super) enum Storage {
     State(Estimator),
     Status(Snapshot, bool),
     RemoveStatus,
-    History(String, i64, i64, usize, u64),
-    UsageHistory(String, i64, i64, usize, u64),
-    Insights(String, i64, u64),
+    History(String, i64, i64, usize, u64, Arc<AtomicBool>),
+    UsageHistory(String, i64, i64, usize, u64, Arc<AtomicBool>),
+    Insights(String, i64, u64, Arc<AtomicBool>),
     Quit,
 }
 #[cfg(test)]
@@ -586,13 +587,20 @@ impl SnapshotPublisher {
             return;
         }
         if self.changed || self.unpublished {
-            let snapshot = engine.snapshot(timestamp);
             self.unpublished = if engine.settings.status_file {
-                let rejected = events.try_send(Event::Snapshot(snapshot.clone())).is_err();
+                let snapshot = engine.snapshot(timestamp);
+                let rejected = events.tx.is_full()
+                    || events.try_send(Event::Snapshot(snapshot.clone())).is_err();
                 let _ = storage.send(Storage::Status(snapshot, true));
                 rejected
+            } else if events.tx.is_full() {
+                // Native menus can hold the UI up. Keep only the dirty flag;
+                // reconstruct the latest state when the bounded queue has room.
+                true
             } else {
-                events.try_send(Event::Snapshot(snapshot)).is_err()
+                events
+                    .try_send(Event::Snapshot(engine.snapshot(timestamp)))
+                    .is_err()
             };
         } else {
             // Freshness labels and theme recovery keep the same cadence without
@@ -664,24 +672,77 @@ fn completed_observations(
     }
     observations
 }
+/// Preferences that can change the safety or ownership of queued native I/O.
+/// A saved manual rate is already handled by the per-device command.
+#[derive(PartialEq, Eq)]
+struct ControlPolicy {
+    enabled: bool,
+    restore_on_startup: bool,
+    playstation_full_mode: bool,
+    bluetooth: bool,
+    disabled_providers: BTreeSet<String>,
+    automation: BTreeMap<
+        String,
+        (
+            Option<PollingRate>,
+            Option<hb_core::settings::LowBatteryMode>,
+        ),
+    >,
+}
+impl From<&Settings> for ControlPolicy {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            enabled: settings.polling_controls,
+            restore_on_startup: settings.restore_polling_on_startup,
+            playstation_full_mode: settings.playstation_full_mode,
+            bluetooth: settings.bluetooth,
+            disabled_providers: settings.disabled_providers.clone(),
+            automation: settings
+                .devices
+                .iter()
+                .filter_map(|(key, preference)| {
+                    let boost = preference.fullscreen_boost_rate;
+                    let saver = preference.low_battery_mode;
+                    (boost.is_some() || saver.is_some()).then(|| (key.clone(), (boost, saver)))
+                })
+                .collect(),
+        }
+    }
+}
+struct SettingsMailbox {
+    policy: ControlPolicy,
+    pending: Option<(Settings, Option<u64>)>,
+}
 pub(crate) struct ControlPermission {
     enabled: AtomicBool,
     epoch: AtomicU64,
     suspended: AtomicBool,
     desired_enabled: AtomicBool,
     acknowledged: AtomicU64,
-    pending_settings: Mutex<Option<(Settings, u64)>>,
+    settings: Mutex<SettingsMailbox>,
     pending_resume: AtomicU64,
 }
 impl ControlPermission {
+    #[cfg(test)]
     fn new(enabled: bool) -> Self {
+        Self::for_settings(&Settings {
+            polling_controls: enabled,
+            ..Settings::default()
+        })
+    }
+
+    fn for_settings(settings: &Settings) -> Self {
+        let enabled = settings.polling_controls;
         Self {
             enabled: AtomicBool::new(enabled),
             epoch: AtomicU64::new(0),
             suspended: AtomicBool::new(false),
             desired_enabled: AtomicBool::new(enabled),
             acknowledged: AtomicU64::new(0),
-            pending_settings: Mutex::new(None),
+            settings: Mutex::new(SettingsMailbox {
+                policy: ControlPolicy::from(settings),
+                pending: None,
+            }),
             pending_resume: AtomicU64::new(0),
         }
     }
@@ -835,6 +896,39 @@ fn vendor_gate_busy(job: WorkerJob) -> WorkerCompleted {
         }
     }
 }
+/// System callbacks can revoke writes while the UI state is borrowed by Windows.
+pub(super) struct PowerSignals {
+    commands: Sender<Command>,
+    permission: Arc<ControlPermission>,
+}
+impl PowerSignals {
+    pub(super) fn notify(&self, suspended: bool) {
+        self.permission.enabled.store(false, Ordering::Release);
+        let epoch = self.permission.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.permission
+            .suspended
+            .store(suspended, Ordering::Release);
+        let command = if suspended {
+            Command::EpochSuspend(epoch)
+        } else {
+            Command::EpochResume(epoch)
+        };
+        if let Err(TrySendError::Full(Command::EpochResume(epoch))) =
+            self.commands.try_send(command)
+        {
+            // Preserve the exact epoch so a later suspend cannot be undone.
+            self.permission
+                .pending_resume
+                .fetch_max(epoch, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn suspended(&self) -> bool {
+        self.permission.suspended.load(Ordering::Acquire)
+    }
+}
+
 pub struct Runtime {
     commands: Sender<Command>,
     pub events: Receiver<Event>,
@@ -852,7 +946,7 @@ impl Runtime {
         let (commands, rx) = bounded(32);
         let (events, events_rx) = bounded(64);
         let cancelled = cancel.clone();
-        let permission = Arc::new(ControlPermission::new(settings.polling_controls));
+        let permission = Arc::new(ControlPermission::for_settings(&settings));
         let configuration = Arc::new(ConfigurationWatch::default());
         let lifecycle = Lifecycle {
             cancel: cancelled,
@@ -893,6 +987,12 @@ impl Runtime {
             }
         }
     }
+    pub(super) fn power_signals(&self) -> PowerSignals {
+        PowerSignals {
+            commands: self.commands.clone(),
+            permission: self.permission.clone(),
+        }
+    }
     pub fn send(&self, command: Command) {
         let command = match command {
             Command::ConfigurationVisible(visible) => {
@@ -902,41 +1002,32 @@ impl Runtime {
                 Command::ConfigurationVisible(visible)
             }
             Command::Settings(settings) => {
-                self.permission.enabled.store(false, Ordering::Release);
-                let epoch = self.permission.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-                self.permission
-                    .desired_enabled
-                    .store(settings.polling_controls, Ordering::Release);
-                *self
+                let policy = ControlPolicy::from(&settings);
+                let mut mailbox = self
                     .permission
-                    .pending_settings
+                    .settings
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = Some((settings, epoch));
+                    .unwrap_or_else(|p| p.into_inner());
+                let epoch = if mailbox.policy != policy {
+                    self.permission.enabled.store(false, Ordering::Release);
+                    let epoch = self.permission.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                    self.permission
+                        .desired_enabled
+                        .store(policy.enabled, Ordering::Release);
+                    mailbox.policy = policy;
+                    Some(epoch)
+                } else {
+                    // A cosmetic save can replace the payload, but not a pending
+                    // revocation that still has to be acknowledged by the owner.
+                    mailbox.pending.as_ref().and_then(|(_, epoch)| *epoch)
+                };
+                mailbox.pending = Some((settings, epoch));
                 Command::SettingsChanged
-            }
-            Command::Suspend => {
-                self.permission.suspended.store(true, Ordering::Release);
-                self.permission.enabled.store(false, Ordering::Release);
-                let epoch = self.permission.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-                Command::EpochSuspend(epoch)
-            }
-            Command::Resume => {
-                self.permission.suspended.store(false, Ordering::Release);
-                self.permission.enabled.store(false, Ordering::Release);
-                let epoch = self.permission.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-                Command::EpochResume(epoch)
             }
             command => command,
         };
         match self.commands.try_send(command) {
             Ok(()) => {}
-            Err(TrySendError::Full(Command::EpochResume(epoch))) => {
-                // Keep the exact epoch; a later suspend or settings change will
-                // invalidate it before it can reauthorize device controls.
-                self.permission
-                    .pending_resume
-                    .fetch_max(epoch, Ordering::AcqRel);
-            }
             Err(error) => {
                 let message = if matches!(error, TrySendError::Disconnected(_)) {
                     "Device monitoring stopped. Restart Halo Continued."
@@ -1009,12 +1100,14 @@ impl Runtime {
         key: String,
         until: i64,
         request: u64,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<(), ProviderError> {
         self.commands
             .try_send(Command::Insights {
                 key,
                 until,
                 request,
+                cancelled,
             })
             .map_err(|_| {
                 ProviderError::new("Battery history is busy. Select Refresh to try again.")
@@ -2113,8 +2206,12 @@ impl HidTransport for InventoryTransport<'_> {
         self.hid.generation()
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
+        self.enumerate_shared(vendor)
+            .map(|devices| devices.to_vec())
+    }
+    fn enumerate_shared(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
         self.active()?;
-        let result = self.hid.enumerate(vendor);
+        let result = self.hid.enumerate_shared(vendor);
         self.active()?;
         result
     }
@@ -2755,13 +2852,17 @@ impl HidTransport for InfoTransport<'_> {
         self.hid.connection_stamp(info)
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
+        self.enumerate_shared(vendor)
+            .map(|devices| devices.to_vec())
+    }
+    fn enumerate_shared(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
         self.access.active()?;
         if vendor != 0x1532 {
             return Err(ProviderError::new(
                 "Firmware reads are unavailable for this brand.",
             ));
         }
-        let value = self.hid.enumerate(vendor)?;
+        let value = self.hid.enumerate_shared(vendor)?;
         self.access.active()?;
         Ok(value)
     }
@@ -2884,6 +2985,10 @@ impl HidTransport for ControlTransport<'_> {
         self.hid.connection_stamp(info)
     }
     fn enumerate(&self, vendor: u16) -> Result<Vec<HidInfo>, ProviderError> {
+        self.enumerate_shared(vendor)
+            .map(|devices| devices.to_vec())
+    }
+    fn enumerate_shared(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
         if self.boost.as_ref().is_some_and(|g| !g.active()) {
             return Err(ProviderError::new(
                 "Fullscreen polling transition cancelled",
@@ -2901,7 +3006,7 @@ impl HidTransport for ControlTransport<'_> {
                 "Keyboard configuration cancelled: Devices is no longer visible",
             ));
         }
-        self.hid.enumerate(vendor)
+        self.hid.enumerate_shared(vendor)
     }
     fn open(&self, info: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
         if self.boost.as_ref().is_some_and(|g| !g.active()) {
@@ -3078,7 +3183,6 @@ fn changed_configuration(
     outcome: &ControlOutcome,
     observed: &mut BTreeMap<String, PollingRate>,
 ) -> bool {
-    let first_confirmation = !observed.contains_key(&outcome.key);
     if observed.len() >= 512 && !observed.contains_key(&outcome.key) {
         observed.pop_first();
     }
@@ -3090,8 +3194,16 @@ fn changed_configuration(
     };
     let changed = observed
         .insert(outcome.key.clone(), rate)
-        .is_none_or(|before| before != rate);
-    first_confirmation || changed || outcome.confirmed_change()
+        .is_some_and(|before| before != rate);
+    changed || outcome.confirmed_change()
+}
+
+fn estimator_state(estimator: &Estimator, rates: &BTreeMap<String, PollingRate>) -> Storage {
+    let mut state = estimator.clone();
+    for (key, discharge) in &mut state.devices {
+        discharge.polling_rate = rates.get(key).copied();
+    }
+    Storage::State(state)
 }
 fn finish_sleep_outcome(
     saver: &mut crate::battery_saver::BatterySaver,
@@ -3188,6 +3300,7 @@ fn finish_sleep_completion(
 struct UsageTracker {
     actions: BTreeMap<u64, (PollingActivityKind, PollingRate)>,
     session: u64,
+    activity_sequence: u64,
     generation: u64,
     enabled: bool,
     rates: BTreeMap<String, PollingObservation>,
@@ -3205,6 +3318,7 @@ impl UsageTracker {
         Self {
             actions: BTreeMap::new(),
             session,
+            activity_sequence: 0,
             generation,
             enabled,
             rates: BTreeMap::new(),
@@ -3311,10 +3425,13 @@ impl UsageTracker {
         {
             return None;
         }
+        let session = *self.device_sessions.get(&outcome.key)?;
+        self.activity_sequence += 1;
         Some(PollingActivity {
             key: outcome.key.clone(),
             timestamp: observation.timestamp,
-            session: *self.device_sessions.get(&outcome.key)?,
+            session,
+            sequence: self.activity_sequence,
             kind,
             rate: expected,
             previous: outcome.previous,
@@ -3537,7 +3654,13 @@ fn run(
     let mut configuration_inflight = false;
     let mut configuration_due = Instant::now();
     let mut configuration_dirty = false;
-    let mut observed_rates = BTreeMap::new();
+    let mut observed_rates = engine
+        .estimator
+        .devices
+        .iter()
+        .filter_map(|(key, discharge)| discharge.polling_rate.map(|rate| (key.clone(), rate)))
+        .take(512)
+        .collect::<BTreeMap<_, _>>();
     let mut usage_tracker = UsageTracker::new(hid.generation(), engine.settings.polling_controls);
     let mut estimator_dirty = false;
     let mut estimator_checkpoint = Instant::now();
@@ -3555,23 +3678,26 @@ fn run(
             control_cancel.store(true, Ordering::Relaxed);
         }
         let latest_settings = permission
-            .pending_settings
+            .settings
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .pending
             .take();
         if let Some((s, epoch)) = latest_settings {
             if !engine.settings.polling_controls && s.polling_controls {
                 recovery_rearm_confirmed = true;
                 recovery_pending = true;
             }
-            startup_polling.cancel();
-            boost.settings_changed();
-            saver.settings_changed();
+            if epoch.is_some() {
+                startup_polling.cancel();
+                boost.settings_changed();
+                saver.settings_changed();
+                control_cancel.store(true, Ordering::Relaxed);
+                control_cancel = Arc::new(AtomicBool::new(!s.polling_controls));
+            }
             let previous = engine.readings();
             snapshots.changed = true;
             let remove = engine.settings.status_file && !s.status_file;
-            control_cancel.store(true, Ordering::Relaxed);
-            control_cancel = Arc::new(AtomicBool::new(!s.polling_controls));
             engine.update_settings(s.clone());
             release_inactive_provider_handles(&mut providers, &engine.settings, suspended);
             let current = engine.readings();
@@ -3589,14 +3715,16 @@ fn run(
             for id in providers.keys() {
                 due.insert(id, Instant::now());
             }
-            permission.enabled.store(
-                engine.settings.polling_controls
-                    && permission.desired_enabled.load(Ordering::Acquire)
-                    && !permission.suspended.load(Ordering::Acquire),
-                Ordering::Release,
-            );
-            // A stale acknowledgment cannot authorize work with a newer epoch.
-            permission.acknowledged.store(epoch, Ordering::Release);
+            if let Some(epoch) = epoch {
+                permission.enabled.store(
+                    engine.settings.polling_controls
+                        && permission.desired_enabled.load(Ordering::Acquire)
+                        && !permission.suspended.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                // A stale acknowledgment cannot authorize work with a newer epoch.
+                permission.acknowledged.store(epoch, Ordering::Release);
+            }
         }
         let requested_suspend = permission.suspended.load(Ordering::Acquire);
         // Revocation is immediate even if its command/settings acknowledgment
@@ -3769,6 +3897,8 @@ fn run(
             r.level = Some(73);
             r.charging = Some(true);
             r.kind = "mouse".into();
+            let delay = effective_interval(engine.settings.interval, quiet);
+            r.set_next_poll(delay);
             engine.apply(
                 "simulation",
                 Ok(vec![r]),
@@ -3777,7 +3907,7 @@ fn run(
             );
             estimator_dirty = true;
             for t in due.values_mut() {
-                *t = Instant::now() + effective_interval(engine.settings.interval, quiet);
+                *t = Instant::now() + delay;
             }
             usage_tracker.synchronize(
                 hid.generation(),
@@ -4083,8 +4213,11 @@ fn run(
                 until,
                 width,
                 request,
+                cancelled,
             })) => {
-                let _ = storage.send(Storage::History(key, since, until, width, request));
+                let _ = storage.send(Storage::History(
+                    key, since, until, width, request, cancelled,
+                ));
             }
             Work::Command(Ok(Command::UsageHistory {
                 key,
@@ -4092,15 +4225,21 @@ fn run(
                 until,
                 width,
                 request,
+                cancelled,
             })) => {
-                let _ = storage.send(Storage::UsageHistory(key, seconds, until, width, request));
+                let _ = storage.send(Storage::UsageHistory(
+                    key, seconds, until, width, request, cancelled,
+                ));
             }
             Work::Command(Ok(Command::Insights {
                 key,
                 until,
                 request,
+                cancelled,
             })) => {
-                let _ = storage.send(Storage::Insights(key, until, request));
+                if !cancelled.load(Ordering::Relaxed) {
+                    let _ = storage.send(Storage::Insights(key, until, request, cancelled));
+                }
             }
             Work::Command(Ok(Command::DeviceChanged { arrival_or_removal })) => {
                 // Plug/unplug remains responsive while gaming. Routine property
@@ -4140,6 +4279,20 @@ fn run(
                 snapshots.changed |= current && battery_affects_snapshot(&engine, id, &r.result);
                 diagnostics_dirty |=
                     update_diagnostics(&mut diagnostics, id, r.provider.diagnostics());
+                if !current {
+                    r.provider.invalidate();
+                }
+                let delay = battery_provider_delay(
+                    id,
+                    engine.settings.interval,
+                    quiet,
+                    r.provider.next_poll_delay(),
+                );
+                if current && let Ok(readings) = &mut r.result {
+                    for reading in readings.iter_mut().filter(|reading| reading.online()) {
+                        reading.set_next_poll(delay);
+                    }
+                }
                 let observations = completed_observations(
                     engine.provider_readings(id),
                     &r.result,
@@ -4188,15 +4341,6 @@ fn run(
                     }
                 }
                 estimator_dirty |= !observations.is_empty();
-                if !current {
-                    r.provider.invalidate();
-                }
-                let delay = battery_provider_delay(
-                    id,
-                    engine.settings.interval,
-                    quiet,
-                    r.provider.next_poll_delay(),
-                );
                 let delay = startup_discovery_delay(
                     delay,
                     !engine.has_readings(),
@@ -4625,7 +4769,7 @@ fn run(
                     if changed_configuration(&outcome, &mut observed_rates) {
                         engine.reset_estimate(&outcome.key);
                         snapshots.changed = true;
-                        let _ = storage.send(Storage::State(engine.estimator.clone()));
+                        let _ = storage.send(estimator_state(&engine.estimator, &observed_rates));
                     }
                     usage_tracker.synchronize(
                         hid.generation(),
@@ -4755,7 +4899,7 @@ fn run(
                 if changed_configuration(&outcome, &mut observed_rates) {
                     engine.reset_estimate(&outcome.key);
                     snapshots.changed = true;
-                    let _ = storage.send(Storage::State(engine.estimator.clone()));
+                    let _ = storage.send(estimator_state(&engine.estimator, &observed_rates));
                 }
                 diagnostics_dirty |= update_diagnostics(
                     &mut diagnostics,
@@ -4787,9 +4931,7 @@ fn run(
                 Command::SettingsChanged
                 | Command::EpochSuspend(_)
                 | Command::EpochResume(_)
-                | Command::Settings(_)
-                | Command::Suspend
-                | Command::Resume,
+                | Command::Settings(_),
             )) => {}
             Work::Completed(Err(_)) | Work::Idle => {}
         }
@@ -4802,7 +4944,7 @@ fn run(
             // learned state on every runtime wake until it catches up.
             estimator_checkpoint = Instant::now();
             if storage
-                .try_send(Storage::State(engine.estimator.clone()))
+                .try_send(estimator_state(&engine.estimator, &observed_rates))
                 .is_ok()
             {
                 estimator_dirty = false;
@@ -4848,7 +4990,7 @@ fn run(
         .map(|r| availability_boundary(r, Connection::Stale, clock.unix()))
         .collect();
     let _ = storage.send(Storage::UsageSample(usage_tracker.samples(boundaries)));
-    let _ = storage.send(Storage::State(engine.estimator.clone()));
+    let _ = storage.send(estimator_state(&engine.estimator, &observed_rates));
     if engine.settings.status_file {
         let _ = storage.send(Storage::Status(engine.snapshot(clock.unix()), false));
     }
@@ -6781,6 +6923,52 @@ mod tests {
         assert!(disconnected.observation.is_none());
     }
     #[test]
+    fn backpressured_snapshots_allocate_nothing_and_keep_the_latest_state() {
+        let (tx, events) = bounded(1);
+        let sink = Events {
+            tx,
+            window: Arc::new(AtomicUsize::new(0)),
+        };
+        let (storage, statuses) = bounded(1);
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut reading = Reading::new("device", "Device", "test", 100);
+        reading.level = Some(80);
+        engine.apply("test", Ok(vec![reading.clone()]), 1.0, false);
+        let start = Instant::now();
+        let mut publisher = SnapshotPublisher::new(start);
+        sink.try_send(Event::Heartbeat(99)).unwrap();
+        let (_, previous) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                std::hint::black_box(engine.snapshot(100));
+            }
+        });
+        let (_, actual) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                publisher.changed = true;
+                publisher.publish(&engine, 100, start, &sink, &storage);
+            }
+        });
+        eprintln!("1,000 blocked snapshot attempts: previous={previous:?}, actual={actual:?}");
+        assert_eq!(actual.calls, 0);
+        assert!(publisher.unpublished);
+        assert!(statuses.is_empty());
+        reading.level = Some(79);
+        engine.apply("test", Ok(vec![reading]), 2.0, false);
+        events.try_recv().unwrap();
+        publisher.publish(
+            &engine,
+            105,
+            start + Duration::from_secs(5),
+            &sink,
+            &storage,
+        );
+        let Event::Snapshot(snapshot) = events.try_recv().unwrap() else {
+            panic!("missing snapshot")
+        };
+        assert_eq!(snapshot.devices[0].reading.level, Some(79));
+        assert!(!publisher.unpublished);
+    }
+    #[test]
     fn unchanged_snapshots_use_lightweight_ticks_and_retry_rejected_state_at_normal_cadence() {
         let (tx, events) = bounded(1);
         let sink = Events {
@@ -7082,6 +7270,7 @@ mod tests {
                 Vec::new()
             })
         }
+
         fn open(&self, _: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
             panic!("passive discovery cannot open")
         }
@@ -7670,8 +7859,22 @@ mod tests {
             }]))
             .unwrap();
         }
-        tx.send(Storage::Insights("synthetic".into(), 2500, 12))
-            .unwrap();
+        // An obsolete queued query must not emit a result or prevent the next
+        // request from flushing and reading the pending observations.
+        tx.send(Storage::Insights(
+            "synthetic".into(),
+            2500,
+            11,
+            Arc::new(AtomicBool::new(true)),
+        ))
+        .unwrap();
+        tx.send(Storage::Insights(
+            "synthetic".into(),
+            2500,
+            12,
+            Arc::new(AtomicBool::new(false)),
+        ))
+        .unwrap();
         let Event::Insights(12, result) = events.recv_timeout(Duration::from_secs(5)).unwrap()
         else {
             panic!("missing insights")
@@ -8724,7 +8927,11 @@ mod tests {
     fn startup_restore_simulated_runtime_emits_confirmed_unsolicited_outcome() {
         let _native_guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut runtime = Runtime::start(dir.path().to_owned(), startup_settings(), true).unwrap();
+        let mut settings = startup_settings();
+        let mut runtime = Runtime::start(dir.path().to_owned(), settings.clone(), true).unwrap();
+        settings.animation = !settings.animation;
+        runtime.send(Command::Settings(settings));
+        assert_eq!(runtime.permission.epoch.load(Ordering::Acquire), 0);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut confirmed = None;
         while Instant::now() < deadline {
@@ -8924,7 +9131,11 @@ mod tests {
                 .submit_control(control_request(ControlAction::Read, 0))
                 .is_err()
         );
-        assert!(runtime.request_insights("device".into(), 100, 1).is_err());
+        assert!(
+            runtime
+                .request_insights("device".into(), 100, 1, Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
         assert!(!runtime.release_history_cache());
         assert!(runtime.events.is_empty());
         let history = |usage, request| {
@@ -8935,6 +9146,7 @@ mod tests {
                     until: 100,
                     width: 50,
                     request,
+                    cancelled: Arc::default(),
                 }
             } else {
                 Command::History {
@@ -8943,6 +9155,7 @@ mod tests {
                     until: 100,
                     width: 50,
                     request,
+                    cancelled: Arc::default(),
                 }
             }
         };
@@ -8950,7 +9163,7 @@ mod tests {
             assert!(runtime.request_history(history(usage, 1)).is_err());
         }
         let _ = _rx.recv().unwrap();
-        assert!(runtime.request_history(Command::Resume).is_err());
+        assert!(runtime.request_history(Command::Refresh).is_err());
         assert!(_rx.is_empty());
         for usage in [false, true] {
             runtime.request_history(history(usage, 2)).unwrap();
@@ -8961,13 +9174,19 @@ mod tests {
         }
         assert!(runtime.release_history_cache());
         assert!(matches!(_rx.recv().unwrap(), Command::ReleaseHistoryCache));
-        runtime.request_insights("device".into(), 100, 2).unwrap();
+        runtime
+            .request_insights("device".into(), 100, 2, Arc::new(AtomicBool::new(false)))
+            .unwrap();
         assert!(matches!(
             _rx.recv().unwrap(),
             Command::Insights { request: 2, .. }
         ));
         drop(_rx);
-        assert!(runtime.request_insights("device".into(), 100, 3).is_err());
+        assert!(
+            runtime
+                .request_insights("device".into(), 100, 3, Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
         assert!(runtime.request_history(history(false, 3)).is_err());
         assert!(runtime.request_history(history(true, 3)).is_err());
     }
@@ -9026,8 +9245,8 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             window: Arc::new(AtomicUsize::new(0)),
         };
-        runtime.send(Command::Suspend);
-        runtime.send(Command::Resume);
+        runtime.power_signals().notify(true);
+        runtime.power_signals().notify(false);
         let resume = permission.epoch.load(Ordering::Acquire);
         assert_eq!(permission.pending_resume.load(Ordering::Acquire), resume);
         runtime.retry_pending_resume();
@@ -9040,10 +9259,10 @@ mod tests {
         assert_ne!(permission.acknowledged.load(Ordering::Acquire), resume);
 
         runtime.commands.send(Command::Refresh).unwrap();
-        runtime.send(Command::Resume);
+        runtime.power_signals().notify(false);
         let stale = permission.pending_resume.load(Ordering::Acquire);
         assert_ne!(stale, 0);
-        runtime.send(Command::Suspend);
+        runtime.power_signals().notify(true);
         runtime.retry_pending_resume();
         assert_eq!(permission.pending_resume.load(Ordering::Acquire), 0);
         assert!(matches!(received.try_recv(), Ok(Command::Refresh)));
@@ -9079,7 +9298,7 @@ mod tests {
                 .is_err()
         );
         assert!(matches!(runtime.events.try_recv(), Ok(Event::Error(_))));
-        runtime.send(Command::Suspend);
+        runtime.power_signals().notify(true);
         assert!(permission.suspended.load(Ordering::Acquire));
         assert_eq!(permission.epoch.load(Ordering::Acquire), 2);
         // Even a later enabling acknowledgment cannot authorize a job with epoch0.
@@ -9126,6 +9345,41 @@ mod tests {
         );
     }
     #[test]
+    fn a_read_only_startup_check_preserves_the_fit_until_a_rate_change_is_proven() {
+        let key = "simulated:mouse";
+        let estimator = Estimator::from_value(
+            serde_json::json!({"devices": { key: {
+                "usage": 3600.0, "seen": 10,
+                "samples": [[0, 95], [1200, 94], [2400, 93], [3600, 92]]
+            }}}),
+            10,
+        );
+        let mut current = PollingRate::try_from(1000).unwrap();
+        let mut request = control_request(ControlAction::Read, 0);
+        request.request = STARTUP_POLLING_REQUEST_BIT | STARTUP_POLLING_READ_BIT;
+        let mut known = BTreeMap::new();
+        let read = simulate_control(&request, &mut current, 0, 11);
+        assert!(!changed_configuration(&read, &mut known));
+        let Storage::State(saved) = estimator_state(&estimator, &known) else {
+            panic!("estimator checkpoint")
+        };
+        let reloaded = Estimator::from_value(serde_json::to_value(saved).unwrap(), 12);
+        let saved_rate = reloaded.devices[key].polling_rate.unwrap();
+        assert_eq!(saved_rate, current);
+        assert_eq!(
+            reloaded.seconds_left(key, Some(92)),
+            estimator.seconds_left(key, Some(92))
+        );
+        assert!(reloaded.seconds_left(key, Some(92)).is_some());
+
+        let mut known = BTreeMap::from([(key.to_owned(), saved_rate)]);
+        assert!(!changed_configuration(&read, &mut known));
+        let mut different_rate = PollingRate::try_from(2000).unwrap();
+        let changed = simulate_control(&request, &mut different_rate, 0, 12);
+        assert!(changed_configuration(&changed, &mut known));
+    }
+
+    #[test]
     fn verified_refresh_after_partial_change_resets_estimate_without_claiming_partial_success() {
         let mut current = PollingRate::try_from(1000).unwrap();
         let mut observed = BTreeMap::new();
@@ -9135,7 +9389,7 @@ mod tests {
             0,
             10,
         );
-        assert!(changed_configuration(&read, &mut observed));
+        assert!(!changed_configuration(&read, &mut observed));
         let mut partial = simulate_control(
             &control_request(
                 ControlAction::Apply(PollingRate::try_from(8000).unwrap()),
@@ -9176,13 +9430,13 @@ mod tests {
             low: 17,
             ..Default::default()
         }));
-        runtime.send(Command::Suspend);
-        runtime.send(Command::Resume);
+        runtime.power_signals().notify(true);
+        runtime.power_signals().notify(false);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             while runtime.events.try_recv().is_ok() {}
             if d.path().join("config.json").exists() {
-                let s = hb_storage::load_settings(&d.path().join("config.json"));
+                let s = hb_storage::load_settings(&d.path().join("config.json")).unwrap();
                 if s.low == 17 && !s.polling_controls {
                     break;
                 }
@@ -9301,8 +9555,15 @@ mod tests {
         }))
         .unwrap();
         tx.send(Storage::Status(Snapshot::default(), true)).unwrap();
-        tx.send(Storage::History("mouse".into(), 0, 100, 50, 9))
-            .unwrap();
+        tx.send(Storage::History(
+            "mouse".into(),
+            0,
+            100,
+            50,
+            9,
+            Arc::default(),
+        ))
+        .unwrap();
         loop {
             if let Event::History(9, result) = events.recv_timeout(Duration::from_secs(5)).unwrap()
             {
@@ -9313,7 +9574,9 @@ mod tests {
         tx.send(Storage::Quit).unwrap();
         worker.join().unwrap();
         assert_eq!(
-            hb_storage::load_settings(&d.path().join("config.json")).low,
+            hb_storage::load_settings(&d.path().join("config.json"))
+                .unwrap()
+                .low,
             17
         );
         assert!(d.path().join("status.json").exists());
@@ -9333,8 +9596,15 @@ mod tests {
             reading.level = Some(80);
             reading.charging = Some(false);
             tx.send(Storage::unconfirmed(vec![reading])).unwrap();
-            tx.send(Storage::History("mouse".into(), 0, 100, 40, 99))
-                .unwrap();
+            tx.send(Storage::History(
+                "mouse".into(),
+                0,
+                100,
+                40,
+                99,
+                Arc::default(),
+            ))
+            .unwrap();
             loop {
                 if let Event::History(99, result) =
                     events.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -9345,9 +9615,9 @@ mod tests {
             }
             std::fs::remove_dir(&database).unwrap();
             tx.send(match query {
-                0 => Storage::History("mouse".into(), 0, 100, 40, 1),
-                1 => Storage::UsageHistory("mouse".into(), 3600, 100, 40, 1),
-                _ => Storage::Insights("mouse".into(), 100, 1),
+                0 => Storage::History("mouse".into(), 0, 100, 40, 1, Arc::default()),
+                1 => Storage::UsageHistory("mouse".into(), 3600, 100, 40, 1, Arc::default()),
+                _ => Storage::Insights("mouse".into(), 100, 1, Arc::new(AtomicBool::new(false))),
             })
             .unwrap();
             loop {
@@ -9379,8 +9649,15 @@ mod tests {
             reading.charging = Some(false);
             tx.send(Storage::unconfirmed(vec![reading])).unwrap();
         }
-        tx.send(Storage::UsageHistory("mouse".into(), 3600, 220, 40, 11))
-            .unwrap();
+        tx.send(Storage::UsageHistory(
+            "mouse".into(),
+            3600,
+            220,
+            40,
+            11,
+            Arc::default(),
+        ))
+        .unwrap();
         loop {
             if let Event::History(11, result) = events.recv_timeout(Duration::from_secs(5)).unwrap()
             {
@@ -9405,8 +9682,15 @@ mod tests {
         tx.send(Storage::unconfirmed(vec![r])).unwrap();
         tx.send(Storage::Status(Snapshot::default(), true)).unwrap();
         tx.send(Storage::RemoveStatus).unwrap();
-        tx.send(Storage::History("mouse".into(), 0, 100, 50, 10))
-            .unwrap();
+        tx.send(Storage::History(
+            "mouse".into(),
+            0,
+            100,
+            50,
+            10,
+            Arc::default(),
+        ))
+        .unwrap();
         loop {
             if let Event::History(10, result) = events.recv_timeout(Duration::from_secs(5)).unwrap()
             {

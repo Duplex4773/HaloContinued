@@ -550,5 +550,173 @@
     ],
     "pull_request": 350,
     "revision": "926bfc0affaf293d0c7af0bc949929568281d68f"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62943,
+      "Cougar Revenger Pro 4K",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 354,
+    "revision": "e8775cf8076d6d79f2520a90baa00192ec82cd6b"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62940,
+      "Cougar Revenger Pro (2.4 GHz)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 354,
+    "revision": "e8775cf8076d6d79f2520a90baa00192ec82cd6b"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62942,
+      "Cougar Revenger Pro 4K (wired)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 354,
+    "revision": "e8775cf8076d6d79f2520a90baa00192ec82cd6b"
+  },
+  {
+    "device": [
+      "eweadn",
+      2205,
+      1583,
+      "EWEADN S9",
+      "pr:eweadn",
+      0
+    ],
+    "pull_request": 352,
+    "revision": "c9c75371e00e42d5714416718b40992e4a6ac7e7"
+  },
+  {
+    "device": [
+      "mchose",
+      16868,
+      8193,
+      "MCHOSE K87",
+      "pr:k87",
+      0
+    ],
+    "pull_request": 352,
+    "revision": "c9c75371e00e42d5714416718b40992e4a6ac7e7"
+  },
+  {
+    "device": [
+      "monsgeek",
+      12625,
+      20518,
+      "MonsGeek FUN60 Pro",
+      "pr:monsgeek",
+      0
+    ],
+    "pull_request": 352,
+    "revision": "c9c75371e00e42d5714416718b40992e4a6ac7e7"
+  },
+  {
+    "device": [
+      "jabra",
+      2830,
+      9415,
+      "Jabra Link 380 headset",
+      "pr:jabra",
+      0
+    ],
+    "pull_request": 337,
+    "revision": "84889a6583e79cfa98f23ff2da876c05c3925cdb"
+  },
+  {
+    "device": [
+      "razer",
+      5426,
+      1402,
+      "Razer BlackShark V3",
+      "pr:blackshark-v3",
+      0
+    ],
+    "pull_request": 349,
+    "revision": "b729a9b25af1e736986270b7a8495fa83c275da3"
+  },
+  {
+    "device": [
+      "corsair",
+      6940,
+      2665,
+      "Corsair HS80 RGB Wireless",
+      "pr:hs80",
+      0
+    ],
+    "pull_request": 359,
+    "revision": "11ba55e37b30df1f87afb1e72e492dfbb2caafc5"
+  },
+  {
+    "device": [
+      "corsair",
+      6940,
+      2666,
+      "Corsair HS80 RGB Wireless",
+      "pr:hs80",
+      0
+    ],
+    "pull_request": 359,
+    "revision": "11ba55e37b30df1f87afb1e72e492dfbb2caafc5"
+  },
+  {
+    "device": [
+      "corsair",
+      6940,
+      2667,
+      "Corsair HS80 RGB Wireless",
+      "pr:hs80",
+      0
+    ],
+    "pull_request": 359,
+    "revision": "11ba55e37b30df1f87afb1e72e492dfbb2caafc5"
+  },
+  {
+    "device": [
+      "pulsar",
+      13652,
+      62725,
+      "VGN Dragonfly 4K (2.4 GHz)",
+      "pr:compx",
+      0
+    ],
+    "pull_request": 363,
+    "revision": "cf1ef93e5c6718bc2b310e1f2b78522ed037bc24"
+  },
+  {
+    "device": [
+      "razer",
+      5426,
+      229,
+      "Razer Viper V4 Pro",
+      "",
+      31
+    ],
+    "pull_request": 363,
+    "revision": "cf1ef93e5c6718bc2b310e1f2b78522ed037bc24"
+  },
+  {
+    "device": [
+      "razer",
+      5426,
+      230,
+      "Razer Viper V4 Pro",
+      "",
+      31
+    ],
+    "pull_request": 363,
+    "revision": "cf1ef93e5c6718bc2b310e1f2b78522ed037bc24"
   }
 ]

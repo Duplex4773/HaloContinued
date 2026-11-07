@@ -408,7 +408,7 @@ fn pulsar_drains_then_accepts_only_checksum_valid_power_reports() {
     use hb_providers::protocols::pulsar_request;
     let device = hb_providers::catalog::DEVICES
         .iter()
-        .find(|d| d.provider == "pulsar")
+        .find(|d| d.provider == "pulsar" && d.vid == 0x3554 && d.pid == 0xf507)
         .unwrap();
     let mut report = pulsar_request();
     report[6] = 46;
@@ -743,7 +743,7 @@ fn candidate_fallback_and_positive_capacity_selection_are_reference_policies() {
     hid.done();
     let known = hb_providers::catalog::DEVICES
         .iter()
-        .find(|d| d.provider == "pulsar")
+        .find(|d| d.provider == "pulsar" && d.vid == 0x3554 && d.pid == 0xf507)
         .unwrap();
     let mut bad = info(known.vid, known.pid, 0xff02);
     bad.path = "wrong-size-control".into();

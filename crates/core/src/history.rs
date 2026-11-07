@@ -1,5 +1,5 @@
 //! Recent awake-use least-squares estimator, isolated from wall-clock storage.
-use crate::{Precision, Reading};
+use crate::{PollingRate, Precision, Reading, usage_gap_seconds};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -11,8 +11,10 @@ pub struct Discharge {
     /// are rebased, preserving measured drops without counting boundary loss.
     pub samples: Vec<(f64, u8)>,
     pub seen: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polling_rate: Option<PollingRate>,
     #[serde(skip)]
-    last: Option<f64>,
+    last: Option<(f64, u16)>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Estimator {
@@ -132,9 +134,11 @@ impl Estimator {
             d.last = None;
             return;
         }
-        let elapsed = d.last.map(|last| monotonic - last);
-        let continuous = elapsed.is_some_and(|seconds| seconds > 0.0 && seconds <= 600.0);
-        d.last = Some(monotonic);
+        let elapsed = d.last.and_then(|(last, limit)| {
+            let seconds = monotonic - last;
+            (seconds > 0.0 && seconds <= f64::from(limit)).then_some(seconds)
+        });
+        d.last = Some((monotonic, usage_gap_seconds(r.next_poll_seconds)));
         let restarted = d
             .samples
             .last()
@@ -143,8 +147,8 @@ impl Estimator {
             d.usage = 0.0;
             d.samples.clear();
         }
-        if continuous && !restarted {
-            d.usage += elapsed.unwrap();
+        if let Some(seconds) = elapsed.filter(|_| !restarted) {
+            d.usage += seconds;
         } else if let Some((_, previous)) = d.samples.last() {
             // A sleeping/disconnected/restarted device can lose charge while we
             // cannot observe its awake time. Shift the fit's level origin instead

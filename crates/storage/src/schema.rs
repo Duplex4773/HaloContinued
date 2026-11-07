@@ -11,7 +11,7 @@ pub fn sequenced(db: &Connection, table: &str) -> rusqlite::Result<bool> {
 pub fn migrate(db: &mut Connection) -> Result<(), ProviderError> {
     let mut migrate = || -> rusqlite::Result<()> {
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 4 {
+        if version > 5 {
             return Err(rusqlite::Error::InvalidQuery);
         }
         db.execute_batch(
@@ -41,14 +41,32 @@ pub fn migrate(db: &mut Connection) -> Result<(), ProviderError> {
                 }
             }
         }
+        let legacy_polling = version < 5
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='polling_events')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )?
+            && !sequenced(&transaction, "polling_events")?;
+        if legacy_polling {
+            transaction
+                .execute_batch("ALTER TABLE polling_events RENAME TO polling_events_legacy_v4;")?;
+        }
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS polling_events(device TEXT NOT NULL, session TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, rate INTEGER NOT NULL, previous_rate INTEGER, sequence INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(device,session,ts,kind,sequence));")?;
+        if legacy_polling {
+            transaction.execute_batch(
+                "INSERT INTO polling_events(device,session,ts,kind,rate,previous_rate)
+                SELECT device,session,ts,kind,rate,previous_rate FROM polling_events_legacy_v4 ORDER BY rowid;
+                DROP TABLE polling_events_legacy_v4;",
+            )?;
+        }
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS readings_time ON readings(ts);
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS usage_metadata_time ON usage_metadata(ts);
-            CREATE TABLE IF NOT EXISTS polling_events(device TEXT NOT NULL, session TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, rate INTEGER NOT NULL, previous_rate INTEGER, PRIMARY KEY(device,session,ts,kind));
             CREATE INDEX IF NOT EXISTS polling_events_time ON polling_events(ts);
             CREATE INDEX IF NOT EXISTS polling_events_device_time ON polling_events(device,ts);
             CREATE INDEX IF NOT EXISTS polling_events_device_session_time ON polling_events(device,session,ts);
-            PRAGMA user_version=4;")?;
+            PRAGMA user_version=5;")?;
         transaction.commit()
     };
     migrate().map_err(|e| ProviderError::new(format!("History schema: {e}")))

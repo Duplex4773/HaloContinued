@@ -15,6 +15,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "reviewed_wireless.rs"]
+mod reviewed_wireless;
+
 const MAX_DEVICES: usize = 64;
 type Endpoint = (u16, u16, String);
 
@@ -23,6 +26,7 @@ pub(crate) struct Community {
     last: BTreeMap<String, (Reading, Duration)>,
     hints: BTreeMap<Endpoint, Hint>,
     sequence: u16,
+    blackshark: BTreeMap<Endpoint, reviewed_wireless::BlackShark>,
     generation: Option<u64>,
     pub diagnostics: Vec<String>,
 }
@@ -30,9 +34,10 @@ pub(crate) struct Community {
 struct Hint {
     path: Option<String>,
     swept: Option<Duration>,
+    headset_name: Option<String>,
 }
 
-fn legacy_gwolves_collection(i: &HidInfo, infos: &[HidInfo]) -> bool {
+fn legacy_gwolves_collection(i: &HidInfo, infos: &[&HidInfo]) -> bool {
     infos.iter().any(|other| {
         other.vendor_id == i.vendor_id
             && other.product_id == i.product_id
@@ -40,7 +45,7 @@ fn legacy_gwolves_collection(i: &HidInfo, infos: &[HidInfo]) -> bool {
             && trusted_identity(other) == trusted_identity(i)
     })
 }
-pub(crate) fn handles(d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool {
+pub(crate) fn handles(d: &Device, i: &HidInfo, infos: &[&HidInfo]) -> bool {
     d.variant.starts_with("pr:")
         || d.provider == "gwolves"
             && d.pid == 0x3854
@@ -69,7 +74,8 @@ fn kind(d: &Device) -> &'static str {
                 "headset"
             }
         }
-        "flow" | "atk-keyboard" | "aula-keyboard" => "keyboard",
+        "flow" | "atk-keyboard" | "aula-keyboard" | "k87" | "monsgeek" => "keyboard",
+        "jabra" | "hs80" | "blackshark-v3" => "headset",
         "rapoo" if [0x1924, 0x4824].contains(&d.pid) => "keyboard",
         "shield" => "gamepad",
         _ => "mouse",
@@ -78,6 +84,7 @@ fn kind(d: &Device) -> &'static str {
 fn family(d: &Device) -> u16 {
     match protocol(d) {
         "nearlink" => 0x108c,
+        "hs80" => 0x0a6b,
         "ajazz" => 0x5c2f,
         "aula-mouse" => 0x22a0,
         "turbo" => 0x6008,
@@ -107,6 +114,12 @@ fn candidate(d: &Device, i: &HidInfo) -> bool {
     match protocol(d) {
         "flow" | "compx" => usage == (0xff02, 2) && out(17),
         "bitmouse" => usage == (0xff05, 1) && out(64),
+        "eweadn" => usage == (0xff01, 0x10) && i.output_length == Some(33),
+        "k87" => i.usage_page == 0xff02 && i.output_length == Some(20),
+        "monsgeek" => usage == (0xffff, 2) && i.interface == 2 && i.feature_length == Some(65),
+        "jabra" => usage == (0xff00, 1) && i.interface == 3 && out(64),
+        "blackshark-v3" => usage == (0xff14, 1) && out(64),
+        "hs80" => d.pid == 0x0a6a || i.interface == 3 && i.usage_page == 0xff42 && out(64),
         "kingston" | "turtle" | "skullcandy" => usage == (0xff13, 1),
         "k65" => usage == (0xff42, 1),
         "strix" => i.feature_length.is_some_and(|n| n >= 64),
@@ -133,7 +146,7 @@ fn candidate(d: &Device, i: &HidInfo) -> bool {
         _ => false,
     }
 }
-pub(crate) fn queryable(d: &Device, i: &HidInfo, infos: &[HidInfo]) -> bool {
+pub(crate) fn queryable(d: &Device, i: &HidInfo, infos: &[&HidInfo]) -> bool {
     handles(d, i, infos)
         && if protocol(d) == "omni" {
             i.interface == 2 && i.usage_page == 0xff02
@@ -150,17 +163,29 @@ fn retain_level(d: &Device) -> bool {
 fn keep_sleeping(d: &Device) -> bool {
     !matches!(
         protocol(d),
-        "shield" | "kingston" | "aula-keyboard" | "atk-keyboard" | "skullcandy" | "flow" | "strix"
+        "shield"
+            | "kingston"
+            | "aula-keyboard"
+            | "atk-keyboard"
+            | "skullcandy"
+            | "flow"
+            | "strix"
+            | "hs80"
+            | "jabra"
+            | "blackshark-v3"
     )
 }
 
 impl Community {
     pub fn is_empty(&self) -> bool {
-        self.last.is_empty() && self.hints.is_empty()
+        self.last.is_empty() && self.hints.is_empty() && self.blackshark.is_empty()
     }
     pub fn invalidate(&mut self) {
         self.hints.clear();
         self.generation = None;
+        for session in self.blackshark.values_mut() {
+            session.close();
+        }
     }
     fn log(&mut self, text: impl Into<String>) {
         if self.diagnostics.len() < 100 {
@@ -170,7 +195,7 @@ impl Community {
     pub fn poll(
         &mut self,
         source: &'static str,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {
@@ -199,10 +224,23 @@ impl Community {
                     .push(i);
             }
         }
-        let mut result = Vec::new();
+        let mut result: Vec<Reading> = Vec::new();
         let mut present: BTreeSet<_> = groups.values().map(|(d, mine)| key(d, mine[0])).collect();
         self.hints
             .retain(|endpoint, _| groups.contains_key(endpoint));
+        self.blackshark.retain(|endpoint, state| {
+            if groups.contains_key(endpoint) {
+                return true;
+            }
+            // Windows can temporarily omit collection capabilities without
+            // disconnecting the receiver. Keep its query limit in that case.
+            state.close();
+            infos.iter().any(|info| {
+                info.vendor_id == endpoint.0
+                    && info.product_id == endpoint.1
+                    && trusted_identity(info) == endpoint.2
+            })
+        });
         // Enumeration can still prove a receiver is present while its control
         // collection/caps are temporarily unavailable. Retain only previously
         // observed devices; never relax the collection filters to query them.
@@ -236,6 +274,13 @@ impl Community {
                 break;
             }
             let k = key(&d, mine[0]);
+            if protocol(&d) == "hs80"
+                && result
+                    .iter()
+                    .any(|r| r.key == k && r.level.is_some() && r.via == "usb")
+            {
+                continue;
+            }
             let now = c.clock.monotonic();
             let passive = matches!(protocol(&d), "inphic" | "rapoo");
             if !self.hints.contains_key(&endpoint) {
@@ -269,13 +314,14 @@ impl Community {
             if passive && resweep && sweep_due {
                 hint.swept = Some(now);
             }
-            let attempts = if known && !(passive && resweep && sweep_due) {
-                1
-            } else if passive && !sweep_due {
-                0
-            } else {
-                4
-            };
+            let attempts =
+                if protocol(&d) == "blackshark-v3" || known && !(passive && resweep && sweep_due) {
+                    1
+                } else if passive && !sweep_due {
+                    0
+                } else {
+                    4
+                };
             let mut found = None;
             for (index, i) in mine.iter().take(attempts).enumerate() {
                 if !c.active() {
@@ -342,17 +388,25 @@ impl Community {
         &mut self,
         d: &Device,
         i: &HidInfo,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
         first: bool,
     ) -> Result<Option<Reading>, ProviderError> {
+        match protocol(d) {
+            "blackshark-v3" => return self.blackshark(d, i, hid, c),
+            "hs80" => return self.hs80(d, i, infos, hid, c),
+            _ => {}
+        }
         let mut s = hid.open(i)?;
         if !c.active() {
             return Ok(None);
         }
         let s = &mut *s;
         let b = match protocol(d) {
+            "eweadn" | "k87" => reviewed_wireless::receiver_battery(protocol(d), s, c)?,
+            "monsgeek" => reviewed_wireless::monsgeek(s, c)?,
+            "jabra" => return self.jabra(d, i, s, c),
             "bitmouse" => {
                 if !drain(s, c, 64, 4)? {
                     return Ok(None);
@@ -880,7 +934,7 @@ impl Community {
     }
     fn omni(
         &mut self,
-        infos: &[HidInfo],
+        infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {
@@ -995,6 +1049,8 @@ fn merge(out: &mut Vec<Reading>, r: Reading) -> Option<&Reading> {
         let old = &out[index];
         let replace = if r.online() != old.online() {
             r.online()
+        } else if r.key.starts_with("corsair:0a6b:") {
+            (r.level.is_some(), r.via == "usb") > (old.level.is_some(), old.via == "usb")
         } else if r.source == "shield" && old.via != r.via {
             r.via == "usb"
         } else {
@@ -1024,6 +1080,13 @@ fn reading(d: &Device, i: &HidInfo, b: Battery, c: &PollContext<'_>) -> Reading 
         "usb"
     }
     .into();
+    if matches!(
+        protocol(d),
+        "eweadn" | "k87" | "monsgeek" | "jabra" | "blackshark-v3"
+    ) || d.provider == "pulsar" && matches!(d.pid, 0xf505 | 0xf5dc | 0xf5df)
+    {
+        r.via = "wireless".into();
+    }
     if b.coarse {
         r.precision = Precision::Coarse;
         r.approx = b.label.or_else(|| Some(format!("about {}%", b.level)));
@@ -1398,7 +1461,7 @@ pub fn flydigi_battery(
     hid: &dyn HidTransport,
     c: &PollContext<'_>,
 ) -> Result<Option<Battery>, ProviderError> {
-    let infos = hid.enumerate(0x37d7)?;
+    let infos = hid.enumerate_shared(0x37d7)?;
     let mut candidates = infos
         .iter()
         .filter(|i| i.product_id == 0x2401 && i.usage_page == 0xffa0);

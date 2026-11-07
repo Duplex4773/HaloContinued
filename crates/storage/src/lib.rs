@@ -9,14 +9,17 @@ use hb_core::{
     BatteryInsights, Estimator, HistoryStore, InsightsBuilder, PollingActivity,
     PollingActivityKind, PollingRate, ProviderError, Reading, Settings, Snapshot, UsageObservation,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 // Retain the earlier Rust app folder across the Halo Continued rebrand.
@@ -197,7 +200,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ProviderError> {
     }
     result
 }
-pub fn load_settings(path: &Path) -> Settings {
+pub fn load_settings(path: &Path) -> Result<Settings, ProviderError> {
     // Bound startup allocations even if a damaged or replaced config is enormous.
     const MAX_SETTINGS_BYTES: u64 = 2 * 1024 * 1024;
     let bytes = fs::File::open(path).and_then(|file| {
@@ -218,23 +221,30 @@ pub fn load_settings(path: &Path) -> Settings {
         Ok(bytes)
     });
     match bytes {
-        Ok(bytes) => match serde_json::from_slice(&bytes)
-            .map_err(|e| e.to_string())
-            .and_then(Settings::from_value)
-        {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = fs::rename(path, path.with_extension("json.bad"));
-                Settings::default()
+        Ok(bytes) => {
+            if let Ok(settings) = serde_json::from_slice(&bytes)
+                .map_err(|e| e.to_string())
+                .and_then(Settings::from_value)
+            {
+                return Ok(settings);
             }
-        },
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Settings::default());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
         Err(error) => {
-            if error.kind() == std::io::ErrorKind::InvalidData {
-                let _ = fs::rename(path, path.with_extension("json.bad"));
-            }
-            Settings::default()
+            return Err(ProviderError::new(format!(
+                "Could not read settings: {error}"
+            )));
         }
     }
+    // Permit a fresh configuration only after the unreadable file is safely
+    // out of the way. An access failure must never turn into writable defaults.
+    fs::rename(path, path.with_extension("json.bad")).map_err(|error| {
+        ProviderError::new(format!("Could not preserve damaged settings: {error}"))
+    })?;
+    Ok(Settings::default())
 }
 pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ProviderError> {
     atomic_write(
@@ -465,6 +475,20 @@ impl Store {
     /// Retained raw observations, streamed independently of chart sampling.
     /// As with history queries, flush pending observations before querying.
     pub fn query_insights(&self, key: &str, until: i64) -> Result<BatteryInsights, ProviderError> {
+        self.query_insights_if(key, until, || true)?
+            .ok_or_else(|| ProviderError::new("Insights query cancelled"))
+    }
+    /// Cancellation is checked between bounded batches of rows, never during
+    /// persistence. Existing history and recovery writes must still finish.
+    pub fn query_insights_if(
+        &self,
+        key: &str,
+        until: i64,
+        current: impl Fn() -> bool,
+    ) -> Result<Option<BatteryInsights>, ProviderError> {
+        if !current() {
+            return Ok(None);
+        }
         let sql = if self.has_usage_metadata && self.has_polling_events {
             if self.sequenced {
                 INSIGHTS_WITH_ACTIVITY_SEQUENCED
@@ -487,7 +511,12 @@ impl Store {
             .query(params![key, until.saturating_sub(30 * 86400), until])
             .map_err(sql_error)?;
         let mut builder = InsightsBuilder::default().recent_since(until.saturating_sub(7 * 86400));
+        let mut count = 0usize;
         while let Some(row) = rows.next().map_err(sql_error)? {
+            if count.is_multiple_of(128) && !current() {
+                return Ok(None);
+            }
+            count += 1;
             let (Ok(timestamp), Ok(payload)) = (row.get::<_, i64>(0), row_text(row, 1)) else {
                 builder.break_continuity();
                 continue;
@@ -566,6 +595,10 @@ impl Store {
                 .map_err(sql_error)?;
             let mut saver_rate = None;
             while let Some(row) = rows.next().map_err(sql_error)? {
+                if count.is_multiple_of(128) && !current() {
+                    return Ok(None);
+                }
+                count += 1;
                 // One malformed event must not prevent the rest of the user's
                 // valid battery history from loading, or inflate activity counts.
                 let Ok(kind) = row_text(row, 0) else {
@@ -627,15 +660,15 @@ impl Store {
                 }
             }
         }
-        Ok(result)
+        Ok(current().then_some(result))
     }
     /// Successful readback only; no device access and no inferred historical events.
     pub fn record_polling_activity(
         &mut self,
         event: &PollingActivity,
     ) -> Result<(), ProviderError> {
-        self.db.execute("INSERT OR IGNORE INTO polling_events(device,session,ts,kind,rate,previous_rate) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![event.key, event.session.to_string(), event.timestamp, event.kind.as_str(), event.rate.hz(), event.previous.map(PollingRate::hz)]).map_err(sql_error)?;
+        self.db.execute("INSERT OR IGNORE INTO polling_events(device,session,ts,kind,rate,previous_rate,sequence) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![event.key, event.session.to_string(), event.timestamp, event.kind.as_str(), event.rate.hz(), event.previous.map(PollingRate::hz), event.sequence as i64]).map_err(sql_error)?;
         Ok(())
     }
     /// Preserve confirmed configuration evidence without applying it to hardware.
@@ -662,6 +695,7 @@ impl Store {
                 || r.via != reading.via
                 || r.serial != reading.serial
                 || r.container != reading.container
+                || r.next_poll_seconds != reading.next_poll_seconds
                 || reading.timestamp < r.timestamp
                 || reading.timestamp.saturating_sub(r.timestamp) >= 60
         });
@@ -872,7 +906,7 @@ impl Store {
             .map_err(sql_error)?;
         // Keep time, awake state and one bounded identity; never copy every
         // full reading during either chart pass.
-        let mut previous: Option<(i64, bool, Option<u64>)> = None;
+        let mut previous: Option<(i64, bool, Option<u64>, u16)> = None;
         let mut identity: Option<usage_sampler::TimingIdentity> = None;
         let mut total = checkpoint.map_or(0, |c| c.position);
         while let Some(row) = rows.next().map_err(sql_error)? {
@@ -908,29 +942,63 @@ impl Store {
             };
             let reading_awake = reading.awake();
             let same_identity = identity.as_ref().is_some_and(|old| old.matches(&reading));
-            if let Some((timestamp, true, previous_session)) = previous
+            if let Some((timestamp, true, previous_session, limit)) = previous
                 && reading_awake
                 && same_identity
                 && previous_session == session
                 && reading
                     .timestamp
                     .checked_sub(timestamp)
-                    .is_some_and(|delta| (1..=600).contains(&delta))
+                    .is_some_and(|delta| (1..=i64::from(limit)).contains(&delta))
             {
                 total = total.saturating_add(reading.timestamp - timestamp);
             }
             if !same_identity {
                 identity = Some(usage_sampler::TimingIdentity::from(&reading));
             }
-            previous = Some((reading.timestamp, reading_awake, session));
+            previous = Some((
+                reading.timestamp,
+                reading_awake,
+                session,
+                hb_core::usage_gap_seconds(reading.next_poll_seconds),
+            ));
             visit(payload, &reading, total, row.get(3).map_err(sql_error)?);
         }
         Ok(total)
     }
+    /// Install the cancellation callback only around a read query. Settings,
+    /// recovery records and history flushes must always finish their writes.
+    pub fn query_cancellable<T>(
+        &self,
+        cancelled: Arc<AtomicBool>,
+        query: impl FnOnce(&Self) -> Result<T, ProviderError>,
+    ) -> Result<T, ProviderError> {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ProviderError::new("History query cancelled"));
+        }
+        let signal = cancelled.clone();
+        self.db
+            .progress_handler(4096, Some(move || signal.load(Ordering::Relaxed)))
+            .map_err(sql_error)?;
+        let result = query(self);
+        self.db
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(sql_error)?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ProviderError::new("History query cancelled"));
+        }
+        result
+    }
+
     pub fn release_history_cache(&self) {
         self.usage_index.borrow_mut().take();
     }
     pub fn load_estimator(&self) -> Estimator {
+        self.try_load_estimator().unwrap_or_default()
+    }
+
+    /// An inaccessible checkpoint is different from a new database with no fit.
+    pub fn try_load_estimator(&self) -> Result<Estimator, ProviderError> {
         // A damaged checkpoint must not allocate an arbitrarily large JSON
         // tree at startup. Keep the original row for recovery; history is intact.
         const MAX_CHECKPOINT_BYTES: i64 = 4 * 1024 * 1024;
@@ -954,18 +1022,30 @@ impl Store {
                     Ok(estimator)
                 },
             )
-            .ok()
-            .unwrap_or_default()
+            .optional()
+            .map(|state| state.unwrap_or_default())
+            .map_err(sql_error)
     }
     pub fn save_estimator(&mut self, estimator: &Estimator) -> Result<(), ProviderError> {
+        self.write_estimator(
+            "INSERT OR REPLACE INTO state(key,payload) VALUES('estimator',?1)",
+            estimator,
+        )
+        .map(|_| ())
+    }
+    pub fn create_estimator(&mut self, estimator: &Estimator) -> Result<bool, ProviderError> {
+        self.write_estimator(
+            "INSERT OR IGNORE INTO state(key,payload) VALUES('estimator',?1)",
+            estimator,
+        )
+    }
+    fn write_estimator(&mut self, sql: &str, estimator: &Estimator) -> Result<bool, ProviderError> {
+        let payload = serde_json::to_string(estimator)
+            .map_err(|error| ProviderError::new(error.to_string()))?;
         self.db
-            .execute(
-                "INSERT OR REPLACE INTO state(key,payload) VALUES('estimator',?1)",
-                [serde_json::to_string(estimator)
-                    .map_err(|e| ProviderError::new(e.to_string()))?],
-            )
-            .map_err(sql_error)?;
-        Ok(())
+            .execute(sql, [payload])
+            .map(|rows| rows != 0)
+            .map_err(sql_error)
     }
 }
 impl HistoryStore for Store {
@@ -1119,6 +1199,61 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_locked_writer_can_still_seed_the_estimator_from_read_only_history() {
+        use super::*;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("history.db");
+        let mut store = Store::open(&path).unwrap();
+        let mut estimator = Estimator::default();
+        estimator
+            .devices
+            .entry("synthetic".into())
+            .or_default()
+            .usage = 3600.0;
+        store.save_estimator(&estimator).unwrap();
+        store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        assert!(Store::open(&path).is_err());
+        let reader = Store::read_only(&path).unwrap();
+        assert_eq!(
+            reader.try_load_estimator().unwrap().devices["synthetic"].usage,
+            3600.0
+        );
+        store.db.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn cancelled_history_interrupts_sql_and_clears_the_handler_before_followup_work() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let sql = "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL
+            SELECT n+1 FROM numbers WHERE n<10000) SELECT sum(n) FROM numbers";
+        let result = store.query_cancellable(cancelled.clone(), |db| {
+            cancelled.store(true, Ordering::Relaxed);
+            let error = db
+                .db
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ffi::ErrorCode::OperationInterrupted)
+            );
+            Err::<i64, _>(sql_error(error))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .db
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            50_005_000
+        );
+        store.save_estimator(&Estimator::default()).unwrap();
+    }
+
+    #[test]
     fn dpi_backups_retain_original_axes_and_profile_bytes_and_report_save_failure() {
         use hb_core::{DpiBackup, DpiState, DpiValue};
         let directory = tempfile::tempdir().unwrap();
@@ -1164,7 +1299,10 @@ mod tests {
             .unwrap()
             .set_len(8 * 1024 * 1024)
             .unwrap();
-        assert_eq!(load_settings(&path).interval, Settings::default().interval);
+        assert_eq!(
+            load_settings(&path).unwrap().interval,
+            Settings::default().interval
+        );
         assert!(!path.exists());
         assert_eq!(
             fs::metadata(path.with_extension("json.bad")).unwrap().len(),
@@ -1183,6 +1321,7 @@ mod tests {
                     key: "synthetic".into(),
                     timestamp: index,
                     session: 1,
+                    sequence: 1,
                     kind: hb_core::PollingActivityKind::Manual,
                     rate: PollingRate::try_from(1000).unwrap(),
                     previous: None,
@@ -1344,12 +1483,40 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn sharing_violation_does_not_load_writable_defaults() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let settings = Settings {
+            interval: 217,
+            ..Settings::default()
+        };
+        save_settings(&path, &settings).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(load_settings(&path).is_err());
+        drop(lock);
+        assert_eq!(load_settings(&path).unwrap().interval, 217);
+        assert!(!path.with_extension("json.bad").exists());
+        assert_eq!(
+            load_settings(&dir.path().join("missing.json"))
+                .unwrap()
+                .interval,
+            Settings::default().interval
+        );
+    }
+
     #[test]
     fn corruption_is_preserved_and_atomic_writes_replace() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.json");
         fs::write(&p, b"broken").unwrap();
-        assert_eq!(load_settings(&p).interval, 60);
+        assert_eq!(load_settings(&p).unwrap().interval, 60);
         assert!(p.with_extension("json.bad").exists());
         let s = Settings {
             low: 15,
@@ -1357,7 +1524,7 @@ mod tests {
         };
         save_settings(&p, &s).unwrap();
         save_settings(&p, &Settings::default()).unwrap();
-        assert_eq!(load_settings(&p).low, 20);
+        assert_eq!(load_settings(&p).unwrap().low, 20);
     }
     #[test]
     #[cfg(windows)]
@@ -1379,7 +1546,7 @@ mod tests {
         };
         assert!(save_settings(&p, &changed).is_err());
         assert_eq!(fs::read(&p).unwrap(), previous);
-        assert_eq!(load_settings(&p).low, 20);
+        assert_eq!(load_settings(&p).unwrap().low, 20);
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1);
     }
     #[test]
@@ -1436,7 +1603,7 @@ mod tests {
             },
         );
         save_settings(&p, &settings).unwrap();
-        let actual = load_settings(&p);
+        let actual = load_settings(&p).unwrap();
         assert_eq!(
             serde_json::to_value(actual).unwrap(),
             serde_json::to_value(settings).unwrap()
@@ -2072,6 +2239,7 @@ mod usage_index_tests {
                 key: "mouse".into(),
                 timestamp: until,
                 session: 1,
+                sequence: 1,
                 kind: PollingActivityKind::Boost,
                 rate: PollingRate::try_from(4000).unwrap(),
                 previous: PollingRate::try_from(1000).ok(),

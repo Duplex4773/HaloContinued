@@ -1,6 +1,6 @@
 //! Small, static native dashboard visuals. Captions remain readable to Windows
 //! accessibility tools; painting uses stock GDI objects and dashboard-owned fonts.
-use crate::dashboard_theme::{Palette, color_brush, rounded_surface};
+use crate::dashboard_theme::{Palette, color_brush, draw_utf16, rounded_surface};
 use windows::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
@@ -32,7 +32,7 @@ fn row_height(dc: HDC, text: &str, width: i32, dpi: i32) -> i32 {
     };
     let mut text: Vec<u16> = text.encode_utf16().collect();
     unsafe {
-        DrawTextW(
+        draw_utf16(
             dc,
             &mut text,
             &mut bounds,
@@ -64,6 +64,85 @@ pub fn panel_height(hwnd: HWND, text: &str, width: i32, mix: bool) -> i32 {
         ((height * 96 + dpi - 1) / dpi).max(92)
     }
 }
+// Measure only during layout, using the same font and wrapping as native labels.
+pub(crate) fn label_height(hwnd: HWND, text: &str, width: i32, font: HFONT) -> i32 {
+    unsafe {
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
+        let dc = GetDC(Some(hwnd));
+        if dc.is_invalid() {
+            return 108;
+        }
+        let old = SelectObject(dc, font.into());
+        let height = row_height(dc, text, width.max(1) * dpi / 96, dpi);
+        SelectObject(dc, old);
+        ReleaseDC(Some(hwnd), dc);
+        (height * 96 + dpi - 1) / dpi + 2
+    }
+}
+fn roster_lines(dc: HDC, text: &str, width: i32, dpi: i32) -> i32 {
+    let mut metrics = TEXTMETRICW::default();
+    unsafe {
+        let _ = GetTextMetricsW(dc, &mut metrics);
+    }
+    let line = metrics.tmHeight.max(1);
+    let height = row_height(dc, text, width, dpi);
+    if height > (20 * dpi / 96).max(line) {
+        2
+    } else {
+        1
+    }
+}
+
+pub(crate) fn roster_height(hwnd: HWND, caption: &str, font: HFONT) -> i32 {
+    unsafe {
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
+        let dc = GetDC(Some(hwnd));
+        if dc.is_invalid() {
+            return 60;
+        }
+        let old = SelectObject(dc, font.into());
+        let mut lines = caption.lines();
+        let name = lines.nth(1).unwrap_or_default();
+        let detail = lines.nth(1).unwrap_or_default();
+        let width = 82 * dpi / 96;
+        let height = 22
+            + 19 * roster_lines(dc, name, width, dpi)
+            + 17 * roster_lines(dc, detail, width, dpi);
+        SelectObject(dc, old);
+        ReleaseDC(Some(hwnd), dc);
+        height.max(60)
+    }
+}
+
+pub(crate) fn meter(dc: HDC, rect: RECT, fraction: f64, palette: Palette, asleep: bool) {
+    let height = rect.bottom - rect.top;
+    let track = palette.track();
+    rounded_surface(dc, &rect, track, track, height);
+    let filled = RECT {
+        right: rect.left
+            + (f64::from(rect.right - rect.left) * fraction.clamp(0., 1.)).round() as i32,
+        ..rect
+    };
+    if filled.right > filled.left {
+        let color = if asleep && !palette.high_contrast {
+            crate::dashboard_theme::mix(track, palette.accent, 58)
+        } else {
+            palette.accent
+        };
+        rounded_surface(
+            dc,
+            &filled,
+            color,
+            color,
+            height.min(filled.right - filled.left),
+        );
+    }
+}
+
+pub(crate) fn battery_fraction(text: &str) -> Option<f64> {
+    percent(text.trim_start_matches('~'))
+}
+
 pub fn draw(item: &DRAWITEMSTRUCT, mut palette: Palette, large_font: HFONT) {
     unsafe {
         let dc = item.hDC;
@@ -98,15 +177,15 @@ pub fn draw(item: &DRAWITEMSTRUCT, mut palette: Palette, large_font: HFONT) {
                 bottom: top + height,
             };
             let mut value: Vec<u16> = value.encode_utf16().collect();
-            DrawTextW(
+            draw_utf16(
                 dc,
                 &mut value,
                 &mut bounds,
-                (if item.CtlID >= 1000 {
+                if item.CtlID == 88 {
                     DT_SINGLELINE | DT_VCENTER
                 } else {
                     DT_WORDBREAK
-                }) | DT_NOPREFIX
+                } | DT_NOPREFIX
                     | DT_END_ELLIPSIS,
             );
         };
@@ -123,84 +202,69 @@ pub fn draw(item: &DRAWITEMSTRUCT, mut palette: Palette, large_font: HFONT) {
                 palette.accent = palette.selection_text;
                 palette.border = palette.selection;
             }
-            let mut surface = rect;
-            surface.right -= 1;
-            surface.bottom -= 1;
+            let surface = RECT {
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+                ..rect
+            };
             rounded_surface(
                 dc,
                 &surface,
                 if selected {
                     palette.selection
                 } else {
-                    palette.surface
+                    palette.background
                 },
-                if selected {
-                    palette.accent
+                if selected && !palette.high_contrast {
+                    palette.selected_border()
                 } else {
                     palette.border
                 },
-                px(14),
+                px(7),
             );
             let kind = lines.next().unwrap_or("device");
+            let name = lines.next().unwrap_or_default();
+            let value = lines.next().unwrap_or("—");
+            let detail = lines.next().unwrap_or_default();
+            let center = (rect.top + rect.bottom) / 2;
             draw_symbol(
                 dc,
                 RECT {
-                    left: rect.left + px(17),
-                    top: rect.top + px(17),
-                    right: rect.left + px(36),
-                    bottom: rect.top + px(36),
+                    left: rect.left + px(9),
+                    right: rect.left + px(25),
+                    top: center - px(8),
+                    bottom: center + px(8),
                 },
                 kind,
-                if selected {
-                    palette.accent
-                } else {
-                    palette.text
-                },
+                palette.accent,
             );
-            let name = lines.next().unwrap_or_default();
+            let left = rect.left + px(33);
+            let right = rect.right - px(41);
+            let name_height = px(19 * roster_lines(dc, name, right - left, dpi));
+            let detail_height = px(17 * roster_lines(dc, detail, right - left, dpi));
+            let top = center - (name_height + detail_height + px(3)) / 2;
+            text(name, left, top, right, name_height, palette.text, normal);
             text(
-                name,
-                rect.left + px(17),
-                rect.top + px(39),
-                rect.right - px(16),
-                px(23),
+                detail,
+                left,
+                top + name_height + px(3),
+                right,
+                detail_height,
                 palette.disabled,
                 normal,
             );
-            let value = lines.next().unwrap_or("—");
-            text(
-                value,
-                rect.left + px(17),
-                rect.top + px(74),
-                rect.right - px(16),
-                px(32),
-                if selected {
-                    palette.accent
-                } else {
-                    palette.text
-                },
-                large_font,
+            let mut bounds = RECT {
+                left: rect.right - px(39),
+                right: rect.right - px(8),
+                ..rect
+            };
+            SetTextColor(dc, palette.text);
+            draw_utf16(
+                dc,
+                &mut value.encode_utf16().collect::<Vec<_>>(),
+                &mut bounds,
+                DT_VCENTER | DT_SINGLELINE | DT_RIGHT | DT_NOPREFIX,
             );
-            text(
-                lines.next().unwrap_or_default(),
-                rect.left + px(17),
-                rect.top + px(113),
-                rect.right - px(16),
-                px(22),
-                palette.disabled,
-                normal,
-            );
-            if let Some(value) = percent(value.trim_start_matches('~')) {
-                bar(
-                    dc,
-                    rect.left + px(17),
-                    rect.bottom - px(17),
-                    rect.right - px(17),
-                    px(4),
-                    value,
-                    palette,
-                );
-            }
             if item.itemState.0 & ODS_FOCUS.0 != 0 {
                 let focus = RECT {
                     left: rect.left + px(4),
@@ -210,8 +274,69 @@ pub fn draw(item: &DRAWITEMSTRUCT, mut palette: Palette, large_font: HFONT) {
                 };
                 let _ = DrawFocusRect(dc, &focus);
             }
-        } else if matches!(item.CtlID, 8 | 468) {
+        } else if matches!(item.CtlID, 8 | 490..=495) {
             FillRect(dc, &rect, color_brush(dc, palette.border));
+        } else if item.CtlID == 476 {
+            let value = lines.next().unwrap_or("—");
+            let detail = lines.next().unwrap_or_default();
+            text(
+                value,
+                rect.left,
+                rect.top,
+                rect.right,
+                px(34),
+                palette.text,
+                large_font,
+            );
+            text(
+                detail,
+                rect.left,
+                rect.top + px(34),
+                rect.right,
+                px(21),
+                palette.disabled,
+                normal,
+            );
+            if let Some(fraction) = battery_fraction(value) {
+                meter(
+                    dc,
+                    RECT {
+                        top: rect.bottom - px(6),
+                        bottom: rect.bottom - px(2),
+                        ..rect
+                    },
+                    fraction,
+                    palette,
+                    detail == "Last known battery",
+                );
+            }
+        } else if item.CtlID == 95 {
+            FillRect(dc, &rect, color_brush(dc, palette.caption()));
+            FillRect(
+                dc,
+                &RECT {
+                    bottom: rect.top + 1,
+                    ..rect
+                },
+                color_brush(dc, palette.border),
+            );
+            let value = if caption.is_empty() {
+                "Monitoring active"
+            } else {
+                &caption
+            };
+            let mut bounds = RECT {
+                left: rect.left + px(20),
+                right: rect.right - px(20),
+                ..rect
+            };
+            SetTextColor(dc, palette.disabled);
+            draw_utf16(
+                dc,
+                &mut value.encode_utf16().collect::<Vec<_>>(),
+                &mut bounds,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
         } else if matches!(item.CtlID, 460..=463) {
             let surface = RECT {
                 right: rect.right - 1,
@@ -291,21 +416,6 @@ pub fn draw(item: &DRAWITEMSTRUCT, mut palette: Palette, large_font: HFONT) {
                 }
             }
         } else {
-            // Consistent section hierarchy without extra child windows.
-            if item.CtlID == 88
-                && let Some((level, _)) = caption.split_once('%')
-                && let Ok(level) = level.parse::<f64>()
-            {
-                bar(
-                    dc,
-                    rect.right - px(186),
-                    rect.top + px(10),
-                    rect.right - px(8),
-                    px(7),
-                    (level / 100.0).clamp(0.0, 1.0),
-                    palette,
-                );
-            }
             text(
                 &caption,
                 rect.left,
@@ -367,7 +477,7 @@ pub(crate) fn draw_symbol(dc: HDC, rect: RECT, kind: &str, color: COLORREF) {
                 line(5, 9, 5, 16);
                 line(9, 9, 9, 16);
             }
-            "boost" => {
+            "boost" | "gamepad" | "controller" | "dualsense" | "dualshock" => {
                 let _ = RoundRect(dc, x(1), y(5), x(23), y(20), w / 3, h / 3);
                 line(5, 12, 11, 12);
                 line(8, 9, 8, 15);
@@ -389,10 +499,26 @@ pub(crate) fn draw_symbol(dc: HDC, rect: RECT, kind: &str, color: COLORREF) {
                 line(12, 18, 12, 23);
             }
             "devices" => {
-                let _ = RoundRect(dc, x(2), y(2), x(19), y(16), w / 5, h / 5);
-                line(7, 21, 13, 21);
-                line(10, 16, 10, 21);
-                let _ = RoundRect(dc, x(17), y(12), x(24), y(23), w / 4, h / 4);
+                line(3, 7, 21, 7);
+                line(3, 7, 8, 2);
+                line(3, 7, 8, 12);
+                line(3, 17, 21, 17);
+                line(21, 17, 16, 12);
+                line(21, 17, 16, 22);
+            }
+            "refresh" => {
+                SetArcDirection(dc, AD_CLOCKWISE);
+                let _ = Arc(dc, x(3), y(3), x(21), y(21), x(4), y(12), x(19), y(6));
+                let _ = Arc(dc, x(3), y(3), x(21), y(21), x(20), y(12), x(5), y(18));
+                line(21, 3, 21, 8);
+                line(21, 8, 16, 8);
+                line(3, 21, 3, 16);
+                line(3, 16, 8, 16);
+            }
+            "more" => {
+                for col in [5, 12, 19] {
+                    line(col, 12, col + 2, 12);
+                }
             }
             "settings" => {
                 let points = [
@@ -448,7 +574,7 @@ fn bar(dc: HDC, left: i32, top: i32, right: i32, height: i32, value: f64, palett
 mod tests {
     use super::*;
     #[test]
-    fn selected_device_card_keeps_high_contrast_symbols_and_battery_bar_visible() {
+    fn selected_roster_row_and_summary_meter_keep_high_contrast_marks_visible() {
         let _guard = crate::ui::NATIVE_TEST_LOCK.lock().unwrap();
         let (x, y) = crate::test_display::origin();
         unsafe {
@@ -486,39 +612,54 @@ mod tests {
                 selection_text: foreground,
                 dark: false,
             };
-            draw(
-                &DRAWITEMSTRUCT {
-                    CtlID: 1000,
-                    hwndItem: hwnd,
-                    hDC: dc,
-                    rcItem: RECT {
-                        left: 0,
-                        top: 0,
-                        right: 375,
-                        bottom: 162,
-                    },
-                    ..Default::default()
+            let row = DRAWITEMSTRUCT {
+                CtlID: 1000,
+                hwndItem: hwnd,
+                hDC: dc,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 375,
+                    bottom: 162,
                 },
-                palette,
-                HFONT(GetStockObject(DEFAULT_GUI_FONT).0),
-            );
+                ..Default::default()
+            };
+            let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
+            draw(&row, palette, font);
             let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
             let px = |n| n * dpi / 96;
             assert!(
-                (px(17)..px(36))
-                    .any(|a| (px(17)..px(36)).any(|b| GetPixel(dc, a, b) == foreground)),
+                (px(9)..px(25))
+                    .any(|x| (81 - px(8)..81 + px(8)).any(|y| GetPixel(dc, x, y) == foreground)),
                 "Selected symbol blends into selection background"
             );
-            assert_eq!(
-                GetPixel(dc, px(25), 162 - px(16)),
-                foreground,
-                "Filled battery bar must contrast with selection"
+            meter(
+                dc,
+                RECT {
+                    left: px(9),
+                    top: 100,
+                    right: px(109),
+                    bottom: 104,
+                },
+                0.5,
+                palette,
+                true,
             );
             assert_eq!(
-                GetPixel(dc, 375 - px(25), 162 - px(16)),
+                GetPixel(dc, px(25), 102),
                 selection,
-                "Unfilled bar must remain distinct"
+                "Filled bar must contrast with its track"
             );
+            assert_eq!(
+                GetPixel(dc, px(80), 102),
+                foreground,
+                "Unfilled bar remains distinct"
+            );
+            // A new roster row can be painted before its caption is populated.
+            SetWindowTextW(hwnd, windows::core::w!("mouse\n\n—")).unwrap();
+            assert!(roster_height(hwnd, "mouse\n\n—", font) >= 60);
+            draw(&row, palette, font);
+
             SelectObject(dc, previous);
             let _ = DeleteObject(bitmap.into());
             let _ = DeleteDC(dc);

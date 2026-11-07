@@ -34,14 +34,14 @@ pub fn discover_keyboards(
                 "configuration discovery cancelled or deadline reached",
             ));
         }
-        let devices = hid.enumerate(vendor)?;
+        let devices = hid.enumerate_shared(vendor)?;
         count = count.saturating_add(devices.len());
         if count > LIMIT {
             return Err(ProviderError::new(
                 "configuration HID inventory exceeds 512 collections",
             ));
         }
-        for info in devices {
+        for info in devices.iter() {
             if info.vendor_id != vendor || is_bluetooth(&info.path) {
                 continue;
             }
@@ -53,7 +53,7 @@ pub fn discover_keyboards(
             if supported.is_none() {
                 continue;
             }
-            let identity = trusted_identity(&info);
+            let identity = trusted_identity(info);
             if identity.trim().is_empty() {
                 continue;
             }
@@ -61,7 +61,7 @@ pub fn discover_keyboards(
             groups
                 .entry(format!("{source}:{:04x}:{identity}", info.product_id))
                 .or_default()
-                .push(info);
+                .push(info.clone());
         }
     }
     if !context.active() {

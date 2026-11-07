@@ -63,6 +63,22 @@ fn main() {
         std::process::exit(1);
     }
 }
+fn simulation_mode(args: &[String]) -> Result<bool, ProviderError> {
+    let has = |flag| args.iter().any(|arg| arg == flag);
+    let simulate = has("--simulate");
+    if simulate && (has("--probe") || has("--polling-probe")) {
+        return Err(ProviderError::new(
+            "Simulation cannot be combined with a live hardware probe.",
+        ));
+    }
+    if has("--simulate-keyboards") && !simulate {
+        return Err(ProviderError::new(
+            "--simulate-keyboards requires --simulate",
+        ));
+    }
+    Ok(simulate)
+}
+
 fn entry() -> Result<(), ProviderError> {
     let args: Vec<String> = std::env::args().collect();
     let option = |name: &str| {
@@ -71,11 +87,7 @@ fn entry() -> Result<(), ProviderError> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    if args.iter().any(|a| a == "--simulate-keyboards") && !args.iter().any(|a| a == "--simulate") {
-        return Err(ProviderError::new(
-            "--simulate-keyboards requires --simulate",
-        ));
-    }
+    let simulate = simulation_mode(&args)?;
     let directory = application_data_directory(&args);
     let dir = directory.path;
     if directory.portable_requested && !directory.portable {
@@ -277,6 +289,7 @@ fn entry() -> Result<(), ProviderError> {
             ));
         }
     };
+    let settings = hb_storage::load_settings(&dir.join("config.json"))?;
     let icon_path = dir.join("application.png");
     let icon: &[u8] = include_bytes!("../application.png");
     let registration = (|| {
@@ -287,12 +300,7 @@ fn entry() -> Result<(), ProviderError> {
         hb_windows::system::identify_registered_with_icon(&icon_path)
     })();
     let identity_error = registration.err().map(|e| e.to_string());
-    let settings = hb_storage::load_settings(&dir.join("config.json"));
-    let runtime = runtime::Runtime::start(
-        dir.clone(),
-        settings.clone(),
-        args.iter().any(|a| a == "--simulate"),
-    )?;
+    let runtime = runtime::Runtime::start(dir.clone(), settings.clone(), simulate)?;
     ui::run(
         runtime,
         settings,
@@ -323,7 +331,7 @@ mod performance_fixture {
             .unwrap();
         assert!(directory.starts_with(&private) && directory != private);
         assert!(!directory.join("history.db").exists());
-        let settings = hb_storage::load_settings(&directory.join("config.json"));
+        let settings = hb_storage::load_settings(&directory.join("config.json")).unwrap();
         assert!(!settings.polling_controls && !settings.restore_polling_on_startup);
         assert!(!settings.notify && !settings.full_alert && !settings.low_sound);
         assert!(!settings.bluetooth && !settings.quiet_fullscreen && !settings.status_file);
@@ -332,5 +340,28 @@ mod performance_fixture {
             .expect("synthetic runtime must start");
         crate::ui::run(runtime, settings, directory, true, None)
             .expect("native benchmark must exit gracefully");
+    }
+}
+
+#[cfg(test)]
+mod startup_mode_tests {
+    use super::simulation_mode;
+
+    #[test]
+    fn simulation_rejects_live_diagnostics_before_opening_hardware() {
+        for probe in ["--probe", "--polling-probe"] {
+            let flags = [
+                probe,
+                "--simulate",
+                "--device-key",
+                "synthetic",
+                "--polling-hz",
+                "2000",
+            ];
+            let args = flags.map(str::to_owned);
+            assert!(simulation_mode(&args).is_err());
+        }
+        assert!(simulation_mode(&["--simulate".into(), "--simulate-keyboards".into()]).unwrap());
+        assert!(!simulation_mode(&["--polling-probe".into()]).unwrap());
     }
 }
