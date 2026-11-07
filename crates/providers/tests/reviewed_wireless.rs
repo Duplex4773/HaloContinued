@@ -179,6 +179,14 @@ fn blackshark_keeps_the_receiver_open_and_refresh_does_not_bypass_quiet_period()
         read(&packet(0x2a, 0x80, 2, 1)),
         read(&[]),
         read(&[]),
+        Step::Write(packet(0x2a, 0x80, 0, 0)),
+    ]);
+    // The headset answers the next level query but its charge reply is lost.
+    steps.extend((0..50).map(|_| read(&[])));
+    steps.extend([
+        Step::Write(packet(0x21, 0x80, 0, 0)),
+        read(&packet(0x21, 0x80, 1, 96)),
+        read(&[]),
     ]);
     let hid = FakeHid::new(vec![device], steps);
     let clock = FakeClock::default();
@@ -187,10 +195,76 @@ fn blackshark_keeps_the_receiver_open_and_refresh_does_not_bypass_quiet_period()
     clock.sleep(Duration::from_secs(60));
     assert_eq!(poll(&mut provider, &hid, &clock)[0].charging, Some(true));
     assert_eq!(hid.opened.lock().unwrap().len(), 1);
+    clock.sleep(Duration::from_secs(240));
+    let refreshed = poll(&mut provider, &hid, &clock);
+    assert_eq!(refreshed[0].level, Some(96));
+    assert_eq!(
+        refreshed[0].charging, None,
+        "A missed charge reply must not reuse old evidence"
+    );
     provider.invalidate();
     let stale = poll(&mut provider, &hid, &clock);
-    assert_eq!(stale[0].level, Some(97));
+    assert_eq!(stale[0].level, Some(96));
     assert_eq!(stale[0].connection, Connection::Sleeping);
     assert_eq!(stale[0].charging, None);
     hid.done();
+}
+
+#[test]
+fn jabra_does_not_repeat_an_unavailable_name_query_on_each_battery_poll() {
+    let mut dongle = info(0x0b0e, 0x24c7, 0xff00);
+    dongle.interface = 3;
+    let hid = FakeHid::new(
+        vec![dongle],
+        vec![
+            Step::Write(padded(&[5, 4, 0, 1, 0x46, 0x12, 2], 64)),
+            read(&[5, 0, 4, 1, 0xc8, 0x12, 2, 0, 21]),
+            Step::Write(padded(&[5, 4, 0, 2, 0x46, 2, 0], 64)),
+            read(&[5, 0, 4, 2, 0xc6, 0xfe]),
+            Step::Write(padded(&[5, 4, 0, 3, 0x46, 0x12, 2], 64)),
+            read(&[5, 0, 4, 3, 0xc8, 0x12, 2, 0, 20]),
+        ],
+    );
+    let clock = FakeClock::default();
+    let mut provider = HidProvider::new("jabra");
+    assert_eq!(poll(&mut provider, &hid, &clock)[0].level, Some(21));
+    clock.sleep(Duration::from_secs(60));
+    assert_eq!(poll(&mut provider, &hid, &clock)[0].level, Some(20));
+    hid.done();
+}
+
+#[test]
+fn receiver_recovers_when_its_cached_collection_becomes_inaccessible() {
+    let mut primary = info(0x1b1c, 0x0a6b, 0xff42);
+    primary.interface = 3;
+    primary.serial = "SYNTHETIC-HS80".into();
+    let mut alternate = primary.clone();
+    alternate.path.push_str("-alternate");
+    let infos = vec![primary.clone(), alternate.clone()];
+    let steps = || {
+        vec![
+            read(&[]),
+            Step::Write(padded(&[2, 9, 2, 0x0f], 64)),
+            read(&[1, 1, 2, 0, 0xf4, 1]),
+        ]
+    };
+    let clock = FakeClock::default();
+    let mut provider = HidProvider::new("corsair");
+    let hid = FakeHid::new(infos.clone(), steps());
+    assert_eq!(poll(&mut provider, &hid, &clock)[0].level, Some(50));
+    hid.done();
+    let inaccessible =
+        FakeHid::new(infos.clone(), vec![]).fail_open(&primary.path, "collection busy");
+    assert!(
+        provider
+            .poll(&inaccessible, &context(&clock, &AtomicBool::new(false)))
+            .is_err()
+    );
+    let recovered = FakeHid::new(infos, steps()).fail_open(&primary.path, "collection busy");
+    assert_eq!(poll(&mut provider, &recovered, &clock)[0].level, Some(50));
+    assert_eq!(
+        *recovered.opened.lock().unwrap(),
+        [primary.path, alternate.path]
+    );
+    recovered.done();
 }

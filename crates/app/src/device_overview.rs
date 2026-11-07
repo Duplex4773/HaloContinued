@@ -1,6 +1,7 @@
 //! Presentation-only device overview. Existing controls retain their commands,
 //! drafts and validation. Card resources exist only while the dashboard is open.
 use super::*;
+use std::borrow::Cow;
 
 const FIRST_CARD: u16 = 1000;
 const LAST_CARD: u16 = 32767;
@@ -25,11 +26,17 @@ pub(super) fn number(value: u32) -> String {
     }
 }
 
-fn clean_line(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+fn clean_line(value: &str) -> Cow<'_, str> {
+    if value.chars().any(char::is_control) {
+        Cow::Owned(
+            value
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 fn boost_menu_rates(
@@ -474,14 +481,14 @@ impl State {
             if let Some(i) = self.overview_keys.iter().position(|key| key == device.key) {
                 let id = FIRST_CARD + i as u16;
                 let caption = self.overview_caption(device, battery);
-                let previous = self.text(id);
-                if previous != caption {
+                let hwnd = self.controls[&id];
+                if !control_text_matches(hwnd, &caption) {
+                    let previous = self.text(id);
                     // Battery values do not change row height. Only remeasure
                     // when the name or connection label changes its wrapping.
                     if previous.lines().nth(1) != caption.lines().nth(1)
                         || previous.lines().nth(3) != caption.lines().nth(3)
                     {
-                        let hwnd = self.controls[&id];
                         let height =
                             crate::dashboard_widgets::roster_height(hwnd, &caption, self.font);
                         let mut bounds = RECT::default();
@@ -492,7 +499,10 @@ impl State {
                             }
                         }
                     }
-                    self.set_control_text(id, &caption);
+                    let text = wide(&caption);
+                    unsafe {
+                        let _ = SetWindowTextW(hwnd, PCWSTR(text.as_ptr()));
+                    }
                 }
             }
             if Some(device.key) != self.selected_device.as_deref() {

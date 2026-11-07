@@ -112,11 +112,16 @@ impl Community {
         let endpoint = (d.vid, d.pid, trusted_identity(i));
         let battery = query(0x12, 2)?.and_then(|r| p::battery(*r.get(1)?, Some(r[0] & 1 != 0)));
         let Some(battery) = battery else {
-            self.hints.get_mut(&endpoint).unwrap().headset_name = None;
+            let hint = self.hints.get_mut(&endpoint).unwrap();
+            hint.headset_name = None;
+            hint.headset_name_checked = false;
             return Ok(None);
         };
         let hint = self.hints.get_mut(&endpoint).unwrap();
-        if hint.headset_name.is_none() {
+        if !hint.headset_name_checked && c.active() {
+            // The name is optional. Cache a negative result until the link
+            // drops or discovery changes, so battery polling stays responsive.
+            hint.headset_name_checked = true;
             hint.headset_name = query(2, 0).ok().flatten().and_then(|r| {
                 let length = usize::from(*r.first()?);
                 let name = std::str::from_utf8(r.get(1..1 + length)?).ok()?.trim();
@@ -271,6 +276,9 @@ impl BlackShark {
             return Ok(());
         }
         self.level = None;
+        // The level and charging replies are independent. If only the level
+        // answers this refresh, the previous charging flag is no longer current.
+        self.charging = None;
         self.next_query = c.clock.monotonic() + REFRESH;
         for attempt in 0..3 {
             if attempt > 0 && !pause(c, 700) {

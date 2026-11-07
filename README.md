@@ -28,22 +28,26 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Latest release: **1.1.2** for Windows 11 x64, available as an unsigned per-user
+Latest release: **1.1.3** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.1.2 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.2/HaloContinued-1.1.2-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.1.2 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.2/HaloContinued-1.1.2-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.3 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.3/HaloContinued-1.1.3-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.3 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.3/HaloContinued-1.1.3-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.2/HaloContinued-1.1.2-SHA256SUMS.txt)
-· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.2)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.3/HaloContinued-1.1.3-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.3)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
+**New in 1.1.3:** Better recovery when a battery collection becomes inaccessible,
+fewer redundant Jabra queries, corrected BlackShark V3 charging status, and
+smoother History resizing. See the [1.1.3 changelog](CHANGELOG.md#halo-continued-113).
+
 **New in 1.1.2:** Device workspace updates, a read-only Windows mouse acceleration
 check, battery support for nine more models, and fixes for tray recovery, polling
-rate readback, and battery history. See the [1.1.2 changelog](CHANGELOG.md).
+rate readback, and battery history. See the [1.1.2 changelog](CHANGELOG.md#halo-continued-112).
 
 **New in 1.1.1:**
 

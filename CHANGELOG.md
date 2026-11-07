@@ -1,3 +1,19 @@
+# Halo Continued 1.1.3
+
+Released 7 November 2026 for Windows 11 x64.
+
+## Device monitoring
+
+- Retry alternate eligible HID collections on a subsequent poll if the preferred collection becomes inaccessible.
+- Cache an unavailable Jabra headset name for the current connection, so optional name requests cannot delay every battery poll.
+- Clear an old BlackShark V3 charging flag if a fresh battery query does not return charging information.
+
+## Dashboard and performance
+
+- Preserve the History graph when only the window height changes. Reload samples when the graph width changes.
+- Redraw History when the last device disappears.
+- Avoid allocating copies of unchanged device captions and updating controls just before rebuilding the dashboard.
+
 # Halo Continued 1.1.2
 
 Released 7 November 2026 for Windows 11 x64.

@@ -1629,18 +1629,23 @@ struct SleepUi {
 struct HistoryResize {
     active: bool,
     pending: bool,
+    queried_width: Option<usize>,
 }
 impl HistoryResize {
     fn begin(&mut self) {
         self.active = true;
         self.pending = false;
     }
-    fn changed(&mut self) -> bool {
+    fn sample_width(client_width: i32) -> usize {
+        (client_width - 80).max(20) as usize
+    }
+    fn changed(&mut self, client_width: i32) -> bool {
+        let changed = self.queried_width != Some(Self::sample_width(client_width));
         if self.active {
-            self.pending = true;
+            self.pending = changed;
             false
         } else {
-            true
+            changed
         }
     }
     fn finish(&mut self) -> bool {
@@ -2186,7 +2191,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     }
                 }
                 if Some(hwnd) == s.dashboard && s.page == 2 && wp.0 as u32 != SIZE_MINIMIZED {
-                    if s.history_resize.changed() {
+                    if s.history_resize.changed(i32::from(lp.0 as u16)) {
                         s.query();
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -5713,6 +5718,11 @@ impl State {
             axis: self.history.axis,
             ..Default::default()
         };
+        if let Some(h) = self.dashboard {
+            unsafe {
+                let _ = InvalidateRect(Some(h), None, false);
+            }
+        }
         let Some(d) = self.snapshot.devices.get(self.selected) else {
             self.history_queued = None;
             self.set_control_text(97, "Connect a battery-powered device to see its history.");
@@ -5724,15 +5734,13 @@ impl State {
         unsafe {
             if let Some(h) = self.dashboard {
                 let _ = GetClientRect(h, &mut r);
-                let _ = InvalidateRect(Some(h), None, false);
             }
         }
-        let command = self.history.command(
-            d.reading.key.clone(),
-            until,
-            (r.right - 80).max(20) as usize,
-            self.request,
-        );
+        let width = HistoryResize::sample_width(r.right);
+        self.history_resize.queried_width = Some(width);
+        let command = self
+            .history
+            .command(d.reading.key.clone(), until, width, self.request);
         if self.history_pending.is_some() {
             self.history_queued = Some(Box::new(command));
         } else {
@@ -5994,11 +6002,13 @@ impl State {
                 self.insights.invalidate();
                 self.insights.select(selected_key.cloned());
             }
-            self.refresh_device_details();
+            let rebuild = (identity_changed && self.page != 3)
+                || ((charging_changed || replaced_device) && self.page == 1);
+            if !rebuild {
+                self.refresh_device_details();
+            }
             self.sync_trays(TrayUpdate::Changed);
-            if (identity_changed && self.page != 3)
-                || ((charging_changed || replaced_device) && self.page == 1)
-            {
+            if rebuild {
                 self.build()
             } else if let Some(h) = self.controls.get(&10) {
                 for i in changed_labels {
@@ -9115,20 +9125,27 @@ mod history_tests {
     fn interactive_resize_defers_queries_until_finished() {
         let mut resize = HistoryResize::default();
         assert!(
-            resize.changed(),
-            "Maximize/restore resizes reload immediately"
+            resize.changed(900),
+            "A new width outside a drag reloads immediately"
         );
+        resize.queried_width = Some(HistoryResize::sample_width(900));
+        assert!(!resize.changed(900), "A height-only resize keeps the chart");
         resize.begin();
         for _ in 0..500 {
             assert!(
-                !resize.changed(),
+                !resize.changed(950),
                 "Dragging must not enqueue queries per pixel"
             );
         }
         assert!(resize.finish(), "One query is needed for the final width");
         assert!(!resize.finish(), "No duplicate query after finishing");
         resize.begin();
-        assert!(!resize.finish(), "Moving without resizing needs no query");
+        assert!(!resize.changed(950));
+        assert!(!resize.changed(900));
+        assert!(
+            !resize.finish(),
+            "Returning to the sampled width needs no query"
+        );
     }
     #[test]
     fn time_used_is_default_and_routes_24_hours_to_usage_query() {
@@ -11093,8 +11110,16 @@ mod dashboard_lifecycle_tests {
             }
             let resize_request = context.state.borrow().request;
             send(first, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+            let mut client = RECT::default();
+            GetClientRect(first, &mut client).unwrap();
+            let changed_width = (client.right + 32) as isize;
             for _ in 0..500 {
-                send(first, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
+                send(
+                    first,
+                    WM_SIZE,
+                    WPARAM(SIZE_RESTORED as usize),
+                    LPARAM(changed_width),
+                );
             }
             assert_eq!(context.state.borrow().request, resize_request);
             assert!(!context.state.borrow().series.samples.is_empty());

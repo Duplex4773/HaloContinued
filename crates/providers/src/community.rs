@@ -35,6 +35,7 @@ struct Hint {
     path: Option<String>,
     swept: Option<Duration>,
     headset_name: Option<String>,
+    headset_name_checked: bool,
 }
 
 fn legacy_gwolves_collection(i: &HidInfo, infos: &[&HidInfo]) -> bool {
@@ -291,6 +292,10 @@ impl Community {
                 .path
                 .as_ref()
                 .is_some_and(|p| mine.iter().any(|i| &i.path == p));
+            if !known {
+                hint.headset_name = None;
+                hint.headset_name_checked = false;
+            }
             let heard = self.last.get(&k).map(|(_, t)| *t);
             let resweep =
                 !known || heard.is_none_or(|t| now.saturating_sub(t) >= Duration::from_secs(600));
@@ -347,6 +352,11 @@ impl Community {
                     Err(e) => {
                         self.log(format!("{}: {}", d.name, e));
                         failures.push(e);
+                        // The next poll can try the other eligible collections.
+                        // Keep the passive and BlackShark probing limits intact.
+                        if known && !passive && protocol(&d) != "blackshark-v3" {
+                            self.hints.get_mut(&endpoint).unwrap().path = None;
+                        }
                     }
                 }
             }
