@@ -52,6 +52,14 @@ pub const FAMILIES: &[(&str, &str)] = &[
     ("eweadn", "EWEADN mice"),
     ("jabra", "Jabra headsets"),
     ("monsgeek", "MonsGeek keyboards"),
+    ("alienware", "Alienware keyboards"),
+    ("endgame_we", "Endgame Gear mice"),
+    ("glorious", "Glorious mice"),
+    ("irocks", "i-Rocks mice"),
+    ("plantronics", "Poly headsets"),
+    ("sony_inzone", "Sony INZONE headsets"),
+    ("urx", "URX keyboards"),
+    ("vaxee", "VAXEE mice"),
 ];
 pub fn providers() -> Vec<Box<dyn BatteryProvider>> {
     FAMILIES
@@ -1480,7 +1488,9 @@ impl HidProvider {
         let mut headsets = BTreeMap::new();
         for d in infos {
             let key = (d.product_id, receiver_key(d));
-            if d.usage_page == 0xff00 && [1, 2].contains(&d.usage) {
+            if d.product_id == 0x0ac4 && (d.usage_page, d.usage) == (0xff43, 0x202) {
+                groups.entry(key).or_default().insert(3, d);
+            } else if d.usage_page == 0xff00 && [1, 2].contains(&d.usage) {
                 groups.entry(key).or_default().insert(d.usage as u8, d);
             } else if DEVICES.iter().any(|known| {
                 known.provider == "logitech"
@@ -1513,10 +1523,29 @@ impl HidProvider {
             .retain(|slot| active_slots.contains(slot));
         self.logitech_slots
             .retain(|slot, _| active_slots.contains(slot));
+        self.last
+            .retain(|key, _| self.logitech_slots.values().any(|live| live == key));
+        let mut failure = None;
         let mut found: BTreeMap<String, Reading> = BTreeMap::new();
         for ((pid, group), paths) in &groups {
             if !c.active() {
                 break;
+            }
+            if let Some(info) = paths.get(&3) {
+                match hid
+                    .open(info)
+                    .and_then(|mut session| Self::query_g535(&mut *session, c))
+                {
+                    Ok(Some(battery)) => {
+                        self.keep_logitech_register(battery, info, group, 255, c, &mut found)
+                    }
+                    Ok(None) => self.log("Logitech G535: no charge register reply"),
+                    Err(error) => {
+                        self.log(format!("Logitech G535: {error}"));
+                        failure = Some(error);
+                    }
+                }
+                continue;
             }
             let Some(long_info) = paths.get(&2) else {
                 continue;
@@ -1525,6 +1554,7 @@ impl HidProvider {
                 Ok(s) => s,
                 Err(e) => {
                     self.log(format!("open: {e}"));
+                    failure = Some(e);
                     continue;
                 }
             };
@@ -1665,6 +1695,7 @@ impl HidProvider {
             })();
             if let Err(e) = result {
                 self.log(format!("channel error: {e}"));
+                failure = Some(e);
             }
             self.logitech_timeout = 600;
         }
@@ -1677,7 +1708,7 @@ impl HidProvider {
         self.last.retain(|key, reading| {
             if found.contains_key(key) {
                 true
-            } else if !groups.is_empty()
+            } else if self.logitech_slots.values().any(|live| live == key)
                 && self
                     .last_observed
                     .get(key)
@@ -1693,7 +1724,13 @@ impl HidProvider {
         });
         self.last_observed
             .retain(|key, _| self.last.contains_key(key));
-        Ok(out)
+        if found.is_empty()
+            && let Some(error) = failure
+        {
+            Err(error)
+        } else {
+            Ok(out)
+        }
     }
     fn cached(&self, key: &str, now: Duration) -> Option<Reading> {
         let r = self.last.get(key)?;
@@ -1755,7 +1792,7 @@ include!("upstream114.rs");
 include!("upstream115.rs");
 fn set_battery(r: &mut Reading, b: Battery) {
     r.level = Some(b.level);
-    r.charging = b.charging.or(Some(false));
+    r.charging = b.charging;
     if b.coarse {
         r.precision = Precision::Coarse;
         r.approx = b.label.or_else(|| Some(format!("about {}%", b.level)));
@@ -1842,7 +1879,7 @@ pub fn receiver_key(info: &HidInfo) -> String {
 pub(crate) fn trusted_identity(info: &HidInfo) -> String {
     valid_identity_value(&info.serial).unwrap_or_else(|| receiver_key(info))
 }
-fn valid_identity_value(value: &str) -> Option<String> {
+pub(crate) fn valid_identity_value(value: &str) -> Option<String> {
     usable_identity_value(value).then(|| value.trim().to_ascii_uppercase())
 }
 fn usable_identity_value(value: &str) -> bool {
@@ -1922,7 +1959,9 @@ fn candidate(id: &str, d: &Device, i: &HidInfo) -> bool {
         "keychron" => i.interface == 4,
         "pulsar" => usage == (0xff02, 2) || (i.interface == 1 && i.usage_page >= 0xff00),
         "corsair" => {
-            if ["nxp", "bragi"].contains(&d.variant) {
+            if d.pid == 0x1bdc {
+                i.usage_page == 0xff42 && matches!(i.usage, 1 | 2)
+            } else if ["nxp", "bragi"].contains(&d.variant) {
                 i.usage_page == 0xff42 && (d.variant != "bragi" || i.usage == 1)
             } else {
                 i.interface == 4 && i.usage_page >= 0xff00
@@ -1966,6 +2005,7 @@ fn candidate_group(id: &str, d: &Device, i: &HidInfo, infos: &[&HidInfo]) -> boo
                 .or_else(|| mine.first());
             picked.is_some_and(|picked| picked.path == i.path)
         }
+        "corsair" if d.pid == 0x1bdc => candidate(id, d, i),
         "corsair" if ["nxp", "bragi"].contains(&d.variant) => {
             if mine.iter().any(|other| other.usage_page == 0xff42) {
                 i.usage_page == 0xff42 && (d.variant != "bragi" || i.usage == 1)
@@ -2050,7 +2090,11 @@ impl BatteryProvider for HidProvider {
         self.playstation_budget.clear();
         let mut inventories = Vec::new();
         for &vendor in &self.vendors {
-            let devices = hid.enumerate_shared(vendor)?;
+            let devices = if self.id == "sony_inzone" {
+                hid.enumerate_serial(vendor)?
+            } else {
+                hid.enumerate_shared(vendor)?
+            };
             if !devices.is_empty() {
                 inventories.push(devices);
             }
@@ -2466,7 +2510,8 @@ impl BatteryProvider for HidProvider {
                             "steelseries",
                         ]
                         .contains(&self.id)
-                            && !(["nxp", "bragi"].contains(&d.variant) && d.pid == 0x1b7f
+                            && !(["nxp", "bragi"].contains(&d.variant)
+                                && matches!(d.pid, 0x1b7f | 0x1bdc)
                                 || d.variant.contains("rival")
                                 || d.variant.contains("aerox"))
                     {
@@ -2475,7 +2520,9 @@ impl BatteryProvider for HidProvider {
                         "mouse"
                     }
                     .into();
-                    r.via = if is_bluetooth(&i.path) {
+                    r.via = if self.id == "corsair" && d.pid == 0x1bdc {
+                        "wireless"
+                    } else if is_bluetooth(&i.path) {
                         "bluetooth"
                     } else {
                         "usb"
@@ -2485,6 +2532,9 @@ impl BatteryProvider for HidProvider {
                         r.via = "wireless".into();
                     }
                     set_battery(&mut r, b);
+                    if self.id == "corsair" && d.pid == 0x1bdc {
+                        r.charging = None;
+                    }
                     if self.id == "razer"
                         && d.pid == 0x0528
                         && let Some((level, charging)) = self.blackshark_reading

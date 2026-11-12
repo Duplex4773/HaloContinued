@@ -718,5 +718,173 @@
     ],
     "pull_request": 363,
     "revision": "cf1ef93e5c6718bc2b310e1f2b78522ed037bc24"
+  },
+  {
+    "device": [
+      "corsair",
+      6940,
+      7132,
+      "Corsair M75 Wireless",
+      "bragi",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "e03730430e50ea248cbc6c5f9e45730eb9d00deb"
+  },
+  {
+    "device": [
+      "pulsar",
+      14139,
+      4122,
+      "ATK X1 Pro",
+      "pr:compx",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "e03730430e50ea248cbc6c5f9e45730eb9d00deb"
+  },
+  {
+    "device": [
+      "endgame_we",
+      13159,
+      6497,
+      "Endgame Gear XM2we",
+      "pr:endgame-we",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "d85b5df4a272bf2e4354acc7b289cd46b22488f9"
+  },
+  {
+    "device": [
+      "irocks",
+      5285,
+      49161,
+      "i-Rocks M31R",
+      "pr:irocks",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "e03730430e50ea248cbc6c5f9e45730eb9d00deb"
+  },
+  {
+    "device": [
+      "irocks",
+      5285,
+      49168,
+      "i-Rocks M31R",
+      "pr:irocks",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "e03730430e50ea248cbc6c5f9e45730eb9d00deb"
+  },
+  {
+    "device": [
+      "glorious",
+      9610,
+      8226,
+      "Glorious Model O Wireless",
+      "pr:glorious",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "b57df0d6fce54f8b11ca5ea3eab4735da436c170"
+  },
+  {
+    "device": [
+      "glorious",
+      9610,
+      8209,
+      "Glorious Model O Wireless",
+      "pr:glorious-cable",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "b57df0d6fce54f8b11ca5ea3eab4735da436c170"
+  },
+  {
+    "device": [
+      "vaxee",
+      12375,
+      8193,
+      "VAXEE wireless mouse",
+      "pr:vaxee",
+      0
+    ],
+    "fork": "Malo-LC/HaloBattery",
+    "revision": "e7f9d6606a824614d56097b1e65effc71cb2fa8e"
+  },
+  {
+    "device": [
+      "alienware",
+      16700,
+      8477,
+      "Alienware Pro Wireless Gaming Keyboard",
+      "pr:alienware",
+      0
+    ],
+    "fork": "casparas123/HaloBattery",
+    "revision": "92335150a0e51529ad7f1bda6f41064e4069d1ef"
+  },
+  {
+    "device": [
+      "urx",
+      14000,
+      12290,
+      "URX Core75",
+      "pr:urx",
+      0
+    ],
+    "fork": "casparas123/HaloBattery",
+    "revision": "5f28496bb6a28f77d9adee54c1a2ebc469b7149b"
+  },
+  {
+    "device": [
+      "aula",
+      13652,
+      64009,
+      "AULA F87 Pro",
+      "pr:f87-pro",
+      0
+    ],
+    "fork": "Ash91323/HaloBattery",
+    "revision": "a759ad2de63bd4c11c8250ffdc3d5bf126ef970a"
+  },
+  {
+    "device": [
+      "sony_inzone",
+      1356,
+      3667,
+      "Sony INZONE H9",
+      "pr:inzone-h9",
+      0
+    ],
+    "fork": "BoringMan314/bm-halo-battery",
+    "revision": "b8d9b7dc88b27277a0455b154b3249db9f4f73a5"
+  },
+  {
+    "device": [
+      "plantronics",
+      1151,
+      759,
+      "Poly Voyager 8200 UC",
+      "pr:bt600",
+      0
+    ],
+    "fork": "casparas123/HaloBattery",
+    "revision": "e4a060fde326ef614dbe38ed65f3bb563d5abfa1"
+  },
+  {
+    "device": [
+      "razer",
+      5426,
+      1362,
+      "Razer Barracuda X (2022)",
+      "pr:barracuda-x",
+      0
+    ],
+    "fork": "ahmedkhursheed23/HaloBattery",
+    "revision": "89d17a2a738dac871e24f01fd48e4e04779b40d9"
   }
 ]

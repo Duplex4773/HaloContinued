@@ -28,16 +28,20 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-Latest release: **1.1.3** for Windows 11 x64, available as an unsigned per-user
+**New in 1.1.4:** More devices report battery levels, Insights better tracks
+Game boost and Battery saver, and Refresh reliably requests firmware information.
+See the [1.1.4 changelog](CHANGELOG.md#halo-continued-114).
+
+Latest GitHub release: **1.1.4** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.1.3 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.3/HaloContinued-1.1.3-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.1.3 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.3/HaloContinued-1.1.3-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.4 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.4/HaloContinued-1.1.4-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.4 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.4/HaloContinued-1.1.4-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.3/HaloContinued-1.1.3-SHA256SUMS.txt)
-· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.3)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.4/HaloContinued-1.1.4-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.4)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
@@ -274,6 +278,23 @@ through [`2251f05`](https://github.com/HeyOkay/HaloBattery/commit/2251f05):
 Receiver/cable readings share an icon when trusted hardware identity proves they
 belong together. Devices with ambiguous identities remain separate. These are
 battery-support additions; they do not expand polling, DPI or sleep write allowlists.
+
+### Battery support from HaloBattery forks
+
+The current source includes these battery readers. Hardware evidence comes
+from the cited forks and device owners. The Rust implementations are covered
+by simulated transport tests.
+
+| Device | Connection and readings |
+| --- | --- |
+| Corsair M75 Wireless, ATK X1 Pro | Receivers `1B1C:1BDC` and `373B:101A`. M75 reports level, X1 Pro also reports charging. [M75 report](https://github.com/HeyOkay/HaloBattery/issues/301) · [X1 Pro report](https://github.com/HeyOkay/HaloBattery/issues/230) |
+| Endgame Gear XM2we, i-Rocks M31R | XM2we receiver `3367:1961`. M31R receiver `14A5:C009` and cable `14A5:C010`. Both report battery and charging. [XM2we source](https://github.com/ahmedkhursheed23/HaloBattery/commit/d85b5df) · [M31R report](https://github.com/HeyOkay/HaloBattery/issues/309) |
+| Glorious Model O Wireless, VAXEE E1 Wireless | Glorious receiver `258A:2022`. USB cable presence can indicate charging when cable and receiver identities match. VAXEE receiver `3057:2001` reports 5% steps and charging. [Glorious report](https://github.com/HeyOkay/HaloBattery/issues/281) · [VAXEE source](https://github.com/Malo-LC/HaloBattery/commit/e7f9d66) |
+| Alienware Pro Wireless Gaming Keyboard, URX Core75, AULA F87 Pro | Receivers `413C:211D`, `36B0:3002`, and `3554:FA09`. Alienware reports charging. URX and AULA report level only. The F87 Pro is identified by its hardware model reply on the shared receiver. [Alienware report](https://github.com/HeyOkay/HaloBattery/issues/287) · [URX source](https://github.com/casparas123/HaloBattery/commit/5f28496) · [AULA source](https://github.com/Ash91323/HaloBattery/commit/a759ad2) |
+| Sony INZONE H9, Poly Voyager 8200 UC, Razer Barracuda X (2022) | H9 receiver `054C:0E53` uses its USB serial interface. Poly BT600 adapter `047F:02F7` reports battery and charging. Barracuda X receiver `1532:0552` reports voltage, shown as an estimated percentage. [H9 captures](https://github.com/BoringMan314/bm-halo-battery/blob/b8d9b7d/hardware-evidence/README.md) · [Poly source](https://github.com/casparas123/HaloBattery/commit/e4a060f) · [Barracuda source](https://github.com/ahmedkhursheed23/HaloBattery/commit/89d17a2) |
+| Logitech G535 | Existing `046D:0AC4` entry gains the charge-register reader on its vendor collection. [G535 report](https://github.com/HeyOkay/HaloBattery/issues/339) |
+
+### Battery support from parent pull requests
 
 Additional battery support from **hardware-confirmed parent pull requests**, reviewed
 25 October 2026. The reports confirm the connections listed here; the Rust implementations

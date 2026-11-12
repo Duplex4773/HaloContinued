@@ -48,7 +48,7 @@ fn steel_classic_arctis1_and_arctis9_exact_transactions_names_and_gate() {
             vec![6, 0x12],
             vec![6, 0x12, 0, 85],
             85,
-            Some(false),
+            None,
             "Arctis 1 Wireless",
         ),
         (
@@ -535,7 +535,7 @@ fn infinity_report_id_tolerance_clamp_and_exact_zero_payload_request() {
                 "am_infinity:FIXTURE-AM_INFINITY-5007",
                 "AM Infinity 8K Mouse",
                 Some(100),
-                Some(false),
+                None,
                 "mouse"
             )
         );

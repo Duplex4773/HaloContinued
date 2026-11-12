@@ -505,14 +505,16 @@ pub fn logitech(feature: u16, r: &[u8]) -> Option<Battery> {
             if mv < 2500 || feature == 0x1f20 && r[2] & 1 == 0 {
                 return None;
             }
-            battery(
+            let mut result = battery(
                 voltage_to_percent(mv),
                 Some(if feature == 0x1001 {
                     r[2] & 128 != 0
                 } else {
                     r[2] & 2 != 0
                 }),
-            )
+            )?;
+            result.coarse = true;
+            Some(result)
         }
         _ => None,
     }

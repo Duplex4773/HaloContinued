@@ -1,4 +1,5 @@
 pub mod displays;
+mod inzone_serial;
 pub mod platform;
 pub mod system;
 pub mod transport;

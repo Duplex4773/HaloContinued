@@ -577,21 +577,24 @@ impl Store {
                 activity,
             );
         }
+        let identity_since = builder.identity_since();
+        let activity_since = identity_since.unwrap_or(until.saturating_sub(30 * 86400));
         let mut result = builder.finish_at(until);
         if self.has_polling_events {
-            // A reused identity can cut the interval later than seven days ago.
+            // Replay retained context before the seven-day reporting window:
+            // saver may already be active at its boundary. Only recent changes
+            // contribute to the activity counts below.
+            // A reused identity cuts context at its physical replacement.
             // At its first timestamp, both units can have saved an event: require
             // matching session evidence within the new unit's retained period.
-            let sql = if self.has_usage_metadata
-                && result.recent.since > until.saturating_sub(7 * 86400)
-            {
-                "SELECT kind,rate,previous_rate FROM polling_events e WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?2 OR EXISTS(SELECT 1 FROM usage_metadata m WHERE m.device=e.device AND m.ts BETWEEN ?2 AND ?3 AND m.session=e.session)) ORDER BY ts,rowid"
+            let sql = if self.has_usage_metadata && identity_since.is_some() {
+                "SELECT kind,rate,previous_rate,ts FROM polling_events e WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?2 OR EXISTS(SELECT 1 FROM usage_metadata m WHERE m.device=e.device AND m.ts BETWEEN ?2 AND ?3 AND m.session=e.session)) ORDER BY ts,rowid"
             } else {
-                "SELECT kind,rate,previous_rate FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid"
+                "SELECT kind,rate,previous_rate,ts FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid"
             };
             let mut query = self.db.prepare(sql).map_err(sql_error)?;
             let mut rows = query
-                .query(params![key, result.recent.since, until])
+                .query(params![key, activity_since, until])
                 .map_err(sql_error)?;
             let mut saver_rate = None;
             while let Some(row) = rows.next().map_err(sql_error)? {
@@ -629,7 +632,7 @@ impl Store {
                         saver_rate = Some(rate);
                         previous.filter(|previous| *previous > rate)
                     }
-                    "boost" if previous != saver_rate => {
+                    "boost" if previous != Some(rate) && previous != saver_rate => {
                         saver_rate = None;
                         previous.filter(|previous| *previous < rate)
                     }
@@ -645,7 +648,9 @@ impl Store {
                 // Same-rate confirmations can transfer ownership from an
                 // automatic boost to a manual choice. Keep those events for
                 // interval classification, but do not count a hardware change.
-                if previous == Some(rate) {
+                if previous == Some(rate)
+                    || row.get::<_, i64>(3).map_err(sql_error)? < result.recent.since
+                {
                     continue;
                 }
                 match kind {

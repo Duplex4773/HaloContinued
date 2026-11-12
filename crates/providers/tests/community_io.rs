@@ -29,6 +29,7 @@ fn packet(hex: &str) -> Vec<u8> {
 fn newly_reviewed_compx_devices_use_only_vendor_collection() {
     for (provider, vid, pid) in [
         ("pulsar", 0x373b, 0x10c9),
+        ("pulsar", 0x373b, 0x101a),
         ("lamzu", 0x3554, 0xf510),
         ("lamzu", 0x3554, 0xf50f),
     ] {
@@ -105,9 +106,14 @@ fn pinned_reviewed_catalog_has_unique_ids_and_excludes_unconfirmed_transports() 
         assert_eq!(d.variant, row[4].as_str().unwrap());
         assert_eq!(u64::from(d.parameter), row[5].as_u64().unwrap());
         assert_eq!(entry["revision"].as_str().unwrap().len(), 40);
-        assert!(entry["pull_request"].as_u64().unwrap() > 0);
+        assert!(
+            entry["pull_request"].as_u64().is_some_and(|n| n > 0)
+                || entry["fork"]
+                    .as_str()
+                    .is_some_and(|name| name.contains('/'))
+        );
     }
-    assert_eq!(seen.len(), 60);
+    assert_eq!(seen.len(), 74);
     for (vid, pid) in [
         (0x1532, 0x00df),
         (0x1532, 0x00de),

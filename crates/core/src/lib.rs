@@ -181,6 +181,11 @@ pub trait HidTransport: Send + Sync {
     fn enumerate_shared(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
         self.enumerate(vendor).map(Into::into)
     }
+    /// Auxiliary serial discovery is isolated from HID discovery failures.
+    /// Simulated transports may supply both kinds in their common inventory.
+    fn enumerate_serial(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
+        self.enumerate_shared(vendor)
+    }
     fn open(&self, info: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError>;
 }
 /// No allocation for an empty inventory; populated snapshots share the existing

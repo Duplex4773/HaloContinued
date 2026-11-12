@@ -1,3 +1,20 @@
+# Halo Continued 1.1.4
+
+## Device monitoring
+
+- Add battery monitoring for Corsair M75 Wireless, ATK X1 Pro, Endgame Gear XM2we, i-Rocks M31R, Glorious Model O Wireless, VAXEE E1 Wireless, Alienware Pro Wireless Gaming Keyboard, URX Core75, AULA F87 Pro, Sony INZONE H9, Poly Voyager 8200 UC and Razer Barracuda X (2022).
+- Extend Logitech G535 monitoring with charge-register support. See the [device support table](README.md#battery-support-from-halobattery-forks) for connection details and hardware reports. The Rust readers were tested with simulated transports.
+- Clear inferred Glorious charging when the cable is removed, and keep the original battery sample timestamp when the cable is detected without a fresh percentage.
+- Keep receiver discovery and identity checks separate for devices with similar hardware, and retain cached metadata when a collection is temporarily inaccessible.
+
+## Insights and dashboard
+
+- Preserve Game boost and Battery saver usage attribution after Refresh when a fresh read confirms the same rate and hardware connection.
+- Preserve that attribution through sleep while excluding sleep time from the usage estimate.
+- Keep older Battery saver events in the normal-rate calculation while counting only recent changes in the activity summary.
+- Read firmware information after Refresh updates the device connection state, so Refresh no longer cancels its own request.
+- Keep the existing device polling schedule when editing appearance or device names.
+
 # Halo Continued 1.1.3
 
 Released 7 November 2026 for Windows 11 x64.

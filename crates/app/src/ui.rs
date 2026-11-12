@@ -4041,10 +4041,6 @@ impl State {
             }
             4 => {
                 self.refresh_mouse_acceleration();
-                if self.page == 1 && self.workspace_sections & INFO_SECTION != 0 {
-                    self.read_device_information(true);
-                    return;
-                }
                 if self.page == 6 {
                     self.query_insights();
                     return;
@@ -6055,6 +6051,11 @@ impl State {
             self.polling_controls();
             self.read_polling();
         }
+        if polling_invalidated && self.dashboard_visible() {
+            // Refresh has now established the new generation. Starting earlier
+            // would cancel our own firmware query with PollingInvalidated.
+            self.read_device_information(false);
+        }
         if self.page == 2
             && self.chart.is_none()
             && self
@@ -6694,6 +6695,14 @@ fn provider_label(id: &str) -> &str {
         "ajazz" => "AJAZZ",
         "shield" => "NVIDIA SHIELD",
         "aula" => "AULA",
+        "alienware" => "Alienware",
+        "endgame_we" => "Endgame Gear",
+        "glorious" => "Glorious",
+        "irocks" => "i-Rocks",
+        "plantronics" => "Poly",
+        "sony_inzone" => "Sony INZONE",
+        "urx" => "URX",
+        "vaxee" => "VAXEE",
         "bluetooth" => "Bluetooth",
         "xinput" => "Xbox / FlyDigi",
         other => other,

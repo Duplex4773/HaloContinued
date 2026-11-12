@@ -15,6 +15,8 @@ use std::{
     time::Duration,
 };
 
+#[path = "fork_devices.rs"]
+mod fork_devices;
 #[path = "reviewed_wireless.rs"]
 mod reviewed_wireless;
 
@@ -75,8 +77,9 @@ fn kind(d: &Device) -> &'static str {
                 "headset"
             }
         }
-        "flow" | "atk-keyboard" | "aula-keyboard" | "k87" | "monsgeek" => "keyboard",
-        "jabra" | "hs80" | "blackshark-v3" => "headset",
+        "flow" | "atk-keyboard" | "aula-keyboard" | "k87" | "monsgeek" | "alienware" | "urx"
+        | "f87-pro" => "keyboard",
+        "jabra" | "hs80" | "blackshark-v3" | "bt600" | "barracuda-x" | "inzone-h9" => "headset",
         "rapoo" if [0x1924, 0x4824].contains(&d.pid) => "keyboard",
         "shield" => "gamepad",
         _ => "mouse",
@@ -106,8 +109,23 @@ fn family(d: &Device) -> u16 {
         _ => d.pid,
     }
 }
+fn endpoint_identity(d: &Device, i: &HidInfo) -> String {
+    if matches!(
+        protocol(d),
+        "endgame-we" | "irocks" | "glorious" | "vaxee" | "f87-pro"
+    ) {
+        crate::provider::receiver_key(i)
+    } else {
+        trusted_identity(i)
+    }
+}
 fn key(d: &Device, i: &HidInfo) -> String {
-    format!("{}:{:04x}:{}", d.provider, family(d), trusted_identity(i))
+    format!(
+        "{}:{:04x}:{}",
+        d.provider,
+        family(d),
+        endpoint_identity(d, i)
+    )
 }
 fn candidate(d: &Device, i: &HidInfo) -> bool {
     let usage = (i.usage_page, i.usage);
@@ -144,7 +162,7 @@ fn candidate(d: &Device, i: &HidInfo) -> bool {
         "shield" => {
             i.output_length.is_none_or(|n| n >= 33) && (i.usage_page >= 0xff00 || usage == (1, 5))
         }
-        _ => false,
+        name => fork_devices::candidate(name, i),
     }
 }
 pub(crate) fn queryable(d: &Device, i: &HidInfo, infos: &[&HidInfo]) -> bool {
@@ -167,6 +185,7 @@ fn keep_sleeping(d: &Device) -> bool {
         "shield"
             | "kingston"
             | "aula-keyboard"
+            | "f87-pro"
             | "atk-keyboard"
             | "skullcandy"
             | "flow"
@@ -214,7 +233,7 @@ impl Community {
                 && queryable(d, i, infos)
                 && protocol(d) != "omni"
             {
-                let group = (d.vid, d.pid, trusted_identity(i));
+                let group = (d.vid, d.pid, endpoint_identity(d, i));
                 if groups.len() >= MAX_DEVICES && !groups.contains_key(&group) {
                     continue;
                 }
@@ -239,7 +258,8 @@ impl Community {
             infos.iter().any(|info| {
                 info.vendor_id == endpoint.0
                     && info.product_id == endpoint.1
-                    && trusted_identity(info) == endpoint.2
+                    && find_device(source, info.vendor_id, info.product_id)
+                        .is_some_and(|d| endpoint_identity(d, info) == endpoint.2)
             })
         });
         // Enumeration can still prove a receiver is present while its control
@@ -363,9 +383,51 @@ impl Community {
             if !c.active() {
                 break;
             }
-            if let Some(r) = found {
+            if found.is_none()
+                && protocol(&d) == "glorious"
+                && infos
+                    .iter()
+                    .any(|i| fork_devices::glorious_cable_matches(mine[0], i))
+            {
+                let mut r = if let Some((last, _)) = self.last.get(&k) {
+                    last.clone()
+                } else {
+                    Reading::new(&k, d.name, d.provider, c.clock.unix())
+                };
+                // The cable establishes power now, not a fresh battery level.
+                // Preserve the last measured sample in the cache and history.
+                r.timestamp = c.clock.unix();
+                r.level = None;
+                r.approx = None;
+                r.kind = kind(&d).into();
+                r.serial = (!mine[0].serial.is_empty()).then(|| mine[0].serial.clone());
+                r.container = mine[0].container.clone();
+                r.connection = Connection::Online;
+                r.charging = Some(true);
+                r.charging_inferred = true;
+                r.via = "usb".into();
+                successful = true;
+                let _ = merge(&mut result, r);
+            } else if let Some(mut r) = found {
+                if protocol(&d) == "glorious" && r.online() {
+                    // Cache measured receiver evidence before adding the cable
+                    // inference, so unplugging cannot leave a charging latch.
+                    self.last
+                        .insert(k.clone(), (r.clone(), c.clock.monotonic()));
+                }
+                if protocol(&d) == "glorious"
+                    && infos
+                        .iter()
+                        .any(|i| fork_devices::glorious_cable_matches(mine[0], i))
+                {
+                    r.charging = Some(true);
+                    r.charging_inferred = true;
+                    r.via = "usb".into();
+                }
                 if let Some(chosen) = merge(&mut result, r)
                     && keep_sleeping(&d)
+                    && protocol(&d) != "glorious"
+                    && chosen.online()
                 {
                     self.last.insert(k, (chosen.clone(), c.clock.monotonic()));
                 }
@@ -406,6 +468,9 @@ impl Community {
         match protocol(d) {
             "blackshark-v3" => return self.blackshark(d, i, hid, c),
             "hs80" => return self.hs80(d, i, infos, hid, c),
+            "endgame-we" | "irocks" => {
+                return fork_devices::split_mouse(d, i, infos, hid, c);
+            }
             _ => {}
         }
         let mut s = hid.open(i)?;
@@ -702,7 +767,12 @@ impl Community {
                 }
                 return Ok(Some(r));
             }
-            _ => None,
+            "barracuda-x" => {
+                let sequence = (self.sequence % 42 * 3) as u8 + 1;
+                self.sequence = self.sequence.wrapping_add(1);
+                fork_devices::barracuda_x(s, c, sequence)?
+            }
+            name => fork_devices::read(name, s, c, i)?,
         };
         Ok(b.map(|b| reading(d, i, b, c)))
     }
@@ -1092,8 +1162,22 @@ fn reading(d: &Device, i: &HidInfo, b: Battery, c: &PollContext<'_>) -> Reading 
     .into();
     if matches!(
         protocol(d),
-        "eweadn" | "k87" | "monsgeek" | "jabra" | "blackshark-v3"
-    ) || d.provider == "pulsar" && matches!(d.pid, 0xf505 | 0xf5dc | 0xf5df)
+        "eweadn"
+            | "k87"
+            | "monsgeek"
+            | "jabra"
+            | "blackshark-v3"
+            | "glorious"
+            | "vaxee"
+            | "alienware"
+            | "urx"
+            | "f87-pro"
+            | "bt600"
+            | "barracuda-x"
+            | "inzone-h9"
+            | "endgame-we"
+    ) || d.provider == "pulsar" && matches!(d.pid, 0xf505 | 0xf5dc | 0xf5df | 0x101a)
+        || d.provider == "irocks" && d.pid == 0xc009
     {
         r.via = "wireless".into();
     }

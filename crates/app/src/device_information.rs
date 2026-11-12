@@ -560,6 +560,45 @@ mod tests {
         assert_eq!(ui.next, 1);
     }
     #[test]
+    fn refreshed_information_accepts_only_the_replacement_request() {
+        let old = request(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut ui = DeviceInfoUi {
+            next: 1,
+            pending: Some((old.clone(), cancelled.clone())),
+            outcome: None,
+        };
+        // Mirror invalidation followed by the read queued at the end of drain.
+        ui.clear();
+        assert!(cancelled.load(Ordering::Acquire));
+        let mut fresh = request(2);
+        fresh.target.generation += 1;
+        assert!(!ui.matches(&fresh.target.device, fresh.target.generation));
+        ui.next = 2;
+        ui.pending = Some((fresh.clone(), Arc::new(AtomicBool::new(false))));
+        for request in [&old, &fresh] {
+            let result = DeviceInfoOutcome::from_result(
+                request,
+                123,
+                Ok(FirmwareVersion {
+                    major: 1,
+                    minor: 21,
+                }),
+            );
+            assert_eq!(
+                ui.accept(
+                    Box::new(result),
+                    &fresh.target.device,
+                    fresh.target.generation
+                ),
+                request.request == 2
+            );
+        }
+        assert!(ui.pending.is_none());
+        assert_eq!(ui.outcome.as_ref().unwrap().request, 2);
+        assert!(ui.matches(&fresh.target.device, fresh.target.generation));
+    }
+    #[test]
     fn connection_and_verification_are_specific_and_do_not_claim_full_certification() {
         let mut device = request(1).target.device;
         assert_eq!(

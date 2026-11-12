@@ -18,6 +18,75 @@ fn observation(ts: i64, level: u8, hz: Option<u32>, session: Option<u64>) -> Usa
 }
 
 #[test]
+fn saver_context_before_the_recent_window_preserves_the_normal_rate() {
+    use hb_core::{PollingActivity, PollingActivityKind};
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+    let day = 86400;
+    for (timestamp, session, kind, rate, previous) in [
+        (day, 1, PollingActivityKind::Saver, 500, 1000),
+        (9 * day, 2, PollingActivityKind::Boost, 4000, 500),
+        (9 * day + 30, 3, PollingActivityKind::Boost, 4000, 4000),
+        (9 * day + 120, 4, PollingActivityKind::Restore, 500, 4000),
+    ] {
+        store
+            .record_polling_activity(&PollingActivity {
+                key: "synthetic-a".into(),
+                timestamp,
+                session,
+                sequence: 1,
+                kind,
+                rate: PollingRate::try_from(rate).unwrap(),
+                previous: PollingRate::try_from(previous).ok(),
+            })
+            .unwrap();
+        store
+            .record_usage(&observation(timestamp, 80, Some(rate), Some(session)))
+            .unwrap();
+    }
+    store.flush().unwrap();
+    let data = store.query_insights("synthetic-a", 10 * day).unwrap();
+    assert_eq!(data.recent.normal_rate, PollingRate::try_from(1000).ok());
+    assert_eq!(data.recent.boost_sessions, 1);
+    assert_eq!(data.recent.restores, 1);
+    assert_eq!(
+        data.recent.saver_changes, 0,
+        "Old context must not inflate recent counts"
+    );
+}
+
+#[test]
+fn older_event_context_does_not_cross_a_replacement_before_the_recent_window() {
+    use hb_core::{PollingActivity, PollingActivityKind};
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+    let day = 86400;
+    store
+        .record_polling_activity(&PollingActivity {
+            key: "synthetic-a".into(),
+            timestamp: day,
+            session: 1,
+            sequence: 1,
+            kind: PollingActivityKind::Saver,
+            rate: PollingRate::try_from(500).unwrap(),
+            previous: PollingRate::try_from(1000).ok(),
+        })
+        .unwrap();
+    store
+        .record_usage(&observation(day, 80, Some(500), Some(1)))
+        .unwrap();
+    for timestamp in [2 * day, 9 * day] {
+        let mut next = observation(timestamp, 80, Some(2000), Some(2));
+        next.reading.serial = Some("REPLACEMENT".into());
+        store.record_usage(&next).unwrap();
+    }
+    store.flush().unwrap();
+    let data = store.query_insights("synthetic-a", 10 * day).unwrap();
+    assert_ne!(data.recent.normal_rate, PollingRate::try_from(1000).ok());
+    assert_eq!(data.recent.saver_changes, 0);
+}
+
+#[test]
 fn cancelled_insights_stops_between_batches_without_changing_retained_history() {
     use std::cell::Cell;
     let directory = tempfile::tempdir().unwrap();

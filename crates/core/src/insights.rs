@@ -113,6 +113,7 @@ impl BatteryInsights {
 }
 
 pub struct InsightsBuilder {
+    identity_since: Option<i64>,
     recent: crate::RecentUse,
     previous_activity: Option<crate::PollingActivityKind>,
     previous: Option<UsageObservation>,
@@ -132,6 +133,7 @@ pub struct InsightsBuilder {
 impl Default for InsightsBuilder {
     fn default() -> Self {
         Self {
+            identity_since: None,
             recent: crate::RecentUse::default(),
             previous_activity: None,
             previous: None,
@@ -164,6 +166,10 @@ fn discharging(reading: &Reading) -> bool {
 }
 
 impl InsightsBuilder {
+    /// Earliest event context belonging to the latest observed physical unit.
+    pub fn identity_since(&self) -> Option<i64> {
+        self.identity_since
+    }
     pub fn recent_since(mut self, since: i64) -> Self {
         self.recent.since = since;
         self
@@ -236,6 +242,7 @@ impl InsightsBuilder {
             // Preserve historical sessions/totals, but do not lend their drain
             // model or recent-rate mix to a different physical battery.
             let since = self.recent.since.max(reading.timestamp);
+            self.identity_since = Some(reading.timestamp);
             self.reset_continuity();
             self.previous = None;
             self.previous_activity = None;

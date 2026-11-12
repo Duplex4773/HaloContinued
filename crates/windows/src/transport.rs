@@ -1,4 +1,5 @@
 //! HIDAPI's Windows C backend. Enumeration is shared and invalidated by device events.
+use crate::inzone_serial;
 use hb_core::*;
 use hidapi::{HidApi, HidDevice};
 use std::{
@@ -157,19 +158,6 @@ impl CensusCache {
 #[derive(Default)]
 struct EnumerationCache(BTreeMap<u16, Cached>);
 impl EnumerationCache {
-    fn after_open<T>(
-        &mut self,
-        vendor: u16,
-        result: Result<T, ProviderError>,
-    ) -> Result<T, ProviderError> {
-        if result.is_err() {
-            // Access failure can mean an exclusive owner, not a connection
-            // change. Re-enumerate this vendor without revoking unrelated
-            // in-flight battery results or successful sibling observations.
-            self.0.remove(&vendor);
-        }
-        result
-    }
     fn enumerate(
         &mut self,
         vendor: u16,
@@ -506,19 +494,33 @@ impl HidTransport for WindowsHid {
             Ok((devices, present))
         })
     }
+    fn enumerate_serial(&self, vendor: u16) -> Result<HidSnapshot, ProviderError> {
+        if vendor != inzone_serial::VENDOR {
+            return Ok(HidSnapshot::default());
+        }
+        // Zero is not a USB vendor; reserve its cache slot for serial discovery.
+        shared_lock(&self.cache, SHARED_LOCK_WAIT)?.enumerate(
+            0,
+            self.generation(),
+            self.epoch.elapsed(),
+            || {
+                let devices = inzone_serial::enumerate()?;
+                let count = devices.len();
+                Ok((devices, count))
+            },
+        )
+    }
     fn open(&self, info: &HidInfo) -> Result<Box<dyn HidSession>, ProviderError> {
+        if inzone_serial::is_endpoint(info) {
+            return inzone_serial::open(info);
+        }
         let path =
             CString::new(info.path.as_bytes()).map_err(|e| ProviderError::new(e.to_string()))?;
-        let result = {
-            // Enumeration locks cache before API. Release API before taking
-            // cache here, so failed opens cannot invert that lock order.
+        let handle = {
+            // Failed opens (including exclusive access) leave metadata cached.
+            // Connection events and the bounded TTL retain discovery recovery.
             let mut api = shared_lock(&self.api, SHARED_LOCK_WAIT)?;
-            initialized_api(&mut api)?.open_path(&path).map_err(error)
-        };
-        let handle = match result {
-            Ok(handle) => handle,
-            Err(error) => shared_lock(&self.cache, SHARED_LOCK_WAIT)?
-                .after_open(info.vendor_id, Err(error))?,
+            initialized_api(&mut api)?.open_path(&path).map_err(error)?
         };
         Ok(Box::new(Session(handle, info.output_length)))
     }
@@ -883,7 +885,7 @@ mod cache_tests {
         assert!(!std::ptr::eq(expired.as_ptr(), recovered.as_ptr()));
     }
     #[test]
-    fn failed_open_recovers_only_affected_vendor_without_connection_epoch_change() {
+    fn metadata_recovers_on_bounded_ttl_without_epoch_change() {
         let mut cache = EnumerationCache::default();
         let generation = 7;
         for vendor in [0x1532, 0x046d] {
@@ -891,12 +893,15 @@ mod cache_tests {
                 .enumerate(vendor, generation, Duration::ZERO, || Ok((infos(2), 2)))
                 .unwrap();
         }
-        let error = cache.after_open::<()>(0x1532, Err(ProviderError::new("exclusive owner")));
-        assert!(error.is_err());
-        assert!(!cache.0.contains_key(&0x1532));
-        let mut refreshed = false;
+        assert!(cache.0.contains_key(&0x1532));
         cache
             .enumerate(0x1532, generation, Duration::from_secs(1), || {
+                panic!("exclusive access must not trigger another metadata scan")
+            })
+            .unwrap();
+        let mut refreshed = false;
+        cache
+            .enumerate(0x1532, generation, Duration::from_secs(30), || {
                 refreshed = true;
                 Ok((infos(1), 1))
             })
@@ -908,9 +913,8 @@ mod cache_tests {
                 panic!("unrelated provider must retain its cache")
             })
             .unwrap();
-        cache.after_open(0x1532, Ok(())).unwrap();
         cache
-            .enumerate(0x1532, generation, Duration::from_secs(2), || {
+            .enumerate(0x1532, generation, Duration::from_secs(31), || {
                 panic!("successful access must not expire metadata")
             })
             .unwrap();

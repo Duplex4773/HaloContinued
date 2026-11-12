@@ -712,7 +712,15 @@ fn remaining_hid_families_use_the_reference_channel_packet_and_positive_reply() 
             .unwrap();
         assert_eq!(readings.len(), 1, "{family}");
         assert_eq!(readings[0].level, Some(46), "{family}");
-        assert_eq!(readings[0].charging, Some(false), "{family}");
+        assert_eq!(
+            readings[0].charging,
+            if matches!(family, "am_infinity" | "keychron") {
+                None
+            } else {
+                Some(false)
+            },
+            "{family}"
+        );
         hid.done();
     }
 }

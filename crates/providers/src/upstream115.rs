@@ -155,7 +155,7 @@ impl HidProvider {
         route: u8,
         property: u8,
     ) -> Result<(), ProviderError> {
-        if pid == 0x1b7f {
+        if matches!(pid, 0x1b7f | 0x1bdc) {
             let request = p::padded(&[0, route, 2, property], 65);
             s.write(&request).or_else(|_| s.write(&request[1..]))
         } else {
@@ -273,7 +273,10 @@ impl HidProvider {
             if second.is_none() {
                 self.log("Corsair confirming read silent; retaining first reading");
             }
-            let charge = if pid != 0x1b7f && c.active() && c.clock.monotonic() < deadline {
+            let charge = if !matches!(pid, 0x1b7f | 0x1bdc)
+                && c.active()
+                && c.clock.monotonic() < deadline
+            {
                 Self::bragi_write(s, pid, route, 0x10)?;
                 self.bragi_read(
                     s,
@@ -286,6 +289,73 @@ impl HidProvider {
                 None
             };
             return Ok(p::battery((first / 10) as u8, charge));
+        }
+        Ok(None)
+    }
+    // G535 uses its long-only HID++ 1.0 charge register before any ping.
+    fn query_g535(
+        s: &mut dyn HidSession,
+        c: &PollContext<'_>,
+    ) -> Result<Option<Battery>, ProviderError> {
+        for _ in 0..4 {
+            if !c.active() || s.read(64, Duration::ZERO)?.is_empty() {
+                break;
+            }
+        }
+        if !c.active() {
+            return Ok(None);
+        }
+        s.write(&p::padded(&[0x11, 0xff, 5, 0x0d], 20))?;
+        let end = c
+            .deadline
+            .min(c.clock.monotonic() + Duration::from_millis(600));
+        for _ in 0..12 {
+            if !c.active() || c.clock.monotonic() >= end {
+                break;
+            }
+            let timeout = Duration::from_millis(50).min(end.saturating_sub(c.clock.monotonic()));
+            let r = s.read(64, timeout)?;
+            let [0x10 | 0x11, 0xff, 5, 0x0d, hi, lo, state, ..] = *r else {
+                continue;
+            };
+            let mv = u16::from_be_bytes([hi, lo]);
+            if !(2500..=5000).contains(&mv) {
+                continue;
+            }
+            // HeadsetControl's G535-specific curve, rounded to whole percentages.
+            let curve = [
+                (3310, 0),
+                (3664, 5),
+                (3730, 20),
+                (3766, 30),
+                (3817, 50),
+                (4175, 100),
+            ];
+            let level = if mv <= curve[0].0 {
+                0
+            } else {
+                curve
+                    .windows(2)
+                    .find_map(|pair| {
+                        let [(low, min), (high, max)] = pair else {
+                            return None;
+                        };
+                        if mv > *high {
+                            return None;
+                        }
+                        let span = high - low;
+                        Some((min + ((mv - low) * (max - min) + span / 2) / span) as u8)
+                    })
+                    .unwrap_or(100)
+            };
+            let charging = match state {
+                1 => Some(false),
+                3 => Some(true),
+                _ => None,
+            };
+            let mut battery = p::battery(level, charging).unwrap();
+            battery.coarse = true;
+            return Ok(Some(battery));
         }
         Ok(None)
     }
@@ -349,7 +419,13 @@ impl HidProvider {
             .logitech_identity
             .get(&slot_key)
             .cloned()
-            .unwrap_or_else(|| ("Logitech device".into(), String::new(), String::new()));
+            .unwrap_or_else(|| {
+                if info.product_id == 0x0ac4 {
+                    ("Logitech G535".into(), "headset".into(), String::new())
+                } else {
+                    ("Logitech device".into(), String::new(), String::new())
+                }
+            });
         let key = if unit.is_empty() {
             format!("logitech:{group}:{:04x}:{slot}", info.product_id)
         } else {
@@ -365,7 +441,12 @@ impl HidProvider {
         reading.kind = kind;
         reading.serial = (!unit.is_empty()).then_some(unit);
         reading.container = info.container.clone();
+        let charging = b.charging;
         set_battery(&mut reading, b);
+        if info.product_id == 0x0ac4 {
+            reading.charging = charging;
+            reading.via = "wireless".into();
+        }
         self.last_observed.insert(key.clone(), c.clock.monotonic());
         self.last.insert(key, reading.clone());
         output.insert(reading.key.clone(), reading);

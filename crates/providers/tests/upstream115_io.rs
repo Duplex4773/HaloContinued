@@ -225,6 +225,19 @@ fn corsair_darkcore_exact_bragi_confirmation_filters_notice_collection() {
     }
 }
 #[test]
+fn corsair_m75_reads_the_slipstream_receiver_as_a_wireless_mouse() {
+    let mut i = info(0x1b1c, 0x1bdc, 0xff42);
+    i.usage = 2;
+    let h = FakeHid::new(vec![i], bragi_steps(0x1b7f, 9, 550, 550, None));
+    let rows = poll(&mut HidProvider::new("corsair"), &h, &FakeClock::default());
+    assert_eq!(rows[0].name, "Corsair M75 Wireless");
+    assert_eq!(rows[0].level, Some(55));
+    assert_eq!(rows[0].charging, None);
+    assert_eq!(rows[0].kind, "mouse");
+    assert_eq!(rows[0].via, "wireless");
+    h.done();
+}
+#[test]
 fn corsair_rejects_disagreeing_answers_instead_of_showing_foreign_level() {
     let h = FakeHid::new(
         vec![info(0x1b1c, 0x1b7f, 0xff42)],

@@ -16,6 +16,14 @@
     0
   ],
   [
+    "alienware",
+    16700,
+    8477,
+    "Alienware Pro Wireless Gaming Keyboard",
+    "pr:alienware",
+    0
+  ],
+  [
     "am_infinity",
     12625,
     20487,
@@ -392,6 +400,14 @@
     0
   ],
   [
+    "aula",
+    13652,
+    64009,
+    "AULA F87 Pro",
+    "pr:f87-pro",
+    0
+  ],
+  [
     "barracuda",
     5426,
     1338,
@@ -476,6 +492,14 @@
     6940,
     7039,
     "Corsair Dark Core RGB Pro SE",
+    "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    7132,
+    "Corsair M75 Wireless",
     "bragi",
     0
   ],
@@ -568,6 +592,14 @@
     0
   ],
   [
+    "endgame_we",
+    13159,
+    6497,
+    "Endgame Gear XM2we",
+    "pr:endgame-we",
+    0
+  ],
+  [
     "eweadn",
     2205,
     1583,
@@ -581,6 +613,22 @@
     256,
     "Finalmouse UltralightX",
     "pr:ulx",
+    0
+  ],
+  [
+    "glorious",
+    9610,
+    8209,
+    "Glorious Model O Wireless",
+    "pr:glorious-cable",
+    0
+  ],
+  [
+    "glorious",
+    9610,
+    8226,
+    "Glorious Model O Wireless",
+    "pr:glorious",
     0
   ],
   [
@@ -1160,6 +1208,22 @@
     0
   ],
   [
+    "irocks",
+    5285,
+    49161,
+    "i-Rocks M31R",
+    "pr:irocks",
+    0
+  ],
+  [
+    "irocks",
+    5285,
+    49168,
+    "i-Rocks M31R",
+    "pr:irocks",
+    0
+  ],
+  [
     "jabra",
     2830,
     9415,
@@ -1672,6 +1736,14 @@
     0
   ],
   [
+    "plantronics",
+    1151,
+    759,
+    "Poly Voyager 8200 UC",
+    "pr:bt600",
+    0
+  ],
+  [
     "playstation",
     1356,
     1476,
@@ -1845,6 +1917,14 @@
     21510,
     "Pulsar X2 CrazyLight Mini (2.4 GHz)",
     "",
+    0
+  ],
+  [
+    "pulsar",
+    14139,
+    4122,
+    "ATK X1 Pro",
+    "pr:compx",
     0
   ],
   [
@@ -2578,6 +2658,14 @@
   [
     "razer",
     5426,
+    1362,
+    "Razer Barracuda X (2022)",
+    "pr:barracuda-x",
+    0
+  ],
+  [
+    "razer",
+    5426,
     1365,
     "Razer BlackShark V2 Pro (2023)",
     "",
@@ -2637,6 +2725,14 @@
     21264,
     "Skullcandy Crusher PLYR 720",
     "pr:skullcandy",
+    0
+  ],
+  [
+    "sony_inzone",
+    1356,
+    3667,
+    "Sony INZONE H9",
+    "pr:inzone-h9",
     0
   ],
   [
@@ -3053,6 +3149,22 @@
     8862,
     "Turtle Beach Stealth Pro II",
     "pr:turtle",
+    0
+  ],
+  [
+    "urx",
+    14000,
+    12290,
+    "URX Core75",
+    "pr:urx",
+    0
+  ],
+  [
+    "vaxee",
+    12375,
+    8193,
+    "VAXEE wireless mouse",
+    "pr:vaxee",
     0
   ],
   [
