@@ -151,6 +151,18 @@ pub struct BatterySaver {
     sequence: u64,
 }
 impl BatterySaver {
+    /// Attribute only fresh readback matching existing ownership and its native connection.
+    /// This does not adopt ownership or authorize any hardware write.
+    pub fn confirms_activity(&self, observation: &PollingObservation) -> bool {
+        let Some(stamp) = observation.target.connection_stamp else {
+            return false;
+        };
+        self.entries.get(&observation.target.device.key).is_some_and(|entry| {
+            entry.target.device == observation.target.device
+                && entry.target.generation == observation.target.generation
+                && matches!(entry.rate, Setting::Active { applied, .. } if observation.rate.is_some_and(|r| r.hz() == applied)) && entry.rate_stamp == Some(stamp)
+        })
+    }
     /// Restore ownership, not hardware state, from a durable pre-write record.
     /// The eventual guarded transaction still checks the native connection and
     /// the value currently on the device before writing.

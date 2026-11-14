@@ -209,6 +209,42 @@ pub(super) fn exercise_native_information(state: &mut State) {
         assert!(state.text(483).contains("1.21"));
         assert!(state.text(483).contains("Not reported"));
         assert!(state.text(486).contains("Polling rate"));
+        // A readback can arrive without another battery snapshot or firmware query.
+        let observation = PollingObservation {
+            target: request.target.clone(),
+            rate: PollingRate::try_from(1000).ok(),
+            supported: vec![PollingRate::try_from(1000).unwrap()],
+            timestamp: 1234,
+            evidence: "test".into(),
+        };
+        let saved_polling = state.polling.observations.remove(&reading.key);
+        state
+            .polling
+            .observations
+            .insert(reading.key.clone(), observation);
+        state.polling_controls();
+        assert!(state.text(486).contains("Polling rate"));
+        assert!(!state.text(486).contains("fullscreen boost"));
+        state
+            .polling
+            .observations
+            .get_mut(&reading.key)
+            .unwrap()
+            .supported
+            .push(PollingRate::try_from(4000).unwrap());
+        state.polling_controls();
+        assert!(state.text(486).contains("fullscreen boost"));
+        assert_eq!(
+            state.information.next, sequence,
+            "capability updates must not requery firmware"
+        );
+        state.polling.observations.remove(&reading.key);
+        if let Some(saved) = saved_polling {
+            state
+                .polling
+                .observations
+                .insert(reading.key.clone(), saved);
+        }
         assert!(state.text(488).contains("Not yet verified"));
         assert!(
             windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(state.controls[&484])
@@ -430,11 +466,13 @@ impl State {
         }
         if polling {
             controls.push(
-                if device.kind == "mouse"
-                    && hb_providers::controls::polling_menu_rates(&device)
-                        .iter()
-                        .any(|r| *r > 1000)
-                {
+                if boost_controls_visible(
+                    &device,
+                    self.polling.observations.get(&device.key).filter(|o| {
+                        o.target.generation == self.polling.generation && o.target.device == device
+                    }),
+                    None,
+                ) {
                     "Polling rate and fullscreen boost"
                 } else {
                     "Polling rate"
@@ -506,6 +544,31 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn information_boost_capability_follows_connection_readback() {
+        let request = request(1);
+        let mut observation = PollingObservation {
+            target: request.target.clone(),
+            rate: PollingRate::try_from(1000).ok(),
+            supported: vec![PollingRate::try_from(1000).unwrap()],
+            timestamp: 1,
+            evidence: "test".into(),
+        };
+        assert!(!boost_controls_visible(
+            &request.target.device,
+            Some(&observation),
+            None
+        ));
+        observation
+            .supported
+            .push(PollingRate::try_from(4000).unwrap());
+        assert!(boost_controls_visible(
+            &request.target.device,
+            Some(&observation),
+            None
+        ));
+    }
+
     #[test]
     fn info_results_require_the_live_request_identity_and_epoch() {
         for change in 0..4 {

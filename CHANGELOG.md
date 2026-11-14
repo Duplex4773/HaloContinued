@@ -1,3 +1,29 @@
+# Halo Continued 1.1.5
+
+Released 14 November 2026 for Windows 11 x64.
+
+## Performance
+
+- Skip charging-animation timer wakeups while consecutive frames show the same image. Preserve the original animation timing and use one shared timer across devices, with no extra frame allocations or hardware queries.
+- Avoid rebuilding identical dashboard snapshots for devices whose disconnected icons are already retained. Reconnects, changed errors and device removal still update normally.
+
+## Insights and device controls
+
+- Keep Battery saver usage attributed correctly when Game boost restores the saver rate. Count the restoration without recording another saver activation.
+- Preserve rate attribution across Refresh, failed reads, suspend and restart only when fresh readback confirms the same device, connection and owned temporary setting. Ignore obsolete read completions without discarding newer evidence.
+- Show fullscreen boost availability from the current connection's supported rates, and update the device information page after a rate read without requerying firmware.
+
+## Reliability and security
+
+- Retain failed battery-notification deliveries when the runtime queue is temporarily full, and retry through existing UI events. Retries are bounded, coalesced and checked for relevance before delivery; no background timer is added.
+- Preserve earlier damaged-settings backups when corruption happens again, instead of overwriting the original recovery file. Keep the source configuration if it cannot be safely moved.
+- Update rusqlite to 0.41.1 and bundled SQLite to 3.54.1, addressing RUSTSEC-2026-0459. Update rustix to 1.1.6 and require Rust 1.89 or newer for source builds.
+- Make dashboard resource checks account for Windows' initial theme caches, then check every subsequent reopen cycle for handle growth.
+
+The installer remains unsigned and installs for the current Windows account without administrator privileges. Existing settings, history and reconnect safety checks are preserved. No new device support is added in this release.
+
+Thanks to HeyOkay, the HaloBattery contributors and the community members who shared protocols, tests and hardware reports.
+
 # Halo Continued 1.1.4
 
 ## Device monitoring

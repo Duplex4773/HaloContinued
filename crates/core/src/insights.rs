@@ -233,6 +233,15 @@ impl InsightsBuilder {
         observation: UsageObservation,
         activity: Option<crate::PollingActivityKind>,
     ) {
+        // An action can restore the saver rate while saver remains the active
+        // mode. Normalize here too, so direct builders agree with stored history.
+        let activity = activity.map(|kind| {
+            if kind == crate::PollingActivityKind::RestoreSaver {
+                crate::PollingActivityKind::Saver
+            } else {
+                kind
+            }
+        });
         let reading = &observation.reading;
         if self
             .previous

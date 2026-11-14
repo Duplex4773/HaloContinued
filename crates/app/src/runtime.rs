@@ -523,6 +523,19 @@ fn remember_failed_notification(
         pending.insert(key, (now + Duration::from_secs(30), notification));
     }
 }
+/// Returning a failed toast must never block the UI or lose it to a full queue.
+/// The UI retains a rejected return until an existing runtime event wakes it.
+pub(super) fn return_notification(
+    commands: &Sender<Command>,
+    notification: Notification,
+) -> Result<(), Notification> {
+    match commands.try_send(Command::NotificationFailed(notification)) {
+        Err(TrySendError::Full(Command::NotificationFailed(notification))) => Err(notification),
+        // A stopped runtime cannot retry. Do not keep its alerts alive forever.
+        Ok(()) | Err(TrySendError::Disconnected(_)) => Ok(()),
+        Err(TrySendError::Full(_)) => unreachable!(),
+    }
+}
 fn update_diagnostics(
     diagnostics: &mut BTreeMap<String, Vec<String>>,
     key: &str,
@@ -620,8 +633,18 @@ impl SnapshotPublisher {
 fn battery_affects_snapshot(engine: &Engine, provider: &str, result: &PollResult) -> bool {
     match result {
         Ok(readings) => {
+            let previous = engine.provider_readings(provider);
+            // Keeping disconnected icons retains stale readings in the engine.
+            // Repeated empty discovery results do not change that visible cache.
             engine.provider_error(provider).is_some()
-                || engine.provider_readings(provider) != readings
+                || (previous != readings
+                    && !(readings.is_empty()
+                        && engine.settings.keep_disconnected
+                        && previous.len() <= 512
+                        && previous.iter().all(|reading| {
+                            reading.connection == Connection::Stale
+                                && reading.charging == Some(false)
+                        })))
         }
         Err(error) => engine.provider_error(provider) != Some(error.message.as_str()),
     }
@@ -1058,6 +1081,9 @@ impl Runtime {
                 Ordering::Acquire,
             );
         }
+    }
+    pub fn return_notification(&self, notification: Notification) -> Result<(), Notification> {
+        return_notification(&self.commands, notification)
     }
     pub fn submit_hdr(
         &self,
@@ -3370,6 +3396,18 @@ impl UsageTracker {
             self.device_sessions.remove(&outcome.key);
             return;
         }
+        // Keep provenance after an unwritten failure, but revoke rate evidence.
+        // A fresh GET must still prove the exact device, connection and rate.
+        // Reuse the continuation flag; no second cache or retry timer is needed.
+        if outcome.failure.is_some()
+            && !outcome.may_have_changed
+            && let Some(old) = self.rates.get_mut(&outcome.key)
+        {
+            old.continuation = true;
+            self.session = self.session.saturating_add(1);
+            self.set_device_session(&outcome.key);
+            return;
+        }
         // A failed/partial exchange cannot establish the resulting rate.
         let previous = self.rates.remove(&outcome.key);
         let next = outcome.observation.as_ref().and_then(|o| o.rate);
@@ -3386,9 +3424,9 @@ impl UsageTracker {
                 .flatten()
         });
         let continuation = inherited.is_some()
-            && previous
-                .as_ref()
-                .is_some_and(|old| old.observation.target.generation != self.generation);
+            && previous.as_ref().is_some_and(|old| {
+                old.continuation || old.observation.target.generation != self.generation
+            });
         if (previous.is_some() || next.is_some())
             && (outcome.failure.is_some()
                 || previous.as_ref().and_then(|o| o.observation.rate) != next
@@ -3415,6 +3453,42 @@ impl UsageTracker {
                     continuation,
                 },
             );
+        }
+    }
+    fn confirm_owned_activity(
+        &mut self,
+        outcome: &ControlOutcome,
+        boost: &crate::boost::Boost,
+        saver: &crate::battery_saver::BatterySaver,
+    ) {
+        let Some(observation) = outcome.observation.as_ref().filter(|o| {
+            self.enabled
+                && outcome.failure.is_none()
+                && o.target.generation == self.generation
+                && o.target.device.key == outcome.key
+                && o.target.device.kind == "mouse"
+        }) else {
+            return;
+        };
+        let kind = if boost.confirms_activity(observation) {
+            PollingActivityKind::Boost
+        } else if saver.confirms_activity(observation) {
+            PollingActivityKind::Saver
+        } else {
+            return;
+        };
+        // Explicit manual actions keep their own classification.
+        if let Some((action, _)) = self.actions.get_mut(&outcome.request) {
+            if *action == PollingActivityKind::Restore && kind == PollingActivityKind::Saver {
+                *action = PollingActivityKind::RestoreSaver;
+            }
+            return;
+        }
+        if let Some(evidence) = self.rates.get_mut(&outcome.key)
+            && evidence.activity != Some(kind)
+        {
+            evidence.activity = Some(kind);
+            evidence.continuation = true;
         }
     }
     fn begin_control(&mut self, request: &ControlRequest, automatic: Option<bool>) {
@@ -3473,7 +3547,11 @@ impl UsageTracker {
         {
             return None;
         }
-        evidence.activity = Some(kind);
+        evidence.activity = Some(if kind == PollingActivityKind::RestoreSaver {
+            PollingActivityKind::Saver
+        } else {
+            kind
+        });
         evidence.continuation = false;
         let session = *self.device_sessions.get(&outcome.key)?;
         self.activity_sequence += 1;
@@ -3534,6 +3612,7 @@ impl UsageTracker {
                 let polling_rate = self
                     .rates
                     .get(&reading.key)
+                    .filter(|e| !e.continuation)
                     .map(|e| &e.observation)
                     .filter(|o| {
                         o.target.generation == self.generation
@@ -4845,11 +4924,12 @@ fn run(
                         hid.generation(),
                         engine.settings.polling_controls && !suspended,
                     );
+                    let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                     usage_tracker.observe(&outcome);
+                    usage_tracker.confirm_owned_activity(&outcome, &boost, &saver);
                     if let Some(activity) = usage_tracker.take_activity(&outcome) {
                         let _ = storage.send(Storage::PollingActivity(activity));
                     }
-                    let publish = finish_polling_outcome(&mut boost, &mut saver, &outcome);
                     saver_dirty = true;
                     startup_polling.restore.complete(request.request);
                     startup_polling.reads.complete(&outcome, Instant::now());
@@ -4945,6 +5025,11 @@ fn run(
                     && !suspended
                     && !stop
                     && configuration_epoch.is_none_or(|epoch| configuration.active(epoch));
+                let stale_read = !outcome.may_have_changed
+                    && outcome
+                        .observation
+                        .as_ref()
+                        .is_some_and(|o| o.target.generation != hid.generation());
                 let publish = finish_polling_completion(
                     &mut boost,
                     &mut saver,
@@ -4987,9 +5072,14 @@ fn run(
                     hid.generation(),
                     engine.settings.polling_controls && !suspended,
                 );
-                usage_tracker.observe(&outcome);
-                if let Some(activity) = usage_tracker.take_activity(&outcome) {
-                    let _ = storage.send(Storage::PollingActivity(activity));
+                if !stale_read {
+                    usage_tracker.observe(&outcome);
+                    usage_tracker.confirm_owned_activity(&outcome, &boost, &saver);
+                    if let Some(activity) = usage_tracker.take_activity(&outcome) {
+                        let _ = storage.send(Storage::PollingActivity(activity));
+                    }
+                } else {
+                    usage_tracker.actions.remove(&outcome.request);
                 }
                 saver_dirty = true;
                 startup_polling.reads.complete(&outcome, Instant::now());
@@ -5148,6 +5238,195 @@ mod tests {
             assert_eq!(result.recent.saver_seconds, if saver { 180 } else { 0 });
         }
     }
+    #[test]
+    fn refresh_failure_preserves_only_historical_provenance_until_safe_readback() {
+        for uncertain in [false, true] {
+            let mut tracker = UsageTracker::new(2, true);
+            let rate = PollingRate::try_from(4000).unwrap();
+            let request = control_request(ControlAction::Apply(rate), 2);
+            tracker.begin_control(&request, Some(true));
+            let mut current = PollingRate::try_from(1000).unwrap();
+            let outcome = simulate_control(&request, &mut current, 2, 100);
+            tracker.observe(&outcome);
+            assert!(tracker.take_activity(&outcome).is_some());
+            tracker.refresh(3, true);
+            let mut failed = ControlOutcome::failed(&request, "Cancelled during Refresh");
+            failed.may_have_changed = uncertain;
+            tracker.observe(&failed);
+            let mut reading = control_reading();
+            reading.timestamp = 200;
+            assert_eq!(tracker.samples(vec![reading])[0].polling_rate, None);
+            let read = control_request(ControlAction::Read, 3);
+            let outcome = simulate_control(&read, &mut current, 3, 220);
+            tracker.observe(&outcome);
+            assert_eq!(tracker.take_activity(&outcome).is_some(), !uncertain);
+        }
+    }
+
+    #[test]
+    fn recovered_activity_requires_matching_native_readback_and_is_written_once() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(500).ok(),
+            sleep_seconds: None,
+        };
+        for is_saver in [false, true] {
+            for change in 0..6 {
+                let layer = if is_saver {
+                    Layer::SaverPolling(mode)
+                } else {
+                    Layer::BoostPolling
+                };
+                let hz = if is_saver { 500 } else { 4000 };
+                let (_folder, mut reading, settings, mut record, _journal) =
+                    recovery_audit_fixture(layer, 1000, hz);
+                reading.level = Some(10);
+                record.confirmed = true;
+                let mut saver = crate::battery_saver::BatterySaver::default();
+                let mut boost = crate::boost::Boost::new(Instant::now());
+                if is_saver {
+                    assert!(saver.recover(&record, &reading, &settings, 2));
+                } else {
+                    assert!(boost.recover(&record, &reading, &settings, 2));
+                }
+                let mut tracker = UsageTracker::new(2, true);
+                let request = ControlRequest {
+                    request: 11,
+                    target: ControlTarget {
+                        device: record.device.clone(),
+                        generation: 2,
+                        connection_stamp: Some(record.stamp),
+                    },
+                    action: ControlAction::Read,
+                };
+                let mut current = PollingRate::try_from(hz).unwrap();
+                let mut outcome = simulate_control(&request, &mut current, 2, 100);
+                match change {
+                    1 => {
+                        outcome
+                            .observation
+                            .as_mut()
+                            .unwrap()
+                            .target
+                            .connection_stamp = ConnectionStamp::new(2)
+                    }
+                    2 => {
+                        outcome
+                            .observation
+                            .as_mut()
+                            .unwrap()
+                            .target
+                            .connection_stamp = None
+                    }
+                    3 => {
+                        outcome.observation.as_mut().unwrap().target.device.serial =
+                            Some("OTHER".into())
+                    }
+                    4 => {
+                        outcome.observation.as_mut().unwrap().rate =
+                            PollingRate::try_from(2000).ok()
+                    }
+                    5 => outcome.failure = Some("Uncertain read".into()),
+                    _ => {}
+                }
+                tracker.observe(&outcome);
+                tracker.confirm_owned_activity(&outcome, &boost, &saver);
+                let event = tracker.take_activity(&outcome);
+                assert_eq!(
+                    event.is_some(),
+                    change == 0,
+                    "saver={is_saver}, change={change}"
+                );
+                if let Some(event) = event {
+                    assert_eq!(event.previous, Some(current));
+                    assert_eq!(
+                        event.kind,
+                        if is_saver {
+                            PollingActivityKind::Saver
+                        } else {
+                            PollingActivityKind::Boost
+                        }
+                    );
+                    tracker.observe(&outcome);
+                    tracker.confirm_owned_activity(&outcome, &boost, &saver);
+                    assert!(tracker.take_activity(&outcome).is_none());
+                    // Resume revokes readback, but retained ownership can classify
+                    // a subsequent fresh query without counting another SET.
+                    tracker.invalidate(3, true);
+                    saver.observe_generation(3);
+                    boost.observe_generation(3);
+                    let mut resumed = outcome.clone();
+                    resumed.observation.as_mut().unwrap().target.generation = 3;
+                    tracker.observe(&resumed);
+                    tracker.confirm_owned_activity(&resumed, &boost, &saver);
+                    assert!(tracker.take_activity(&resumed).is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boost_restore_to_owned_saver_counts_saver_time_and_only_one_restore() {
+        use crate::recovery::Layer;
+        let mode = hb_core::settings::LowBatteryMode {
+            threshold: 20,
+            polling_rate: PollingRate::try_from(500).ok(),
+            sleep_seconds: None,
+        };
+        let (folder, mut reading, settings, mut record, _) =
+            recovery_audit_fixture(Layer::SaverPolling(mode), 1000, 500);
+        reading.level = Some(10);
+        record.confirmed = true;
+        let mut saver = crate::battery_saver::BatterySaver::default();
+        assert!(saver.recover(&record, &reading, &settings, 2));
+        let boost = crate::boost::Boost::new(Instant::now());
+        let mut tracker = UsageTracker::new(2, true);
+        let mut store = hb_storage::Store::open(&folder.path().join("insights.db")).unwrap();
+        let mut current = PollingRate::try_from(1000).unwrap();
+        for (id, t, hz, kind) in [
+            (1, 100, 500, PollingActivityKind::Saver),
+            (2, 220, 4000, PollingActivityKind::Boost),
+            (3, 340, 500, PollingActivityKind::Restore),
+        ] {
+            let request = ControlRequest {
+                request: id,
+                target: ControlTarget {
+                    device: record.device.clone(),
+                    generation: 2,
+                    connection_stamp: Some(record.stamp),
+                },
+                action: ControlAction::Apply(PollingRate::try_from(hz).unwrap()),
+            };
+            if kind == PollingActivityKind::Saver {
+                tracker.begin_saver_control(&request, false);
+            } else {
+                tracker.begin_control(&request, Some(kind == PollingActivityKind::Boost));
+            }
+            let outcome = simulate_control(&request, &mut current, 2, t);
+            tracker.observe(&outcome);
+            tracker.confirm_owned_activity(&outcome, &boost, &saver);
+            let event = tracker.take_activity(&outcome).unwrap();
+            if id == 3 {
+                assert_eq!(event.kind, PollingActivityKind::RestoreSaver);
+            }
+            store.record_polling_activity(&event).unwrap();
+            for dt in [0, 60] {
+                reading.timestamp = t + dt;
+                store
+                    .record_usage(&tracker.samples(vec![reading.clone()]).remove(0))
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        let result = store.query_insights(&reading.key, 400).unwrap();
+        assert_eq!(result.recent.saver_seconds, 120);
+        assert_eq!(result.recent.boost_seconds, 60);
+        assert_eq!(result.recent.restores, 1);
+        assert_eq!(result.recent.saver_changes, 1);
+        assert_eq!(result.recent.normal_rate, PollingRate::try_from(1000).ok());
+    }
+
     #[test]
     fn refresh_preserves_reconfirmed_automatic_use_without_counting_another_change() {
         for saver in [false, true] {
@@ -7474,6 +7753,50 @@ mod tests {
         assert!(battery_affects_snapshot(
             &engine,
             "bluetooth",
+            &Ok(vec![reading])
+        ));
+    }
+    #[test]
+    fn retained_disconnects_publish_transitions_but_not_unchanged_empty_polls() {
+        let mut engine = Engine::new(
+            Settings {
+                keep_disconnected: true,
+                ..Settings::default()
+            },
+            Estimator::default(),
+        );
+        let mut reading = Reading::new("mouse", "Mouse", "razer", 100);
+        reading.level = Some(70);
+        reading.charging = Some(true);
+        engine.apply("razer", Ok(vec![reading.clone()]), 0.0, false);
+        assert!(battery_affects_snapshot(&engine, "razer", &Ok(Vec::new())));
+        engine.apply("razer", Ok(Vec::new()), 1.0, false);
+        assert_eq!(
+            engine.provider_readings("razer")[0].connection,
+            Connection::Stale
+        );
+        let before = serde_json::to_value(engine.snapshot(100)).unwrap();
+        for tick in 2..20 {
+            assert!(!battery_affects_snapshot(&engine, "razer", &Ok(Vec::new())));
+            engine.apply("razer", Ok(Vec::new()), f64::from(tick), false);
+            assert_eq!(serde_json::to_value(engine.snapshot(100)).unwrap(), before);
+        }
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(!battery_affects_snapshot(&engine, "razer", &Ok(Vec::new())));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        // Error recovery, removal of retained icons and reconnection remain visible.
+        engine.apply("razer", Err(ProviderError::new("busy")), 20.0, false);
+        assert!(battery_affects_snapshot(&engine, "razer", &Ok(Vec::new())));
+        engine.apply("razer", Ok(Vec::new()), 21.0, false);
+        engine.settings.keep_disconnected = false;
+        assert!(battery_affects_snapshot(&engine, "razer", &Ok(Vec::new())));
+        engine.settings.keep_disconnected = true;
+        assert!(battery_affects_snapshot(
+            &engine,
+            "razer",
             &Ok(vec![reading])
         ));
     }

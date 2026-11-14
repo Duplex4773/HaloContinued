@@ -59,6 +59,22 @@ pub struct Boost {
     sequence: u64,
 }
 impl Boost {
+    /// Attribute only fresh readback matching existing ownership and its native connection.
+    /// This does not adopt ownership or authorize any hardware write.
+    pub fn confirms_activity(&self, observation: &PollingObservation) -> bool {
+        let Some(stamp) = observation.target.connection_stamp else {
+            return false;
+        };
+        self.entries
+            .get(&observation.target.device.key)
+            .is_some_and(|entry| {
+                entry.target.device == observation.target.device
+                    && entry.target.generation == observation.target.generation
+                    && entry.active
+                    && observation.rate == Some(entry.boost)
+                    && entry.target.connection_stamp == Some(stamp)
+            })
+    }
     /// Adopt only ownership recorded for the same connection. The normal
     /// desktop transition and compare-before-write path performs restoration.
     pub fn recover(

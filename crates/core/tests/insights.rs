@@ -665,3 +665,14 @@ fn complete_continuous_windows_can_support_moderate_evidence() {
     assert_eq!(rate.confidence, InsightConfidence::Moderate);
     assert!((rate.projected_full_charge_hours.unwrap() - 200.0 / 9.0).abs() < 0.001);
 }
+
+#[test]
+fn restore_to_saver_is_a_saver_interval_in_direct_summaries() {
+    let mut builder = InsightsBuilder::default();
+    builder.push_with_activity(point(0, 80), Some(PollingActivityKind::Saver));
+    builder.push_with_activity(point(60, 79), Some(PollingActivityKind::RestoreSaver));
+    builder.push_with_activity(point(120, 78), Some(PollingActivityKind::Saver));
+    let result = builder.finish();
+    assert_eq!(result.recent.saver_seconds, 120);
+    assert_eq!(result.recent.boost_seconds, 0);
+}

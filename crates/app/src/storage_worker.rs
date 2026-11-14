@@ -204,10 +204,10 @@ fn query_database<'a>(
     pending_usage: &mut Vec<UsageObservation>,
     estimator: &mut EstimatorCheckpoint,
     pending_activities: &mut VecDeque<PollingActivity>,
-) -> Result<&'a Store, ProviderError> {
+) -> Result<&'a mut Store, ProviderError> {
     recover_and_flush(database, path, pending_usage, estimator)?;
     flush_activities(database, pending_activities)?;
-    database.as_ref().map_err(Clone::clone)
+    database.as_mut().map_err(|error| error.clone())
 }
 pub(super) fn run(
     folder: PathBuf,

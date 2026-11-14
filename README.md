@@ -28,20 +28,22 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-**New in 1.1.4:** More devices report battery levels, Insights better tracks
-Game boost and Battery saver, and Refresh reliably requests firmware information.
-See the [1.1.4 changelog](CHANGELOG.md#halo-continued-114).
+**New in 1.1.5:** Fewer charging-animation wakeups, more reliable battery-alert
+retries, clearer device capabilities, and better Insights attribution when
+Game boost restores a Battery saver rate. Damaged settings backups are preserved
+and the bundled SQLite dependency includes its latest security fix.
+See the [1.1.5 changelog](CHANGELOG.md#halo-continued-115).
 
-Latest GitHub release: **1.1.4** for Windows 11 x64, available as an unsigned per-user
+Latest GitHub release: **1.1.5** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.1.4 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.4/HaloContinued-1.1.4-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.1.4 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.4/HaloContinued-1.1.4-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.5 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.5/HaloContinued-1.1.5-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.5 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.5/HaloContinued-1.1.5-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.4/HaloContinued-1.1.4-SHA256SUMS.txt)
-· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.4)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.5/HaloContinued-1.1.5-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.5)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
@@ -607,9 +609,31 @@ These single samples show no observed resource regression. Small differences
 can reflect Windows accounting resolution or run-to-run variation; they do not
 establish a sustained reduction in CPU or RAM use or predict live-hardware usage.
 
+## 1.1.5 pre-release resource check (14 November 2026)
+
+The final CPU-audit changes were measured with one simulated charging mouse at
+73%, the dashboard closed, a 10-second warmup and a three-minute sampling window.
+Both runs used the optimized native application test harness without hardware
+I/O. The baseline is the working tree immediately before the animation-scheduling
+change, not a new upstream HaloBattery comparison.
+
+| Measurement | Before animation scheduling change | Final 1.1.5 source |
+| --- | ---: | ---: |
+| Average CPU, one logical core | 0.043% | 0.009% |
+| Average private memory | 4.80 MiB | 5.01 MiB |
+| Peak private memory | 5.06 MiB | 5.15 MiB |
+
+The scheduler skips wakeups for identical charging images while preserving the
+animation's timing. At this simulated battery level, that is 14 animation wakeups
+per three-second cycle instead of 30. Hardware polling intervals are unchanged.
+These are single samples with very small CPU totals, not evidence of a sustained
+percentage improvement across devices or battery levels. They do not measure
+the installer, live hardware, gaming performance or input latency. RAM did not
+decrease in this comparison.
+
 ## Build from source
 
-Requirements: Windows, Rust's MSVC toolchain (Rust 1.88 or newer), Visual Studio
+Requirements: Windows, Rust's MSVC toolchain (Rust 1.89 or newer), Visual Studio
 C++ Build Tools with the Windows SDK, and PowerShell 7.
 
 ```powershell
@@ -617,11 +641,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.1.1
+.\tools\package-rust.ps1 -Version 1.1.5
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.1.1-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.1.5-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -631,25 +655,27 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.1.1
+.\tools\package-installer.ps1 -Version 1.1.5
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.1.1-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.1.1-windows-x64.exe` and
-`dist/HaloContinued-1.1.1-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.1.5-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.1.5-windows-x64.exe` and
+`dist/HaloContinued-1.1.5-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with
 `.\tools\test-installer.ps1 -Iscc 'path\to\ISCC.exe'`. They use isolated test
 identities, leave the running app alone and never launch the packaged app.
-Add `-PreviousPackageZip 'dist/HaloContinued-0.1.0-windows-x64.zip'` to test an
+Add `-PreviousPackageZip 'dist/HaloContinued-1.1.4-windows-x64.zip'` to test an
 upgrade from that version, including executable replacement, the Installed apps
 version and preservation of settings and history.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Latest local validation: **749 passing tests**, with
-four opt-in benchmark tests skipped, plus formatting and strict Clippy. Hardware
+storage and the application. Release validation covers **1,047 passing tests**,
+including headless application checks and 40 native dashboard reopen cycles,
+plus formatting, strict Clippy and isolated installer upgrade checks. Performance
+fixtures are run separately from the ordinary test suite. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
 

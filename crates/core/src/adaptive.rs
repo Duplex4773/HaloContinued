@@ -8,6 +8,8 @@ pub enum PollingActivityKind {
     Manual,
     Saver,
     SaverRestore,
+    /// Game boost ended while Battery saver still owns the resulting rate.
+    RestoreSaver,
 }
 impl PollingActivityKind {
     pub fn as_str(self) -> &'static str {
@@ -17,6 +19,7 @@ impl PollingActivityKind {
             Self::Manual => "manual",
             Self::Saver => "saver",
             Self::SaverRestore => "saver_restore",
+            Self::RestoreSaver => "restore_saver",
         }
     }
 }

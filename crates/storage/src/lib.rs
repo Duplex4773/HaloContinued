@@ -241,11 +241,42 @@ pub fn load_settings(path: &Path) -> Result<Settings, ProviderError> {
     }
     // Permit a fresh configuration only after the unreadable file is safely
     // out of the way. An access failure must never turn into writable defaults.
-    fs::rename(path, path.with_extension("json.bad")).map_err(|error| {
-        ProviderError::new(format!("Could not preserve damaged settings: {error}"))
-    })?;
+    preserve_damaged_settings(path)?;
     Ok(Settings::default())
 }
+/// Reserve an unused recovery name before renaming; never replace an earlier
+/// damaged configuration (or an existing link). No copying of oversized input.
+fn preserve_damaged_settings(path: &Path) -> Result<(), ProviderError> {
+    for index in 0..1024 {
+        let backup = path.with_extension(if index == 0 {
+            "json.bad".into()
+        } else {
+            format!("json.bad.{index}")
+        });
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(reserved) => {
+                drop(reserved);
+                if let Err(error) = fs::rename(path, &backup) {
+                    let _ = fs::remove_file(&backup);
+                    return Err(ProviderError::new(format!(
+                        "Could not preserve damaged settings: {error}"
+                    )));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ProviderError::new(
+        "Too many damaged settings backups; original file kept",
+    ))
+}
+
 pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ProviderError> {
     atomic_write(
         path,
@@ -564,7 +595,7 @@ impl Store {
                 Some("boost") => Some(PollingActivityKind::Boost),
                 Some("restore") => Some(PollingActivityKind::Restore),
                 Some("manual") => Some(PollingActivityKind::Manual),
-                Some("saver") => Some(PollingActivityKind::Saver),
+                Some("saver" | "restore_saver") => Some(PollingActivityKind::Saver),
                 Some("saver_restore") => Some(PollingActivityKind::SaverRestore),
                 _ => None,
             };
@@ -628,6 +659,10 @@ impl Store {
                         saver_rate = None;
                         Some(rate)
                     }
+                    "restore_saver" => {
+                        saver_rate = Some(rate);
+                        None
+                    }
                     "saver" => {
                         saver_rate = Some(rate);
                         previous.filter(|previous| *previous > rate)
@@ -657,7 +692,7 @@ impl Store {
                     "boost" => {
                         result.recent.boost_sessions += 1;
                     }
-                    "restore" => result.recent.restores += 1,
+                    "restore" | "restore_saver" => result.recent.restores += 1,
                     "manual" => result.recent.manual_changes += 1,
                     "saver" => result.recent.saver_changes += 1,
                     "saver_restore" => result.recent.saver_restores += 1,
@@ -974,7 +1009,7 @@ impl Store {
     /// Install the cancellation callback only around a read query. Settings,
     /// recovery records and history flushes must always finish their writes.
     pub fn query_cancellable<T>(
-        &self,
+        &mut self,
         cancelled: Arc<AtomicBool>,
         query: impl FnOnce(&Self) -> Result<T, ProviderError>,
     ) -> Result<T, ProviderError> {
@@ -1513,6 +1548,33 @@ mod tests {
                 .unwrap()
                 .interval,
             Settings::default().interval
+        );
+    }
+
+    #[test]
+    fn repeated_corruption_never_overwrites_existing_recovery_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let config = folder.path().join("config.json");
+        for (index, content) in [
+            "first damaged config",
+            "second damaged config",
+            "third damaged config",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::write(&config, content).unwrap();
+            load_settings(&config).unwrap();
+            let backup = config.with_extension(if index == 0 {
+                "json.bad".into()
+            } else {
+                format!("json.bad.{index}")
+            });
+            assert_eq!(fs::read_to_string(backup).unwrap(), content);
+        }
+        assert_eq!(
+            fs::read_to_string(config.with_extension("json.bad")).unwrap(),
+            "first damaged config"
         );
     }
 

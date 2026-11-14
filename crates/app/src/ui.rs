@@ -539,6 +539,7 @@ struct Tray {
     frames: Frames,
     signature: IconSignature,
     frame: usize,
+    frame_at: Instant,
 }
 impl Drop for Tray {
     fn drop(&mut self) {
@@ -1543,6 +1544,34 @@ fn current_device_state<'a>(
         battery.and_then(|battery| battery.reading.charging),
     ))
 }
+/// Normally empty. Only Shell delivery failures during command backpressure
+/// need this bounded buffer; existing heartbeats retry the handoff to the owner.
+#[derive(Default)]
+struct NotificationReturns(Vec<Notification>);
+impl NotificationReturns {
+    fn retain(&mut self, notification: Notification) {
+        if let Some(old) = self
+            .0
+            .iter_mut()
+            .find(|old| old.key == notification.key && old.kind == notification.kind)
+        {
+            *old = notification;
+        } else if self.0.len() < 512 {
+            self.0.push(notification);
+        }
+    }
+    fn flush(&mut self, mut send: impl FnMut(Notification) -> Result<(), Notification>) {
+        while let Some(notification) = self.0.pop() {
+            if let Err(notification) = send(notification) {
+                self.0.push(notification);
+                return;
+            }
+        }
+        // Do not retain an outage's allocation during normal monitoring.
+        self.0 = Vec::new();
+    }
+}
+
 struct State {
     context: *const UiContext,
     runtime: Runtime,
@@ -1552,6 +1581,7 @@ struct State {
     dashboard: Option<HWND>,
     controls: BTreeMap<u16, HWND>,
     trays: BTreeMap<String, Tray>,
+    notification_returns: NotificationReturns,
     snapshot: Snapshot,
     diagnostics: BTreeMap<String, Vec<String>>,
     page: u16,
@@ -1573,7 +1603,8 @@ struct State {
     history_cache_active: bool,
     history_queued: Option<Box<Command>>,
     notify: Option<HDEVNOTIFY>,
-    animating: bool,
+    animation_deadline: Option<Instant>,
+    animation_interval: u32,
     tray_theme: TrayThemeCache,
     error: String,
     font: HFONT,
@@ -1773,6 +1804,7 @@ pub fn run(
                 dashboard: None,
                 controls: BTreeMap::new(),
                 trays: BTreeMap::new(),
+                notification_returns: NotificationReturns::default(),
                 snapshot: Snapshot::default(),
                 diagnostics: BTreeMap::new(),
                 page: 1,
@@ -1794,7 +1826,8 @@ pub fn run(
                 history_cache_active: false,
                 history_queued: None,
                 notify: None,
-                animating: false,
+                animation_deadline: None,
+                animation_interval: 0,
                 tray_theme: TrayThemeCache::default(),
                 error: initial_error.unwrap_or_default(),
                 font: HFONT::default(),
@@ -4656,6 +4689,7 @@ impl State {
         self.build_dpi_controls();
         self.build_sleep_controls();
         self.build_battery_saver();
+        self.render_device_information();
         self.layout_page();
         drop(_redraw);
         if let Some(control) = focus_id.and_then(|id| self.controls.get(&id)) {
@@ -5765,6 +5799,8 @@ impl State {
         // A full command queue may have deferred the resume acknowledgement.
         // Existing events provide retry opportunities without another timer.
         self.runtime.retry_pending_resume();
+        self.notification_returns
+            .flush(|notification| self.runtime.return_notification(notification));
         let mut latest = None;
         let mut heartbeat = None;
         let mut polling_outcomes = Vec::new();
@@ -5874,8 +5910,10 @@ impl State {
                         .get_mut(&n.key)
                         .ok_or_else(|| ProviderError::new("Tray icon not available"))
                         .and_then(|t| t.deliver(&n));
-                    if result.is_err() {
-                        self.runtime.send(Command::NotificationFailed(n));
+                    if result.is_err()
+                        && let Err(notification) = self.runtime.return_notification(n)
+                    {
+                        self.notification_returns.retain(notification);
                     }
                 }
                 Event::Insights(id, result) if self.dashboard.is_some() && self.page == 6 => {
@@ -6109,6 +6147,7 @@ impl State {
                 !tray.registration.registered
                     || tray.registration.pending_modify
                     || !tray.signature.matches(device, &self.settings, dark)
+                    || (self.animation_deadline.is_none() && tray.frames.len() > 1)
             });
         }
         if visible == 0 {
@@ -6155,6 +6194,7 @@ impl State {
                     t.frames = frames;
                     t.signature = icon_signature(d, settings, dark);
                     t.frame = 0;
+                    t.frame_at = Instant::now();
                     changed = true
                 }
                 let old = t.data.szTip;
@@ -6200,47 +6240,70 @@ impl State {
                         frames,
                         signature: icon_signature(d, settings, dark),
                         frame: 0,
+                        frame_at: Instant::now(),
                     },
                 );
             }
         }
-        let animate = self.trays.values().any(|t| {
-            t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
-        });
-        if animate != self.animating {
-            unsafe {
-                if animate {
-                    SetTimer(Some(self.monitor), 2, 100, None);
-                } else {
-                    let _ = KillTimer(Some(self.monitor), 2);
-                }
-            }
-            self.animating = animate;
-        }
+        self.animate();
     }
     fn animate(&mut self) {
+        let now = Instant::now();
+        let mut deadline = None;
         for t in self.trays.values_mut().filter(|t| {
             t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
         }) {
             let previous = t.frames[t.frame].0;
-            t.frame = (t.frame + 1) % t.frames.len();
-            if t.frames[t.frame].0 == previous {
-                continue;
+            let (frame, remainder, next) = t
+                .frames
+                .advance(t.frame, now.saturating_duration_since(t.frame_at));
+            t.frame = frame;
+            t.frame_at = now - remainder;
+            t.data.hIcon = t.frames[frame].0;
+            if t.data.hIcon != previous {
+                let mut data = t.data;
+                data.uFlags = NIF_GUID | NIF_ICON;
+                if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+                    t.registration.pending_modify = true;
+                    continue;
+                }
             }
-            let mut data = t.data;
-            data.uFlags = NIF_GUID | NIF_ICON;
-            data.hIcon = t.frames[t.frame].0;
-            if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
-                t.registration.pending_modify = true;
+            if let Some(next) = next {
+                let due = now + next;
+                deadline = Some(deadline.map_or(due, |old: Instant| old.min(due)));
             }
         }
-        if !self.trays.values().any(|t| {
-            t.frames.len() > 1 && t.registration.registered && !t.registration.pending_modify
-        }) {
+        // Multiple devices share one timer, armed for the earliest changed image.
+        // A tooltip or heartbeat refresh must not postpone an existing deadline.
+        if deadline != self.animation_deadline {
             unsafe {
-                let _ = KillTimer(Some(self.monitor), 2);
+                if let Some(due) = deadline {
+                    let delay = due
+                        .saturating_duration_since(Instant::now())
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .clamp(1, u32::MAX as u128) as u32;
+                    // Keep the existing 100 ms timer through changing frames.
+                    // Re-arm only when entering/leaving a run of identical images;
+                    // replacing a healthy timer every frame adds kernel work.
+                    if self.animation_deadline.is_some()
+                        && self.animation_interval == 100
+                        && delay <= 100
+                    {
+                        self.animation_deadline = Some(due);
+                        return;
+                    }
+                    self.animation_interval = delay;
+                    self.animation_deadline =
+                        (SetTimer(Some(self.monitor), 2, delay, None) != 0).then_some(due);
+                    if self.animation_deadline.is_none() {
+                        let _ = KillTimer(Some(self.monitor), 2);
+                    }
+                } else {
+                    let _ = KillTimer(Some(self.monitor), 2);
+                    self.animation_deadline = None;
+                }
             }
-            self.animating = false;
         }
     }
     fn select_tray_device(&mut self, key: &str) -> bool {
@@ -6763,6 +6826,67 @@ fn boost_controls_visible(
 
 #[cfg(test)]
 mod behaviour_tests {
+    #[test]
+    fn failed_alerts_survive_full_command_queues_and_release_recovery_memory() {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut reading = Reading::new("mouse", "Mouse", "razer", 0);
+        reading.level = Some(10);
+        reading.charging = Some(false);
+        let notification = engine
+            .apply("razer", Ok(vec![reading]), 0.0, false)
+            .pop()
+            .unwrap();
+        let (commands, receiver) = crossbeam_channel::bounded(1);
+        commands.send(Command::Refresh).unwrap();
+        let mut pending = NotificationReturns::default();
+        let returned =
+            crate::runtime::return_notification(&commands, notification.clone()).unwrap_err();
+        pending.retain(returned);
+        pending.retain(notification.clone());
+        pending.flush(|n| crate::runtime::return_notification(&commands, n));
+        assert_eq!(pending.0.len(), 1);
+        assert!(matches!(receiver.recv().unwrap(), Command::Refresh));
+        pending.flush(|n| crate::runtime::return_notification(&commands, n));
+        assert!(pending.0.is_empty());
+        assert_eq!(pending.0.capacity(), 0);
+        let Command::NotificationFailed(returned) = receiver.recv().unwrap() else {
+            panic!("failed alert was lost")
+        };
+        engine.notification_failed(returned);
+        assert_eq!(engine.flush_held().len(), 1);
+        assert!(engine.flush_held().is_empty());
+        drop(receiver);
+        pending.retain(notification);
+        pending.flush(|n| crate::runtime::return_notification(&commands, n));
+        assert_eq!(pending.0.capacity(), 0);
+    }
+
+    #[test]
+    fn notification_outages_are_bounded_and_idle_retries_do_not_allocate() {
+        let mut engine = Engine::new(Settings::default(), Estimator::default());
+        let mut reading = Reading::new("mouse", "Mouse", "razer", 0);
+        reading.level = Some(10);
+        let notification = engine
+            .apply("razer", Ok(vec![reading]), 0.0, false)
+            .pop()
+            .unwrap();
+        let mut pending = NotificationReturns::default();
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                pending.flush(|_| panic!("empty retry must not send work"));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
+        for index in 0..1024 {
+            let mut n = notification.clone();
+            n.key = format!("mouse:{index}");
+            pending.retain(n);
+        }
+        assert_eq!(pending.0.len(), 512);
+        pending.flush(|_| Ok(()));
+        assert_eq!(pending.0.capacity(), 0);
+    }
+
     #[test]
     fn boost_visibility_respects_model_and_readback_but_allows_disabling_saved_boost() {
         use super::*;
@@ -9891,6 +10015,7 @@ mod dashboard_lifecycle_tests {
                         icons::unshared_frames(&device, &settings, tray.signature.dark, 32)
                             .unwrap();
                     tray.frame = 0;
+                    tray.frame_at = Instant::now();
                     tray.data.hIcon = tray.frames[0].0;
                     tray.registration.update_with(
                         &tray.data,
@@ -10702,6 +10827,7 @@ mod dashboard_lifecycle_tests {
                     dashboard: None,
                     controls: BTreeMap::new(),
                     trays: BTreeMap::new(),
+                    notification_returns: NotificationReturns::default(),
                     snapshot: Snapshot::default(),
                     diagnostics: BTreeMap::new(),
                     page: 1,
@@ -10723,7 +10849,8 @@ mod dashboard_lifecycle_tests {
                     history_cache_active: false,
                     history_queued: None,
                     notify: None,
-                    animating: false,
+                    animation_deadline: None,
+                    animation_interval: 0,
                     tray_theme: TrayThemeCache::default(),
                     error: String::new(),
                     font: HFONT::default(),
@@ -10803,7 +10930,7 @@ mod dashboard_lifecycle_tests {
                     state.snapshot.devices[0].reading.level = Some(level);
                     state.snapshot.devices[0].reading.charging = Some(true);
                     state.sync_trays(TrayUpdate::Changed);
-                    assert_eq!(state.animating, animated);
+                    assert_eq!(state.animation_deadline.is_some(), animated);
                     assert_eq!(
                         state.trays["simulated:mouse"].frames.len(),
                         if animated { 30 } else { 1 }
@@ -13200,18 +13327,21 @@ mod dashboard_lifecycle_tests {
                         GetGuiResources(process, GR_GDIOBJECTS),
                         GetGuiResources(process, GR_USEROBJECTS),
                     );
-                    if cycle == 0 {
+                    // Native controls lazily cache resources for each palette.
+                    // Warm both themes before measuring; still reject growth on
+                    // every subsequent cycle rather than only the final one.
+                    if cycle == 1 {
                         baseline = Some(handles);
                     }
-                    if cycle == 39 {
+                    if cycle > 1 {
                         let first = baseline.unwrap();
                         assert!(
                             handles.0 <= first.0 && handles.1 <= first.1,
                             "closed dashboard native resources grew: {first:?} -> {handles:?}"
                         );
-                        if std::env::var_os("HALO_CAPTURE_DASHBOARD_TEST").is_some() {
+                        if cycle == 39 {
                             eprintln!(
-                                "Closed dashboard native handles, cycles 1 and 40: {first:?} -> {handles:?}"
+                                "Closed dashboard native handles, cycles 2 and 40: {first:?} -> {handles:?}"
                             );
                         }
                     }

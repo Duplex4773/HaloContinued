@@ -21,6 +21,23 @@ impl Frames {
     pub fn len(&self) -> usize {
         self.count
     }
+    /// Locate the current 100 ms frame and the next *visible* change. Repeated
+    /// images need no UI wakeup, but still occupy their original time slots.
+    pub fn advance(
+        &self,
+        frame: usize,
+        elapsed: std::time::Duration,
+    ) -> (usize, std::time::Duration, Option<std::time::Duration>) {
+        use std::time::Duration;
+        const TICK_NS: u128 = 100_000_000;
+        let frame =
+            (frame + (elapsed.as_nanos() / TICK_NS % self.count as u128) as usize) % self.count;
+        let remainder = Duration::from_nanos((elapsed.as_nanos() % TICK_NS) as u64);
+        let next = (1..self.count)
+            .find(|step| self.order[(frame + step) % self.count] != self.order[frame])
+            .map(|step| Duration::from_millis(step as u64 * 100) - remainder);
+        (frame, remainder, next)
+    }
     #[cfg(test)]
     pub(super) fn unique_len(&self) -> usize {
         self.icons.len()
@@ -59,6 +76,94 @@ impl std::ops::Index<usize> for Frames {
     fn index(&self, frame: usize) -> &Icon {
         assert!(frame < self.count);
         &self.icons[usize::from(self.order[frame])]
+    }
+}
+#[cfg(test)]
+mod animation_schedule_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn timeline(order: &[u8]) -> Frames {
+        let mut frames = Frames {
+            icons: Vec::new(),
+            order: [0; 30],
+            count: order.len(),
+        };
+        frames.order[..order.len()].copy_from_slice(order);
+        frames
+    }
+    #[test]
+    fn repeated_frames_sleep_until_visible_change_without_altering_the_cycle() {
+        let order: Vec<_> = (0..30).map(|i| if i < 17 { 0 } else { i }).collect();
+        let frames = timeline(&order);
+        let mut now = Duration::ZERO;
+        let mut wakes = 0;
+        while now < Duration::from_secs(3) {
+            let (frame, _, next) = frames.advance(0, now);
+            assert_eq!(frame, (now.as_millis() / 100 % 30) as usize);
+            now += next.unwrap();
+            wakes += 1;
+        }
+        assert_eq!(now, Duration::from_secs(3));
+        assert_eq!(wakes, 14, "formerly thirty timer wakeups per cycle");
+        assert_eq!(timeline(&[0]).advance(0, Duration::from_secs(99)).2, None);
+        assert_eq!(timeline(&[0, 0, 0]).advance(0, Duration::ZERO).2, None);
+    }
+    #[test]
+    fn delayed_and_early_callbacks_preserve_the_monotonic_animation_phase() {
+        let frames = timeline(&[0, 0, 0, 1, 2, 0]);
+        let (mut frame, mut at) = (0, Duration::ZERO);
+        for millis in [0, 11, 90, 299, 300, 407, 600, 601, 910, 10_025, 86_400_075] {
+            let now = Duration::from_millis(millis);
+            let (actual, remainder, next) = frames.advance(frame, now - at);
+            assert_eq!(actual, (millis / 100 % 6) as usize);
+            frame = actual;
+            at = now - remainder;
+            let due = now + next.unwrap();
+            assert!(due > now);
+            assert_eq!(due.as_nanos() % 100_000_000, 0);
+            assert_ne!(
+                frames.order[(due.as_millis() / 100 % 6) as usize],
+                frames.order[frame]
+            );
+        }
+        let (frame, remainder, _) = frames.advance(0, Duration::MAX);
+        assert!(frame < frames.len() && remainder < Duration::from_millis(100));
+    }
+    #[test]
+    fn independent_devices_share_the_earliest_deadline_without_losing_frames() {
+        let first = timeline(&[0, 0, 0, 1, 1, 2]);
+        let second = timeline(&[0, 1, 1, 1, 2, 2]);
+        let starts = [Duration::ZERO, Duration::from_millis(37)];
+        let mut displayed = [0, 0];
+        let mut due = Duration::ZERO;
+        for millis in 0..3000 {
+            let now = Duration::from_millis(millis);
+            if now >= due {
+                due = Duration::MAX;
+                for (index, frames) in [&first, &second].into_iter().enumerate() {
+                    if now < starts[index] {
+                        due = due.min(starts[index]);
+                        continue;
+                    }
+                    let (frame, _, wait) = frames.advance(0, now - starts[index]);
+                    displayed[index] = frames.order[frame];
+                    due = due.min(now + wait.unwrap());
+                }
+            }
+            for (index, frames) in [&first, &second].into_iter().enumerate() {
+                if now >= starts[index] {
+                    let frame = ((now - starts[index]).as_millis() / 100 % 6) as usize;
+                    assert_eq!(displayed[index], frames.order[frame]);
+                }
+            }
+        }
+        let (_, allocations) = crate::allocation_counter::measure(|| {
+            for index in 0..1000 {
+                std::hint::black_box(first.advance(0, Duration::from_millis(index)));
+            }
+        });
+        assert_eq!(allocations.calls, 0);
     }
 }
 pub fn frames(
