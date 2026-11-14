@@ -547,7 +547,10 @@ fn coarse(battery: &XINPUT_BATTERY_INFORMATION) -> Option<(u8, &'static str)> {
     }
 }
 fn wgi_percentage(vid: u16, pid: u16, remaining: Option<i32>, full: Option<i32>) -> Option<u8> {
-    if !matches!(vid, 0x045e | 0x3537) || xbox_bluetooth(vid, pid) {
+    if !matches!(vid, 0x045e | 0x3537)
+        || xbox_bluetooth(vid, pid)
+        || hb_providers::community::vendor_controller_name(vid, pid).is_some()
+    {
         return None;
     }
     remaining
@@ -609,6 +612,8 @@ impl BatteryProvider for ControllerProvider {
         // Check size/entries so partial discovery cannot imply disconnection.
         let count = controller_query(controllers.Size(), "inventory size")?;
         let mut flydigi = Vec::new();
+        let mut vendor_controller = None;
+        let mut gamepad_count = 0;
         for index in 0..count {
             if !c.active() {
                 return Err(ProviderError::new("Controller snapshot deadline exceeded"));
@@ -617,6 +622,7 @@ impl BatteryProvider for ControllerProvider {
             if Gamepad::FromGameController(&raw).is_err() {
                 continue;
             }
+            gamepad_count += 1;
             let id = controller_query(raw.NonRoamableId(), "device identity")?;
             if id.is_empty() {
                 continue;
@@ -632,12 +638,18 @@ impl BatteryProvider for ControllerProvider {
             r.kind = "gamepad".into();
             let vendor = raw.HardwareVendorId().unwrap_or(0);
             let product = raw.HardwareProductId().unwrap_or(0);
+            let vendor_name = hb_providers::community::vendor_controller_name(vendor, product);
+            if let Some(name) = vendor_name {
+                vendor_controller = Some((out.len(), vendor, product, name));
+            }
             if vendor == 0x37d7 && product == 0x2401 {
                 flydigi.push(out.len());
             }
             let bt = xbox_bluetooth(vendor, product);
             r.via = if bt { "bluetooth" } else { "wireless" }.into();
-            if let Ok(report) = raw.TryGetBatteryReport() {
+            if vendor_name.is_none()
+                && let Ok(report) = raw.TryGetBatteryReport()
+            {
                 r.level = wgi_percentage(
                     vendor,
                     product,
@@ -666,8 +678,9 @@ impl BatteryProvider for ControllerProvider {
             r.precision = Precision::Coarse;
             r.approx = Some(format!("about {}%", b.level));
         }
-        // Windows exposes no dependable WGI-to-XInput slot identity. Keep every slot;
-        // a WGI report from one pad must never hide another pad's XInput report.
+        // An exact model can replace the XInput placeholder only when neither
+        // inventory leaves another controller that could own the slot.
+        let wgi_count = out.len();
         for slot in 0..4 {
             if !c.active() {
                 return Err(ProviderError::new("Controller snapshot deadline exceeded"));
@@ -685,12 +698,43 @@ impl BatteryProvider for ControllerProvider {
                 c.clock.unix(),
             ));
         }
+        if single_vendor_controller(gamepad_count, out.len() - wgi_count)
+            && let Some((index, vid, pid, name)) = vendor_controller
+            && let Ok(Some(battery)) =
+                hb_providers::community::vendor_controller_battery(vid, pid, hid, c)
+        {
+            let r = &mut out[index];
+            r.name = name.into();
+            r.level = Some(battery.level);
+            r.charging = battery.charging;
+            if pid == 0x10c5 {
+                r.via = "usb".into();
+            }
+            out.pop();
+        }
         Ok(out)
     }
+}
+
+fn single_vendor_controller(wgi_gamepads: usize, xinput_slots: usize) -> bool {
+    wgi_gamepads == 1 && xinput_slots == 1
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vendor_controller_requires_unambiguous_inventories_and_ignores_placeholders() {
+        for wgi in 0..=3 {
+            for xinput in 0..=4 {
+                assert_eq!(
+                    single_vendor_controller(wgi, xinput),
+                    (wgi, xinput) == (1, 1)
+                );
+            }
+        }
+        assert_eq!(wgi_percentage(0x3537, 0x10c6, Some(1000), Some(1000)), None);
+        assert_eq!(wgi_percentage(0x20bc, 0x515c, Some(1000), Some(1000)), None);
+    }
     #[test]
     fn non_battery_nodes_do_not_keep_fast_connection_checks_alive() {
         let mut provider = BluetoothProvider {

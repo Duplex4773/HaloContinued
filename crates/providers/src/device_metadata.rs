@@ -56,27 +56,36 @@ pub fn parent_battery_verified(device: &ConfigurationDevice) -> bool {
         device.key.starts_with(p) && device.key.split(':').next() == Some(device.source.as_str())
     }) || device.source == "asus" && device.key.starts_with("asus:omni:")
         || device.source == "shield" && device.key.starts_with("shield:board:")
-        || device.source == "xinput" && device.name == "FlyDigi Vader 5 Pro"
+        || device.source == "xinput"
+            && matches!(
+                device.name.as_str(),
+                "FlyDigi Vader 5 Pro" | "BEITONG KP40D" | "GameSir G7 Pro 8K Aimlabs"
+            )
 }
 // Exact connection prefixes from the documented parent hardware confirmations.
 const PARENT_PREFIXES: &[&str] = &[
     "ajazz:5c2f:",
+    "ajazz:fefc:",
     "alienware:211d:",
     "asus:18d6:",
     "asus:1ace:",
+    "asus:1ad0:",
     "asus:1c5a:",
     "atk_keyboard:5088:",
     "atk_nearlink:108c:",
+    "aula:024f:",
     "aula:22a0:",
     "aula:fa09:",
     "aula:fefc:",
     "corsair:0a40:",
+    "corsair:0a55:",
     "corsair:0a6b:",
     "corsair:1b7f:",
     "corsair:1bdc:",
     "corsair:2b07:",
     "dareu:1074:",
     "endgame_we:1961:",
+    "eweadn:026f:",
     "eweadn:062f:",
     "finalmouse:0100:",
     "glorious:2011:",
@@ -92,6 +101,7 @@ const PARENT_PREFIXES: &[&str] = &[
     "lamzu:f50f:",
     "lamzu:f510:",
     "lofree:024f:",
+    "mchose:1018:",
     "mchose:2001:",
     "mchose:385d:",
     "mchose:6008:",
@@ -99,6 +109,7 @@ const PARENT_PREFIXES: &[&str] = &[
     "monsgeek:5026:",
     "nzxt:2101:",
     "nzxt:2129:",
+    "plantronics:02ee:",
     "plantronics:02f7:",
     "pulsar:0300:",
     "pulsar:101a:",
@@ -132,6 +143,7 @@ const PARENT_PREFIXES: &[&str] = &[
     "steam:1305:",
     "steelseries:2317:",
     "turtlebeach:2251:",
+    "turtlebeach:225e:",
     "turtlebeach:229b:",
     "urx:3002:",
     "vaxee:2001:",

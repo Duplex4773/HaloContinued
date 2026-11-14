@@ -886,5 +886,113 @@
     ],
     "fork": "ahmedkhursheed23/HaloBattery",
     "revision": "89d17a2a738dac871e24f01fd48e4e04779b40d9"
+  },
+  {
+    "device": [
+      "asus",
+      2821,
+      6864,
+      "ROG Harpe II Ace",
+      "pr:harpe-ii",
+      0
+    ],
+    "pull_request": 364,
+    "revision": "fcd0ea2dc7fce50dd1c869f690374c2b183c5bf2"
+  },
+  {
+    "device": [
+      "atk_keyboard",
+      12815,
+      20565,
+      "ATK V75X",
+      "pr:atk-keyboard",
+      0
+    ],
+    "pull_request": 368,
+    "revision": "db0516e6ab5f50706385d50ffc20b4b9e10071a8"
+  },
+  {
+    "device": [
+      "corsair",
+      6940,
+      2645,
+      "Corsair Void Elite Wireless",
+      "pr:void-elite",
+      0
+    ],
+    "fork": "HeyOkay/HaloBattery",
+    "revision": "a20391e2a630eddf4ce8b1dc00a9a40e342aa2fc"
+  },
+  {
+    "device": [
+      "aula",
+      1452,
+      591,
+      "AULA F108 Pro",
+      "pr:f108-pro",
+      0
+    ],
+    "pull_request": 402,
+    "revision": "94fba74cb8cdd9ba3960a3413aced5803c08c3b4"
+  },
+  {
+    "device": [
+      "mchose",
+      14391,
+      4120,
+      "MCHOSE K7 V2 Ultra+",
+      "pr:mchose-device-info",
+      0
+    ],
+    "pull_request": 403,
+    "revision": "51019b27724d07439e8b24428e7b6ec08fca13cb"
+  },
+  {
+    "device": [
+      "eweadn",
+      1267,
+      623,
+      "EWEADN X23 Pro",
+      "pr:eweadn-ydx",
+      0
+    ],
+    "pull_request": 406,
+    "revision": "30c9101eb74b309dccc9f6bb40c74e5aba32715b"
+  },
+  {
+    "device": [
+      "turtlebeach",
+      4341,
+      8798,
+      "Turtle Beach Atlas Air",
+      "pr:turtle",
+      0
+    ],
+    "fork": "HeyOkay/HaloBattery",
+    "revision": "a20391e2a630eddf4ce8b1dc00a9a40e342aa2fc"
+  },
+  {
+    "device": [
+      "ajazz",
+      3141,
+      65276,
+      "AJAZZ AK820 Max Ultra",
+      "pr:ajazz-ak820",
+      0
+    ],
+    "fork": "casparas123/HaloBattery",
+    "revision": "b0b804644a194bf8003540cf8d216b444e94842e"
+  },
+  {
+    "device": [
+      "plantronics",
+      1151,
+      750,
+      "Poly Voyager 8200 UC",
+      "pr:bt600",
+      0
+    ],
+    "fork": "HeyOkay/HaloBattery",
+    "revision": "a20391e2a630eddf4ce8b1dc00a9a40e342aa2fc"
   }
 ]

@@ -405,6 +405,7 @@ fn metadata(info: &mut HidInfo) {
                 let data = Preparsed(data);
                 let mut caps = HIDP_CAPS::default();
                 if HidP_GetCaps(data.0, &mut caps) == HIDP_STATUS_SUCCESS {
+                    info.input_length = Some(caps.InputReportByteLength as usize);
                     info.output_length = Some(caps.OutputReportByteLength as usize);
                     info.feature_length = Some(caps.FeatureReportByteLength as usize);
                 }

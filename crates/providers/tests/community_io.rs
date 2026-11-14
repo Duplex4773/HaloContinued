@@ -113,7 +113,7 @@ fn pinned_reviewed_catalog_has_unique_ids_and_excludes_unconfirmed_transports() 
                     .is_some_and(|name| name.contains('/'))
         );
     }
-    assert_eq!(seen.len(), 74);
+    assert_eq!(seen.len(), 83);
     for (vid, pid) in [
         (0x1532, 0x00df),
         (0x1532, 0x00de),
@@ -700,7 +700,7 @@ fn gsi_inputs(doc: &str) -> Vec<Step> {
 }
 #[test]
 fn turtle_pro_uses_captured_opener_and_reassembles_json_in_bounded_frames() {
-    for pid in [0x229b, 0x229e] {
+    for pid in [0x229b, 0x229e, 0x225e] {
         let q = packet(
             "06 18 00 05 5a 14 00 02 99 48 01 c0 4a 01 00 00 00 00 00 00 00 61 00 53 49 6e 66",
         );
@@ -715,7 +715,14 @@ fn turtle_pro_uses_captured_opener_and_reassembles_json_in_bounded_frames() {
         .unwrap();
         assert_eq!(rows[0].level, Some(77));
         assert_eq!(rows[0].charging, Some(true));
-        assert_eq!(rows[0].name, "Turtle Beach Stealth Pro II");
+        assert_eq!(
+            rows[0].name,
+            if pid == 0x225e {
+                "Turtle Beach Atlas Air"
+            } else {
+                "Turtle Beach Stealth Pro II"
+            }
+        );
         h.done();
     }
 }
@@ -958,7 +965,13 @@ fn razer_pro_type_prefers_9f_and_unproven_timeout_does_not_pin_wrong_collection(
 
 #[test]
 fn omni_queries_only_confirmed_paired_models_and_keeps_child_identities_distinct() {
-    for known in [false, true] {
+    for (mouse_model, keyboard_model, battery_byte, known) in [
+        (0x1a72u16, 0x1b42u16, 6, false),
+        (0x1b65, 0x1b06, 11, true),
+        (0x1b1a, 0x1a85, 6, true),
+        (0x1b18, 0x1ab0, 6, true),
+        (0x1b1a, 0x1cea, 6, true),
+    ] {
         let mut infos = vec![];
         for page in [0xff02, 0xff01, 0xff00] {
             let mut i = device(0x0b05, 0x1ace, page, 1);
@@ -967,9 +980,9 @@ fn omni_queries_only_confirmed_paired_models_and_keeps_child_identities_distinct
             i.path = format!("omni-{page:04x}");
             infos.push(i);
         }
-        let mut pairs = padded(&[1, 0xa0, 0, 0, 0], 64);
-        pairs[5..7].copy_from_slice(if known { &[0x65, 0x1b] } else { &[0x85, 0x1a] });
-        pairs[9..11].copy_from_slice(if known { &[6, 0x1b] } else { &[0x72, 0x1a] });
+        let mut pairs = padded(&[1, 0xa0, 0, 1, 0], 64);
+        pairs[5..7].copy_from_slice(&mouse_model.to_le_bytes());
+        pairs[9..11].copy_from_slice(&keyboard_model.to_le_bytes());
         let mut steps = vec![
             rd(&[]),
             Step::Write(padded(&[1, 0xa0, 0, 0], 64)),
@@ -979,7 +992,7 @@ fn omni_queries_only_confirmed_paired_models_and_keeps_child_identities_distinct
             let mut mouse = padded(&[3, 0x12, 7], 64);
             mouse[5] = 55;
             let mut keyboard = padded(&[2, 0x12, 1], 64);
-            keyboard[11] = 66;
+            keyboard[battery_byte] = 66;
             keyboard[9] = 1;
             steps.extend([
                 rd(&[]),
@@ -1009,7 +1022,7 @@ fn passive_startup_sweep_is_throttled_and_refresh_preserves_sleeping_cache() {
     let clock = FakeClock::default();
     let i = device(0x1d57, 0xfa65, 0x000a, 0);
     let mut p = HidProvider::new("inphic");
-    let silent = FakeHid::new(vec![i.clone()], vec![rd(&[]); 5]);
+    let silent = FakeHid::new(vec![i.clone()], vec![rd(&[]); 12]);
     assert!(poll(&mut p, &silent, &clock).unwrap().is_empty());
     silent.done();
     let throttled = FakeHid::new(vec![i.clone()], vec![]);

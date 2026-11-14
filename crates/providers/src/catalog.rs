@@ -22,6 +22,14 @@ pub fn find_device(provider: &str, vid: u16, pid: u16) -> Option<&'static Device
 pub const DEVICES: &[Device] = &[
     Device {
         provider: "ajazz",
+        vid: 0x0c45,
+        pid: 0xfefc,
+        name: "AJAZZ AK820 Max Ultra",
+        variant: "pr:ajazz-ak820",
+        parameter: 0,
+    },
+    Device {
+        provider: "ajazz",
         vid: 0x248a,
         pid: 0x5d2e,
         name: "AJAZZ AJ179 V2 MAX",
@@ -271,6 +279,14 @@ pub const DEVICES: &[Device] = &[
     Device {
         provider: "asus",
         vid: 0x0b05,
+        pid: 0x1ad0,
+        name: "ROG Harpe II Ace",
+        variant: "pr:harpe-ii",
+        parameter: 0,
+    },
+    Device {
+        provider: "asus",
+        vid: 0x0b05,
         pid: 0x1af3,
         name: "TX Gaming Mouse Mini",
         variant: "",
@@ -323,6 +339,14 @@ pub const DEVICES: &[Device] = &[
         name: "TX Gaming Mouse Mini Miku",
         variant: "",
         parameter: 1,
+    },
+    Device {
+        provider: "atk_keyboard",
+        vid: 0x320f,
+        pid: 0x5055,
+        name: "ATK V75X",
+        variant: "pr:atk-keyboard",
+        parameter: 0,
     },
     Device {
         provider: "atk_keyboard",
@@ -398,6 +422,14 @@ pub const DEVICES: &[Device] = &[
     },
     Device {
         provider: "aula",
+        vid: 0x05ac,
+        pid: 0x024f,
+        name: "AULA F108 Pro",
+        variant: "pr:f108-pro",
+        parameter: 0,
+    },
+    Device {
+        provider: "aula",
         vid: 0x0c45,
         pid: 0xfefc,
         name: "AULA F87 Pro V2C",
@@ -458,6 +490,14 @@ pub const DEVICES: &[Device] = &[
         pid: 0x0a40,
         name: "Corsair Virtuoso RGB Wireless SE",
         variant: "bragi",
+        parameter: 0,
+    },
+    Device {
+        provider: "corsair",
+        vid: 0x1b1c,
+        pid: 0x0a55,
+        name: "Corsair Void Elite Wireless",
+        variant: "pr:void-elite",
         parameter: 0,
     },
     Device {
@@ -618,6 +658,14 @@ pub const DEVICES: &[Device] = &[
         pid: 0x1961,
         name: "Endgame Gear XM2we",
         variant: "pr:endgame-we",
+        parameter: 0,
+    },
+    Device {
+        provider: "eweadn",
+        vid: 0x04f3,
+        pid: 0x026f,
+        name: "EWEADN X23 Pro",
+        variant: "pr:eweadn-ydx",
         parameter: 0,
     },
     Device {
@@ -1671,6 +1719,14 @@ pub const DEVICES: &[Device] = &[
     Device {
         provider: "mchose",
         vid: 0x3837,
+        pid: 0x1018,
+        name: "MCHOSE K7 V2 Ultra+",
+        variant: "pr:mchose-device-info",
+        parameter: 0,
+    },
+    Device {
+        provider: "mchose",
+        vid: 0x3837,
         pid: 0x6008,
         name: "MCHOSE V9 Turbo+",
         variant: "pr:turbo",
@@ -1754,6 +1810,14 @@ pub const DEVICES: &[Device] = &[
         pid: 0x2129,
         name: "NZXT Lift Elite Wireless",
         variant: "",
+        parameter: 0,
+    },
+    Device {
+        provider: "plantronics",
+        vid: 0x047f,
+        pid: 0x02ee,
+        name: "Poly Voyager 8200 UC",
+        variant: "pr:bt600",
         parameter: 0,
     },
     Device {
@@ -3153,6 +3217,14 @@ pub const DEVICES: &[Device] = &[
         vid: 0x10f5,
         pid: 0x2253,
         name: "Turtle Beach Stealth 700 Gen 3 headset",
+        variant: "pr:turtle",
+        parameter: 0,
+    },
+    Device {
+        provider: "turtlebeach",
+        vid: 0x10f5,
+        pid: 0x225e,
+        name: "Turtle Beach Atlas Air",
         variant: "pr:turtle",
         parameter: 0,
     },

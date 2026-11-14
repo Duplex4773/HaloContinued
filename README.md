@@ -28,22 +28,22 @@ and do not measure game frame rates or input latency. Small CPU differences can
 reflect counter resolution or run-to-run variation; actual usage varies.
 [See the full comparison, settings and limitations](#matched-version-comparison-18-october-2026).
 
-**New in 1.1.5:** Fewer charging-animation wakeups, more reliable battery-alert
-retries, clearer device capabilities, and better Insights attribution when
-Game boost restores a Battery saver rate. Damaged settings backups are preserved
-and the bundled SQLite dependency includes its latest security fix.
-See the [1.1.5 changelog](CHANGELOG.md#halo-continued-115).
+**New in 1.1.6:** Battery monitoring for 15 more device models, USB cable
+monitoring for the ATK V75X, another Poly BT600 receiver revision and an
+Arctis Pro Wireless base station compatibility fix. See the
+[device and connection list](#battery-support-from-halobattery-1170-and-follow-up-reports)
+and [1.1.6 changelog](CHANGELOG.md#halo-continued-116).
 
-Latest GitHub release: **1.1.5** for Windows 11 x64, available as an unsigned per-user
+Latest GitHub release: **1.1.6** for Windows 11 x64, available as an unsigned per-user
 installer and a portable ZIP.
 
 | Download | Use it for |
 | --- | --- |
-| [**V1.1.5 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.5/HaloContinued-1.1.5-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
-| [**V1.1.5 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.5/HaloContinued-1.1.5-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
+| [**V1.1.6 installer**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.6/HaloContinued-1.1.6-windows-x64-setup.exe) | Install for your Windows account, with a Start menu shortcut and optional startup at sign-in. No administrator privileges required. |
+| [**V1.1.6 portable ZIP**](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.6/HaloContinued-1.1.6-windows-x64.zip) | Extract the ZIP and run `HaloContinued.exe`. Includes licences and notices. |
 
-[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.5/HaloContinued-1.1.5-SHA256SUMS.txt)
-· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.5)
+[SHA-256 checksums](https://github.com/Duplex4773/HaloContinued/releases/download/v1.1.6/HaloContinued-1.1.6-SHA256SUMS.txt)
+· [Release notes and changelog](https://github.com/Duplex4773/HaloContinued/releases/tag/v1.1.6)
 
 Both downloads are unsigned. Windows may show an unrecognised-app warning.
 
@@ -296,6 +296,23 @@ by simulated transport tests.
 | Sony INZONE H9, Poly Voyager 8200 UC, Razer Barracuda X (2022) | H9 receiver `054C:0E53` uses its USB serial interface. Poly BT600 adapter `047F:02F7` reports battery and charging. Barracuda X receiver `1532:0552` reports voltage, shown as an estimated percentage. [H9 captures](https://github.com/BoringMan314/bm-halo-battery/blob/b8d9b7d/hardware-evidence/README.md) · [Poly source](https://github.com/casparas123/HaloBattery/commit/e4a060f) · [Barracuda source](https://github.com/ahmedkhursheed23/HaloBattery/commit/89d17a2) |
 | Logitech G535 | Existing `046D:0AC4` entry gains the charge-register reader on its vendor collection. [G535 report](https://github.com/HeyOkay/HaloBattery/issues/339) |
 
+### Battery support from HaloBattery 1.17.0 and follow-up reports
+
+These battery readers use the existing HID and controller polling paths.
+Hardware confirmation comes from the linked reports. Halo Continued tests
+the exchanges with simulated transports.
+
+| Device | Supported connection and limits | Source |
+| --- | --- | --- |
+| ASUS ROG Harpe II Ace | SPEEDNOVA receiver `0B05:1AD0`. | [#364](https://github.com/HeyOkay/HaloBattery/pull/364) |
+| ASUS ROG Keris II Ace, Azoth, Strix Scope II 96 Wireless and Strix Morph 96 Wireless | ROG OMNI receiver `0B05:1ACE`, with the mouse and keyboard identified separately from its pair list. | [#231](https://github.com/HeyOkay/HaloBattery/issues/231), [#364](https://github.com/HeyOkay/HaloBattery/pull/364), [#340](https://github.com/HeyOkay/HaloBattery/issues/340) |
+| ATK V75X and VGN N75 PRO | V75X adds cable `320F:5055`; VGN uses `320F:5088` with its exact product name. The cable takes priority when both V75X connections share a trusted identity. Receiver reads reuse a successful sample for five minutes and retry failures after at least 30 seconds on the existing schedule. VGN charging is unknown. | [#368](https://github.com/HeyOkay/HaloBattery/pull/368), [#407](https://github.com/HeyOkay/HaloBattery/pull/407) |
+| AULA F108 Pro and AJAZZ AK820 Max Ultra | Receivers `05AC:024F` and `0C45:FEFC`. The product name and HID collection distinguish them from other keyboards sharing those IDs. AULA reports battery level only. | [#402](https://github.com/HeyOkay/HaloBattery/pull/402), [#256](https://github.com/HeyOkay/HaloBattery/issues/256) |
+| MCHOSE K7 V2 Ultra+, EWEADN X23 Pro and Delux M900 Pro | Receivers `3837:1018`, `04F3:026F` and `1D57:FA65` respectively. The X23 Pro uses a feature read with a separate input collection. The Delux is identified from its passive reports. | [#403](https://github.com/HeyOkay/HaloBattery/pull/403), [#406](https://github.com/HeyOkay/HaloBattery/pull/406), [#407](https://github.com/HeyOkay/HaloBattery/pull/407) |
+| Corsair Void Elite Wireless, Turtle Beach Atlas Air and Poly Voyager 8200 UC | Receivers `1B1C:0A55`, `10F5:225E` and BT600 revision `047F:02EE`. | [#330](https://github.com/HeyOkay/HaloBattery/issues/330), [#310](https://github.com/HeyOkay/HaloBattery/issues/310), [HaloBattery 1.17.0](https://github.com/HeyOkay/HaloBattery/releases/tag/v1.17.0) |
+| BEITONG KP40D and GameSir G7 Pro 8K Aimlabs | BEITONG receiver `20BC:515C`; GameSir cable and receiver `3537:10C5` / `10C6`. Vendor battery reads require one Windows gamepad, one XInput slot and a unique matching HID collection. | [#376](https://github.com/HeyOkay/HaloBattery/pull/376), [#390](https://github.com/HeyOkay/HaloBattery/pull/390) |
+| SteelSeries Arctis Pro Wireless | Existing base station `1038:1290` now tries an alternate HID report format when the original format gets no response. | [#389](https://github.com/HeyOkay/HaloBattery/pull/389) |
+
 ### Battery support from parent pull requests
 
 Additional battery support from **hardware-confirmed parent pull requests**, reviewed
@@ -332,8 +349,8 @@ deduplication and SteelSeries Nova 3P use existing implementations; the latter's
 The Maxwell Xbox receiver's off-state name is also recognized
 ([#254](https://github.com/HeyOkay/HaloBattery/pull/254)). Proposals explicitly awaiting
 hardware confirmation, including Viper V3 Pro SE and HyperX Cloud Alpha Wireless,
-are not enabled by this review. Sony INZONE H9's proposed transport also needs
-protocol evidence before it can be included.
+were left out of that review. The original Sony INZONE H9 is covered by the
+separate USB serial implementation listed above.
 
 After a slow Windows boot, an empty inventory is retried every ten seconds for
 up to ninety seconds. Sleeping Pulsar-family mice use Windows' last-input timestamp
@@ -641,11 +658,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 .\tools\build-rust.ps1
-.\tools\package-rust.ps1 -Version 1.1.5
+.\tools\package-rust.ps1 -Version 1.1.6
 ```
 
 The executable is `target/x86_64-pc-windows-msvc/release/HaloContinued.exe`.
-The portable ZIP is `dist/HaloContinued-1.1.5-windows-x64.zip`. Release builds use
+The portable ZIP is `dist/HaloContinued-1.1.6-windows-x64.zip`. Release builds use
 size optimisation, link-time optimisation, static runtime linking and stripped
 symbols; local compiler paths are removed. Packages include dependency notices
 and licences. Optional API/import validation uses `tools/validate-configuration.ps1`
@@ -655,27 +672,27 @@ To also build the unsigned installer, install [Inno Setup](https://jrsoftware.or
 6.3 or newer, then run:
 
 ```powershell
-.\tools\package-installer.ps1 -Version 1.1.5
+.\tools\package-installer.ps1 -Version 1.1.6
 # For a portable compiler installation, add -Iscc 'path\to\ISCC.exe'.
 ```
 
-This produces the portable ZIP, `dist/HaloContinued-1.1.5-windows-x64-setup.exe`,
-the standalone `dist/HaloContinued-1.1.5-windows-x64.exe` and
-`dist/HaloContinued-1.1.5-SHA256SUMS.txt`. The installer uses the same app and
+This produces the portable ZIP, `dist/HaloContinued-1.1.6-windows-x64-setup.exe`,
+the standalone `dist/HaloContinued-1.1.6-windows-x64.exe` and
+`dist/HaloContinued-1.1.6-SHA256SUMS.txt`. The installer uses the same app and
 dependency notices as the ZIP; it adds no service, updater or background process.
 Exit Halo Continued from its tray menu before installing or uninstalling.
 Installer regression checks can be run with
 `.\tools\test-installer.ps1 -Iscc 'path\to\ISCC.exe'`. They use isolated test
 identities, leave the running app alone and never launch the packaged app.
-Add `-PreviousPackageZip 'dist/HaloContinued-1.1.4-windows-x64.zip'` to test an
+Add `-PreviousPackageZip 'dist/HaloContinued-1.1.5-windows-x64.zip'` to test an
 upgrade from that version, including executable replacement, the Installed apps
 version and preservation of settings and history.
 
 The five workspace crates separate device models, protocols, Windows integration,
-storage and the application. Release validation covers **1,047 passing tests**,
-including headless application checks and 40 native dashboard reopen cycles,
-plus formatting, strict Clippy and isolated installer upgrade checks. Performance
-fixtures are run separately from the ordinary test suite. Hardware
+storage and the application. Version 1.1.6 validation covers **1,054 passing
+tests**, including headless application and simulated device checks, plus
+formatting, strict Clippy and an isolated installer upgrade from 1.1.5.
+Performance fixtures run separately from the ordinary test suite. Hardware
 changes need a reviewed implementation and tests; recompiling alone does not add
 support. No GitHub Actions workflows are included.
 

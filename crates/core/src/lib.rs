@@ -125,6 +125,7 @@ pub struct HidInfo {
     pub product: String,
     pub serial: String,
     pub container: Option<String>,
+    pub input_length: Option<usize>,
     pub output_length: Option<usize>,
     pub feature_length: Option<usize>,
 }

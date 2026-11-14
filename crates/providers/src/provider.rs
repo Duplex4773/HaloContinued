@@ -1310,15 +1310,37 @@ impl HidProvider {
                     }
                 }),
             "exchange_pro_wireless" => {
-                let state = self.query(s, c, &p::padded(&[0x41, 0xaa], 31), 10, 100, |r| {
-                    !r.is_empty() && [2, 4].contains(&r[0])
-                })?;
+                // #389: some bases require HIDAPI's unnumbered report ID.
+                let ask_state = |provider: &mut Self, s: &mut dyn HidSession, packet: &[u8]| {
+                    provider.query(s, c, packet, 10, 100, |r| matches!(r.first(), Some(2 | 4)))
+                };
+                let (state, numbered) = match ask_state(self, s, &p::padded(&[0x41, 0xaa], 31)) {
+                    Ok(Some(state)) => (Some(state), false),
+                    first if c.active() => {
+                        let fallback = ask_state(self, s, &p::padded(&[0, 0x41, 0xaa], 32));
+                        match (first, fallback) {
+                            (Err(error), Ok(None)) => return Err(error),
+                            (_, result) => (result?, true),
+                        }
+                    }
+                    first => (first?, false),
+                };
                 if state.is_none_or(|r| r[0] == 2) {
                     return Ok(None);
                 }
-                self.query(s, c, &p::padded(&[0x40, 0xaa], 31), 10, 100, |r| {
-                    !r.is_empty() && r[0] <= 4
-                })?
+                let head: &[u8] = if numbered {
+                    &[0, 0x40, 0xaa]
+                } else {
+                    &[0x40, 0xaa]
+                };
+                self.query(
+                    s,
+                    c,
+                    &p::padded(head, if numbered { 32 } else { 31 }),
+                    10,
+                    100,
+                    |r| !r.is_empty() && r[0] <= 4,
+                )?
                 .and_then(|r| {
                     let mut b = p::battery(r[0] * 25, None)?;
                     b.coarse = true;

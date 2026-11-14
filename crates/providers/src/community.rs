@@ -78,8 +78,9 @@ fn kind(d: &Device) -> &'static str {
             }
         }
         "flow" | "atk-keyboard" | "aula-keyboard" | "k87" | "monsgeek" | "alienware" | "urx"
-        | "f87-pro" => "keyboard",
-        "jabra" | "hs80" | "blackshark-v3" | "bt600" | "barracuda-x" | "inzone-h9" => "headset",
+        | "f87-pro" | "f108-pro" | "ajazz-ak820" => "keyboard",
+        "jabra" | "hs80" | "blackshark-v3" | "bt600" | "barracuda-x" | "inzone-h9"
+        | "void-elite" => "headset",
         "rapoo" if [0x1924, 0x4824].contains(&d.pid) => "keyboard",
         "shield" => "gamepad",
         _ => "mouse",
@@ -88,6 +89,7 @@ fn kind(d: &Device) -> &'static str {
 fn family(d: &Device) -> u16 {
     match protocol(d) {
         "nearlink" => 0x108c,
+        "atk-keyboard" => 0x5088,
         "hs80" => 0x0a6b,
         "ajazz" => 0x5c2f,
         "aula-mouse" => 0x22a0,
@@ -99,20 +101,21 @@ fn family(d: &Device) -> u16 {
                 0x1924
             }
         }
-        "turtle" => {
-            if [0x229b, 0x229e].contains(&d.pid) {
-                0x229b
-            } else {
-                0x2251
-            }
-        }
+        "turtle" => match d.pid {
+            0x229b | 0x229e => 0x229b,
+            0x2251 | 0x2253 => 0x2251,
+            _ => d.pid,
+        },
         _ => d.pid,
     }
 }
 fn endpoint_identity(d: &Device, i: &HidInfo) -> String {
+    if protocol(d) == "atk-keyboard" && vgn_keyboard(i) {
+        return format!("vgn:{}", trusted_identity(i));
+    }
     if matches!(
         protocol(d),
-        "endgame-we" | "irocks" | "glorious" | "vaxee" | "f87-pro"
+        "endgame-we" | "irocks" | "glorious" | "vaxee" | "f87-pro" | "eweadn-ydx"
     ) {
         crate::provider::receiver_key(i)
     } else {
@@ -127,11 +130,22 @@ fn key(d: &Device, i: &HidInfo) -> String {
         endpoint_identity(d, i)
     )
 }
+fn vgn_keyboard(i: &HidInfo) -> bool {
+    i.product_id == 0x5088
+        && i.product
+            .trim()
+            .eq_ignore_ascii_case("VGN N75 PRO 2.4G Dongle")
+}
 fn candidate(d: &Device, i: &HidInfo) -> bool {
     let usage = (i.usage_page, i.usage);
     let out = |length| i.output_length.is_none_or(|n| n == length);
     match protocol(d) {
-        "flow" | "compx" => usage == (0xff02, 2) && out(17),
+        "flow" => {
+            usage == (0xff02, 2)
+                && out(17)
+                && !i.product.trim().eq_ignore_ascii_case("F108Pro Dongle")
+        }
+        "compx" => usage == (0xff02, 2) && out(17),
         "bitmouse" => usage == (0xff05, 1) && out(64),
         "eweadn" => usage == (0xff01, 0x10) && i.output_length == Some(33),
         "k87" => i.usage_page == 0xff02 && i.output_length == Some(20),
@@ -145,11 +159,50 @@ fn candidate(d: &Device, i: &HidInfo) -> bool {
         "nearlink" => usage == (if d.pid == 0x108c { 0xffb3 } else { 0xffb2 }, 1) && out(64),
         "atk-keyboard" => {
             usage == (0xff1c, 0x92)
-                && i.product == "ATK V75X 2.4G Dongle"
+                && match d.pid {
+                    0x5055 => i.product.trim().eq_ignore_ascii_case("ATK V75X"),
+                    _ => {
+                        vgn_keyboard(i)
+                            || i.product
+                                .trim()
+                                .eq_ignore_ascii_case("ATK V75X 2.4G Dongle")
+                    }
+                }
                 && i.output_length.is_none_or(|n| n >= 32)
         }
+        "f108-pro" => {
+            usage == (0xff60, 0x61)
+                && i.interface == 3
+                && out(33)
+                && i.product.trim().eq_ignore_ascii_case("F108Pro Dongle")
+        }
+        "ajazz-ak820" => {
+            matches!((i.interface, usage), (3, (0xff70, 0x71)) | (2, (0xff80, 1)))
+                && i.output_length == Some(65)
+                && i.product.trim().eq_ignore_ascii_case("AJAZZ AK820MAX")
+        }
+        "mchose-device-info" => usage == (0xff01, 1) && out(64),
+        "eweadn-ydx" => {
+            usage == (0x000a, 0)
+                && i.interface == 1
+                && i.input_length == Some(32)
+                && i.feature_length == Some(0)
+        }
+        "harpe-ii" => {
+            i.interface == 2
+                && usage.0 == 0xff01
+                && out(64)
+                && i.path.to_ascii_lowercase().contains("&mi_02&col03#")
+        }
+        "void-elite" => {
+            usage == (0xffc5, 1) && i.interface == 3 && i.output_length.is_none_or(|n| n >= 2)
+        }
         "aula-mouse" => usage == (0xff1c, 0x92) && i.output_length.is_none_or(|n| n >= 32),
-        "aula-keyboard" => usage == (0xff80, 1) && i.output_length.is_none_or(|n| n >= 33),
+        "aula-keyboard" => {
+            usage == (0xff80, 1)
+                && i.output_length.is_none_or(|n| n >= 33)
+                && !i.product.trim().eq_ignore_ascii_case("AJAZZ AK820MAX")
+        }
         "sonix" => i.interface == 3 && i.usage_page >= 0xff00 && i.feature_length == Some(65),
         "inphic" => usage == (0x000a, 0) || usage == (0xff00, 1),
         "rapoo" => i.usage_page >= 0xff00,
@@ -186,7 +239,7 @@ fn keep_sleeping(d: &Device) -> bool {
             | "kingston"
             | "aula-keyboard"
             | "f87-pro"
-            | "atk-keyboard"
+            | "eweadn-ydx"
             | "skullcandy"
             | "flow"
             | "strix"
@@ -295,10 +348,11 @@ impl Community {
                 break;
             }
             let k = key(&d, mine[0]);
-            if protocol(&d) == "hs80"
+            if matches!(protocol(&d), "hs80" | "atk-keyboard")
+                && (protocol(&d) != "atk-keyboard" || d.pid == 0x5088)
                 && result
                     .iter()
-                    .any(|r| r.key == k && r.level.is_some() && r.via == "usb")
+                    .any(|r| r.key == k && r.online() && r.level.is_some() && r.via == "usb")
             {
                 continue;
             }
@@ -308,6 +362,29 @@ impl Community {
                 self.hints.insert(endpoint.clone(), Hint::default());
             }
             let hint = self.hints.get_mut(&endpoint).unwrap();
+            if protocol(&d) == "atk-keyboard" && d.pid == 0x5088 {
+                if let Some(path) = hint.path.as_ref()
+                    && mine.iter().any(|i| &i.path == path)
+                    && let Some((last, at)) = self.last.get(&k)
+                    && last.via == "wireless"
+                    && now.saturating_sub(*at) < Duration::from_secs(300)
+                {
+                    let _ = merge(&mut result, last.clone());
+                    continue;
+                }
+                if hint
+                    .swept
+                    .is_some_and(|at| now.saturating_sub(at) < Duration::from_secs(30))
+                {
+                    if let Some((last, at)) = self.last.get(&k)
+                        && let Some(r) = cached_reading(&d, last, *at, now)
+                    {
+                        let _ = merge(&mut result, r);
+                    }
+                    continue;
+                }
+                hint.swept = Some(now);
+            }
             let known = hint
                 .path
                 .as_ref()
@@ -332,6 +409,7 @@ impl Community {
                     } else {
                         1
                     },
+                    protocol(&d) == "ajazz-ak820" && i.interface != 3,
                     i.interface,
                     i.path.as_str(),
                 )
@@ -339,14 +417,17 @@ impl Community {
             if passive && resweep && sweep_due {
                 hint.swept = Some(now);
             }
-            let attempts =
-                if protocol(&d) == "blackshark-v3" || known && !(passive && resweep && sweep_due) {
-                    1
-                } else if passive && !sweep_due {
-                    0
-                } else {
-                    4
-                };
+            let attempts = if matches!(protocol(&d), "blackshark-v3" | "eweadn-ydx")
+                || known && !(passive && resweep && sweep_due)
+            {
+                1
+            } else if passive && !sweep_due {
+                0
+            } else if protocol(&d) == "ajazz" {
+                8
+            } else {
+                4
+            };
             let mut found = None;
             for (index, i) in mine.iter().take(attempts).enumerate() {
                 if !c.active() {
@@ -471,6 +552,7 @@ impl Community {
             "endgame-we" | "irocks" => {
                 return fork_devices::split_mouse(d, i, infos, hid, c);
             }
+            "eweadn-ydx" => return ydx(d, i, infos, hid, c),
             _ => {}
         }
         let mut s = hid.open(i)?;
@@ -479,6 +561,65 @@ impl Community {
         }
         let s = &mut *s;
         let b = match protocol(d) {
+            "f108-pro" => {
+                let mut request = [0; 33];
+                request[1..3].copy_from_slice(&[0x20, 1]);
+                request[32] = 0x21;
+                s.write(&request)?;
+                receive(s, c, 4, 150, 33, f108_reply)?
+            }
+            "ajazz-ak820" => {
+                if !drain(s, c, 65, 4)? {
+                    return Ok(None);
+                }
+                s.write(&p::padded(&[0, 0xaa, 0x10], 65))?;
+                receive(s, c, 6, 250, 65, |r| {
+                    let r = r.strip_prefix(&[0]).unwrap_or(r);
+                    if r.len() < 27 || !r.starts_with(&[0x55, 0x10]) || r[25] == 0 {
+                        return None;
+                    }
+                    p::battery(r[25], charge(r[26], &[0], &[1]))
+                })?
+            }
+            "mchose-device-info" => {
+                let mut answer = None;
+                let request = p::padded(&[0x4d, 1, 1, 0, 0, 9, 0, 0, 8], 64);
+                for _ in 0..3 {
+                    if !c.active() {
+                        break;
+                    }
+                    s.write(&request)?;
+                    answer = receive(s, c, 5, 200, 64, mchose_device_info)?;
+                    if answer.is_some() {
+                        break;
+                    }
+                }
+                answer
+            }
+            "harpe-ii" => {
+                if !drain(s, c, 64, 16)? {
+                    return Ok(None);
+                }
+                s.write(&p::padded(&[3, 0x12, 7], 64))?;
+                receive(s, c, 8, 300, 64, |r| {
+                    let [3, 0x12, 7, _, _, level, _, _, _, _, state, ..] = *r else {
+                        return None;
+                    };
+                    if level == 0 && state == 0 {
+                        return None;
+                    }
+                    p::battery(level, Some(state != 0))
+                })?
+            }
+            "void-elite" => {
+                s.write(&[0xc9, 0x64])?;
+                receive(s, c, 10, 100, 64, |r| match *r {
+                    [0x64, 0, level, 0xb1, state @ (1 | 2 | 4 | 5), ..] => {
+                        p::battery(level & 0x7f, Some(matches!(state, 4 | 5)))
+                    }
+                    _ => None,
+                })?
+            }
             "eweadn" | "k87" => reviewed_wireless::receiver_battery(protocol(d), s, c)?,
             "monsgeek" => reviewed_wireless::monsgeek(s, c)?,
             "jabra" => return self.jabra(d, i, s, c),
@@ -694,12 +835,25 @@ impl Community {
             "inphic" => {
                 let mut pending = false;
                 let mut answer = None;
-                for _ in 0..if first { 5 } else { 2 } {
+                let mut delux = false;
+                let last_name = self
+                    .last
+                    .get(&key(d, i))
+                    .map(|(last, _)| last.name.as_str());
+                let attempts = if !first {
+                    2
+                } else if d.pid == 0xfa65 && last_name.is_none_or(|name| name == "Delux M900 Pro") {
+                    12
+                } else {
+                    5
+                };
+                for _ in 0..attempts {
                     if !c.active() {
                         break;
                     }
                     let r = read(s, c, 100, 250)?;
                     if let Some((level, charging, coarse)) = inphic(&r, d.pid) {
+                        delux |= r.strip_prefix(&[3]).unwrap_or(&r).first() == Some(&0x3f);
                         pending |= charging == Some(true);
                         if let Some(level) = level {
                             let mut b =
@@ -716,6 +870,13 @@ impl Community {
                     && let Some((last, _)) = self.last.get(&key(d, i))
                 {
                     answer = last.level.and_then(|level| p::battery(level, Some(true)));
+                }
+                if delux {
+                    return Ok(answer.map(|b| {
+                        let mut r = reading(d, i, b, c);
+                        r.name = "Delux M900 Pro".into();
+                        r
+                    }));
                 }
                 answer
             }
@@ -938,7 +1099,22 @@ impl Community {
         s: &mut dyn HidSession,
         c: &PollContext<'_>,
     ) -> Result<Option<Battery>, ProviderError> {
-        let coap = [0x2251, 0x2253].contains(&d.pid);
+        if matches!(d.pid, 0x2251 | 0x2253) {
+            return self.turtle_exchange(s, c, true);
+        }
+        let result = self.turtle_exchange(s, c, false)?;
+        if result.is_none() && d.pid == 0x225e && c.active() {
+            self.turtle_exchange(s, c, true)
+        } else {
+            Ok(result)
+        }
+    }
+    fn turtle_exchange(
+        &mut self,
+        s: &mut dyn HidSession,
+        c: &PollContext<'_>,
+        coap: bool,
+    ) -> Result<Option<Battery>, ProviderError> {
         let mut blob = Vec::new();
         if coap {
             for _ in 0..5 {
@@ -1038,22 +1214,28 @@ impl Community {
             };
             let ask = |i: &HidInfo,
                        head: &[u8],
-                       accept: fn(&[u8]) -> bool|
+                       minimum_length: usize|
              -> Result<Option<Vec<u8>>, ProviderError> {
                 let mut s = hid.open(i)?;
                 if !drain(&mut *s, c, 64, 16)? {
                     return Ok(None);
                 }
                 s.write(&p::padded(head, 64))?;
-                receive(&mut *s, c, 8, 300, 64, |r| accept(r).then(|| r.to_vec()))
+                receive(&mut *s, c, 8, 300, 64, |r| {
+                    let echo = if head == [1, 0xa0, 0, 0] {
+                        &head[..2]
+                    } else {
+                        head
+                    };
+                    (r.len() >= minimum_length && r.starts_with(echo)).then(|| r.to_vec())
+                })
             };
-            let Some(pairs) = ask(control, &[1, 0xa0, 0, 0], |r| {
-                r.len() >= 7 && r[..2] == [1, 0xa0]
-            })?
-            else {
+            let Some(pairs) = ask(control, &[1, 0xa0, 0, 0], 7)? else {
                 continue;
             };
-            // Only the two models with successful owner tests in parent #185.
+            // Only models with successful upstream owner tests. Pair-list
+            // battery fields are shared by each peripheral class.
+            let mut queried = [false; 2];
             for (model, page, head, name, device_kind, at) in [
                 (
                     0x1b65,
@@ -1071,6 +1253,46 @@ impl Community {
                     "keyboard",
                     11,
                 ),
+                (
+                    0x1b1a,
+                    0xff01,
+                    &[3, 0x12, 7][..],
+                    "ROG Keris II Ace",
+                    "mouse",
+                    5,
+                ),
+                (
+                    0x1b18,
+                    0xff01,
+                    &[3, 0x12, 7][..],
+                    "ROG Keris II Ace",
+                    "mouse",
+                    5,
+                ),
+                (
+                    0x1a85,
+                    0xff00,
+                    &[2, 0x12, 1][..],
+                    "ROG Azoth",
+                    "keyboard",
+                    6,
+                ),
+                (
+                    0x1ab0,
+                    0xff00,
+                    &[2, 0x12, 1][..],
+                    "ROG Strix Scope II 96 Wireless",
+                    "keyboard",
+                    6,
+                ),
+                (
+                    0x1cea,
+                    0xff00,
+                    &[2, 0x12, 1][..],
+                    "ROG Strix Morph 96 Wireless",
+                    "keyboard",
+                    6,
+                ),
             ] {
                 if !pairs
                     .get(5..)
@@ -1084,13 +1306,17 @@ impl Community {
                 let Some(i) = mine.iter().find(|i| i.usage_page == page) else {
                     continue;
                 };
-                let r = ask(i, head, |r| {
-                    r.len() > 11 && matches!(r.get(..3), Some([3, 0x12, 7] | [2, 0x12, 1]))
-                })?;
+                let mouse = device_kind == "mouse";
+                let channel = usize::from(mouse);
+                if queried[channel] {
+                    continue;
+                }
+                queried[channel] = true;
+                let charge_at = if mouse { 10 } else { 9 };
+                let r = ask(i, head, at.max(charge_at) + 1)?;
                 if let Some(r) = r
-                    && r.starts_with(head)
                     && r[at] <= 100
-                    && (r[at] > 0 || r[9] != 0)
+                    && (r[at] > 0 || r[charge_at] != 0)
                 {
                     let mut reading = Reading::new(
                         format!("asus:omni:{id}:{model:04x}"),
@@ -1099,9 +1325,9 @@ impl Community {
                         c.clock.unix(),
                     );
                     reading.level = Some(r[at]);
-                    reading.charging = Some(r[9] != 0);
+                    reading.charging = Some(r[charge_at] != 0);
                     reading.kind = device_kind.into();
-                    reading.via = "usb".into();
+                    reading.via = "wireless".into();
                     // A receiver container identifies the receiver, not its two children.
                     out.push(reading);
                 }
@@ -1117,6 +1343,10 @@ fn cached_reading(d: &Device, last: &Reading, at: Duration, now: Duration) -> Op
         return None;
     }
     let mut r = last.clone();
+    if protocol(d) == "atk-keyboard" {
+        r.charging = None;
+        r.via = if d.pid == 0x5055 { "usb" } else { "wireless" }.into();
+    }
     r.connection = if protocol(d) == "inphic" && age < Duration::from_secs(90) {
         Connection::Online
     } else {
@@ -1148,10 +1378,19 @@ fn merge(out: &mut Vec<Reading>, r: Reading) -> Option<&Reading> {
     Some(&out[index])
 }
 fn reading(d: &Device, i: &HidInfo, b: Battery, c: &PollContext<'_>) -> Reading {
-    let mut r = Reading::new(key(d, i), d.name, d.provider, c.clock.unix());
+    let name = if protocol(d) == "atk-keyboard" && vgn_keyboard(i) {
+        "VGN N75 PRO"
+    } else {
+        d.name
+    };
+    let mut r = Reading::new(key(d, i), name, d.provider, c.clock.unix());
     r.kind = kind(d).into();
     r.level = Some(b.level);
-    r.charging = b.charging;
+    r.charging = if protocol(d) == "atk-keyboard" && vgn_keyboard(i) {
+        None
+    } else {
+        b.charging
+    };
     r.serial = (!i.serial.is_empty()).then(|| i.serial.clone());
     r.container = i.container.clone();
     r.via = if is_bluetooth(&i.path) {
@@ -1176,8 +1415,16 @@ fn reading(d: &Device, i: &HidInfo, b: Battery, c: &PollContext<'_>) -> Reading 
             | "barracuda-x"
             | "inzone-h9"
             | "endgame-we"
+            | "f108-pro"
+            | "ajazz-ak820"
+            | "eweadn-ydx"
+            | "harpe-ii"
+            | "mchose-device-info"
+            | "void-elite"
     ) || d.provider == "pulsar" && matches!(d.pid, 0xf505 | 0xf5dc | 0xf5df | 0x101a)
         || d.provider == "irocks" && d.pid == 0xc009
+        || protocol(d) == "atk-keyboard" && d.pid == 0x5088
+        || protocol(d) == "turtle" && d.pid == 0x225e
     {
         r.via = "wireless".into();
     }
@@ -1263,6 +1510,97 @@ fn compx(r: &[u8], header: u8, cmd: u8) -> Option<Battery> {
     }
     p::battery(r[6], charge(r[7], &[0], &[1]))
 }
+// AULA F108 Pro, HaloBattery #402. Windows HID may strip report ID zero.
+fn f108_reply(report: &[u8]) -> Option<Battery> {
+    let report = report.strip_prefix(&[0]).unwrap_or(report);
+    if report.len() != 32 || !report.starts_with(&[0x20, 1, 0]) {
+        return None;
+    }
+    let sum = report[..31]
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    (sum == report[31]).then_some(())?;
+    p::battery(report[3], None)
+}
+
+// MCHOSE M HUB device-info reply, HaloBattery #403.
+fn mchose_device_info(report: &[u8]) -> Option<Battery> {
+    let [0x4d, 1, 1, length, 0, 9, _, _, ..] = *report else {
+        return None;
+    };
+    let end = 8 + usize::from(length);
+    let data = report.get(8..end)?;
+    if data.len() < 13
+        || !data.starts_with(&[0x37, 0x38])
+        || *report.get(end)? != report[2..end].iter().fold(0u8, |xor, byte| xor ^ byte)
+        || data[12] == 0
+    {
+        return None;
+    }
+    p::battery(data[12], charge(data[11], &[0], &[1]))
+}
+
+// EWEADN X23 Pro, HaloBattery #406. GET_FEATURE on one collection triggers
+// an input report on the other. Match the physical receiver before opening either.
+fn ydx(
+    d: &Device,
+    i: &HidInfo,
+    infos: &[&HidInfo],
+    hid: &dyn HidTransport,
+    c: &PollContext<'_>,
+) -> Result<Option<Reading>, ProviderError> {
+    let id = crate::provider::receiver_key(i);
+    let mut feature = None;
+    for sibling in infos.iter().copied().filter(|other| {
+        other.vendor_id == i.vendor_id
+            && other.product_id == i.product_id
+            && other.interface == 1
+            && (other.usage_page, other.usage) == (0x000a, 0)
+            && crate::provider::receiver_key(other) == id
+    }) {
+        if candidate(d, sibling) && sibling.path != i.path {
+            return Ok(None);
+        }
+        if sibling.feature_length == Some(32)
+            && sibling.input_length == Some(0)
+            && feature.replace(sibling).is_some()
+        {
+            return Ok(None);
+        }
+    }
+    let Some(feature) = feature else {
+        return Ok(None);
+    };
+    let generation = hid.generation();
+    let mut input = hid.open(i)?;
+    let mut request = hid.open(feature)?;
+    for _ in 0..32 {
+        if !c.active() || hid.generation() != generation {
+            break;
+        }
+        if !input.read(32, Duration::ZERO)?.is_empty() {
+            continue;
+        }
+        request.feature(5, 32)?;
+        return receive(&mut *input, c, 15, 100, 32, |r| {
+            if hid.generation() != generation || r.len() != 32 || r[0] != 4 {
+                return None;
+            }
+            if r[1] == 0 {
+                let mut offline = reading(d, i, p::battery(0, None).unwrap(), c);
+                offline.connection = Connection::Sleeping;
+                offline.level = None;
+                return Some(offline);
+            }
+            if r[1] != 1 || r[4] > 100 {
+                return None;
+            }
+            let level = if r[5] == 2 { 100 } else { r[4] };
+            p::battery(level, charge(r[5], &[0, 2], &[1])).map(|b| reading(d, i, b, c))
+        });
+    }
+    Ok(None)
+}
 fn sequence_battery(r: &[u8], report: u8, seq: u16, nearlink: bool) -> Option<Battery> {
     if r.len() < if nearlink { 64 } else { 10 }
         || r[..4] != [report, seq as u8, (seq >> 8) as u8, 0x1a]
@@ -1318,7 +1656,7 @@ fn inphic(r: &[u8], pid: u16) -> Option<PassiveBattery> {
     if r.len() < 4
         || r[1] != 0x40
         || !(if pid == 0xfa65 {
-            &[0x95, 0x90, 0x93, 0x99][..]
+            &[0x95, 0x90, 0x93, 0x99, 0x3f][..]
         } else {
             &[0x55, 0x10, 0x4e][..]
         })
@@ -1551,6 +1889,78 @@ fn shield_serial(r: &[u8]) -> Option<String> {
 
 /// The WGI owner calls this only for a proven FlyDigi WGI device. No XInput
 /// slot is renamed or given another controller's battery. Ambiguity does no I/O.
+pub fn vendor_controller_name(vid: u16, pid: u16) -> Option<&'static str> {
+    match (vid, pid) {
+        (0x20bc, 0x515c) => Some("BEITONG KP40D"),
+        (0x3537, 0x10c5 | 0x10c6) => Some("GameSir G7 Pro 8K Aimlabs"),
+        _ => None,
+    }
+}
+
+/// The Windows caller proves there is exactly one matching gamepad and one
+/// XInput slot. Here we require one compatible HID collection for that model.
+pub fn vendor_controller_battery(
+    vid: u16,
+    pid: u16,
+    hid: &dyn HidTransport,
+    c: &PollContext<'_>,
+) -> Result<Option<Battery>, ProviderError> {
+    if vendor_controller_name(vid, pid).is_none() || !c.active() {
+        return Ok(None);
+    }
+    let generation = hid.generation();
+    let infos = hid.enumerate_shared(vid)?;
+    let beitong = vid == 0x20bc;
+    let mut matches = infos.iter().filter(|i| {
+        i.vendor_id == vid
+            && vendor_controller_name(vid, i.product_id).is_some()
+            && if beitong {
+                i.interface == 1 && (i.usage_page, i.usage) == (0x00ff, 3)
+            } else {
+                (i.usage_page, i.usage) == (0xfff0, 0x40)
+            }
+    });
+    let Some(info) = matches.next() else {
+        return Ok(None);
+    };
+    if info.product_id != pid || matches.next().is_some() || !c.active() {
+        return Ok(None);
+    }
+    let mut session = hid.open(info)?;
+    for _ in 0..10 {
+        if !c.active() || hid.generation() != generation {
+            return Ok(None);
+        }
+        if !session.read(64, Duration::ZERO)?.is_empty() {
+            continue;
+        }
+        // HaloBattery #376 / #390: status read / read current profile only.
+        let mut request = [0; 64];
+        request[..2].copy_from_slice(if beitong { &[2, 0x15] } else { &[0x0f, 0x0b] });
+        session.write(&request[..if beitong { 64 } else { 2 }])?;
+        return receive(
+            &mut *session,
+            c,
+            if beitong { 20 } else { 40 },
+            25,
+            64,
+            |r| {
+                if hid.generation() != generation {
+                    return None;
+                }
+                if beitong && r.len() == 64 && r.starts_with(&[2, 0x15]) {
+                    p::battery(r[2], Some(charge(r[4], &[0x50], &[0x51])?))
+                } else if !beitong && r.len() >= 37 && r[0] == 0x12 {
+                    p::battery(r[36], charge(r[35], &[0], &[1]))
+                } else {
+                    None
+                }
+            },
+        );
+    }
+    Ok(None)
+}
+
 pub fn flydigi_battery(
     hid: &dyn HidTransport,
     c: &PollContext<'_>,

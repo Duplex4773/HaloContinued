@@ -1,6 +1,14 @@
 [
   [
     "ajazz",
+    3141,
+    65276,
+    "AJAZZ AK820 Max Ultra",
+    "pr:ajazz-ak820",
+    0
+  ],
+  [
+    "ajazz",
     9354,
     23854,
     "AJAZZ AJ179 V2 MAX",
@@ -250,6 +258,14 @@
   [
     "asus",
     2821,
+    6864,
+    "ROG Harpe II Ace",
+    "pr:harpe-ii",
+    0
+  ],
+  [
+    "asus",
+    2821,
     6899,
     "TX Gaming Mouse Mini",
     "",
@@ -302,6 +318,14 @@
     "TX Gaming Mouse Mini Miku",
     "",
     1
+  ],
+  [
+    "atk_keyboard",
+    12815,
+    20565,
+    "ATK V75X",
+    "pr:atk-keyboard",
+    0
   ],
   [
     "atk_keyboard",
@@ -377,6 +401,14 @@
   ],
   [
     "aula",
+    1452,
+    591,
+    "AULA F108 Pro",
+    "pr:f108-pro",
+    0
+  ],
+  [
+    "aula",
     3141,
     65276,
     "AULA F87 Pro V2C",
@@ -437,6 +469,14 @@
     2624,
     "Corsair Virtuoso RGB Wireless SE",
     "bragi",
+    0
+  ],
+  [
+    "corsair",
+    6940,
+    2645,
+    "Corsair Void Elite Wireless",
+    "pr:void-elite",
     0
   ],
   [
@@ -597,6 +637,14 @@
     6497,
     "Endgame Gear XM2we",
     "pr:endgame-we",
+    0
+  ],
+  [
+    "eweadn",
+    1267,
+    623,
+    "EWEADN X23 Pro",
+    "pr:eweadn-ydx",
     0
   ],
   [
@@ -1650,6 +1698,14 @@
   [
     "mchose",
     14391,
+    4120,
+    "MCHOSE K7 V2 Ultra+",
+    "pr:mchose-device-info",
+    0
+  ],
+  [
+    "mchose",
+    14391,
     24584,
     "MCHOSE V9 Turbo+",
     "pr:turbo",
@@ -1733,6 +1789,14 @@
     8489,
     "NZXT Lift Elite Wireless",
     "",
+    0
+  ],
+  [
+    "plantronics",
+    1151,
+    750,
+    "Poly Voyager 8200 UC",
+    "pr:bt600",
     0
   ],
   [
@@ -3132,6 +3196,14 @@
     4341,
     8787,
     "Turtle Beach Stealth 700 Gen 3 headset",
+    "pr:turtle",
+    0
+  ],
+  [
+    "turtlebeach",
+    4341,
+    8798,
+    "Turtle Beach Atlas Air",
     "pr:turtle",
     0
   ],

@@ -121,6 +121,26 @@ fn steel_pro_wireless_31byte_state_and_level_requests() {
     }
 }
 #[test]
+fn steel_pro_wireless_retries_with_report_id_zero_and_respects_off_state() {
+    for state in [2, 4] {
+        let mut steps = vec![
+            Step::WriteError(padded(&[0x41, 0xaa], 31), "unnumbered report required"),
+            Step::Write(padded(&[0, 0x41, 0xaa], 32)),
+            rd(&[state, 2]),
+        ];
+        if state == 4 {
+            steps.extend([Step::Write(padded(&[0, 0x40, 0xaa], 32)), rd(&[3])]);
+        }
+        let h = FakeHid::new(vec![classic(0x1290)], steps);
+        let rows = poll("steelseries", &h);
+        assert_eq!(
+            rows.first().and_then(|r| r.level),
+            (state == 4).then_some(75)
+        );
+        h.done();
+    }
+}
+#[test]
 fn steel_classic_response_matching_and_cached_answering_collection() {
     let clock = FakeClock::default();
     let cancel = AtomicBool::new(false);

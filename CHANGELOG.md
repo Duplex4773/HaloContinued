@@ -1,3 +1,34 @@
+# Halo Continued 1.1.6
+
+Released 14 November 2026 for Windows 11 x64.
+
+## New battery support
+
+| Device | Connection | Hardware report |
+| --- | --- | --- |
+| ASUS ROG Harpe II Ace | SPEEDNOVA receiver `0B05:1AD0` | [#364](https://github.com/HeyOkay/HaloBattery/pull/364) |
+| ASUS ROG Keris II Ace, ROG Azoth, ROG Strix Scope II 96 Wireless and ROG Strix Morph 96 Wireless | ROG OMNI receiver `0B05:1ACE` | [#231](https://github.com/HeyOkay/HaloBattery/issues/231), [#364](https://github.com/HeyOkay/HaloBattery/pull/364), [#340](https://github.com/HeyOkay/HaloBattery/issues/340) |
+| Delux M900 Pro | Receiver `1D57:FA65`; identified by its passive battery report | [#407](https://github.com/HeyOkay/HaloBattery/pull/407) |
+| EWEADN X23 Pro | Receiver `04F3:026F`; uses a feature read and separate input collection | [#406](https://github.com/HeyOkay/HaloBattery/pull/406) |
+| MCHOSE K7 V2 Ultra+ | Receiver `3837:1018`, including the MagDock receiver | [#403](https://github.com/HeyOkay/HaloBattery/pull/403) |
+| AJAZZ AK820 Max Ultra | Receiver `0C45:FEFC` with the matching product name and HID collection | [#256](https://github.com/HeyOkay/HaloBattery/issues/256) |
+| AULA F108 Pro | Receiver `05AC:024F` with the matching product name and HID collection; battery level only | [#402](https://github.com/HeyOkay/HaloBattery/pull/402) |
+| VGN N75 PRO | Receiver `320F:5088` with the matching product name; battery level only | [#407](https://github.com/HeyOkay/HaloBattery/pull/407) |
+| Corsair Void Elite Wireless | Receiver `1B1C:0A55` | [#330](https://github.com/HeyOkay/HaloBattery/issues/330) |
+| Turtle Beach Atlas Air | Receiver `10F5:225E` | [#310](https://github.com/HeyOkay/HaloBattery/issues/310) |
+| BEITONG KP40D | Receiver `20BC:515C` | [#376](https://github.com/HeyOkay/HaloBattery/pull/376) |
+| GameSir G7 Pro 8K Aimlabs | USB cable `3537:10C5` and receiver `3537:10C6` | [#390](https://github.com/HeyOkay/HaloBattery/pull/390) |
+
+The BEITONG and GameSir readers require one Windows gamepad, one XInput slot and a unique matching HID collection to attribute the battery reading.
+
+## Connection and compatibility updates
+
+- **ATK V75X:** Add USB cable battery and charging monitoring on `320F:5055`. Prefer the cable when the cable and receiver share a trusted identity. On the receiver, reuse successful readings for five minutes and wait at least 30 seconds before retrying failures. [#368](https://github.com/HeyOkay/HaloBattery/pull/368)
+- **Poly Voyager 8200 UC:** Add BT600 adapter revision `047F:02EE`. [HaloBattery 1.17.0](https://github.com/HeyOkay/HaloBattery/releases/tag/v1.17.0)
+- **SteelSeries Arctis Pro Wireless:** Add an alternate HID report format for base stations on `1038:1290` that do not respond to the original format. [#389](https://github.com/HeyOkay/HaloBattery/pull/389)
+
+Hardware confirmation comes from the linked HaloBattery reports. Halo Continued tested the Rust readers with simulated transports. Thanks to HeyOkay, the HaloBattery contributors and the device owners who shared reports and captures.
+
 # Halo Continued 1.1.5
 
 Released 14 November 2026 for Windows 11 x64.

@@ -92,11 +92,11 @@ verified = {
 for entry in json.loads((ROOT / 'crates/providers/reviewed-devices.json').read_text(encoding='utf-8')):
     provider, _, pid, _, variant, _ = entry['device']
     protocol = variant.removeprefix('pr:')
-    family = {'nearlink':0x108c, 'ajazz':0x5c2f, 'aula-mouse':0x22a0, 'turbo':0x6008, 'hs80':0x0a6b}.get(protocol, pid)
+    family = {'nearlink':0x108c, 'ajazz':0x5c2f, 'aula-mouse':0x22a0, 'turbo':0x6008, 'hs80':0x0a6b, 'atk-keyboard':0x5088}.get(protocol, pid)
     if protocol == 'rapoo':
         family = 0x1413 if pid in (0x1413,0x4613) else 0x1924
     if protocol == 'turtle':
-        family = 0x229b if pid in (0x229b,0x229e) else 0x2251
+        family = {0x229e:0x229b, 0x2253:0x2251}.get(pid, pid)
     if provider not in ('shield','xinput'):
         verified.add(f'{provider}:{family:04x}:')
 metadata = ROOT / 'crates/providers/src/device_metadata.rs'
