@@ -21,9 +21,8 @@ use windows::{
 pub enum Command {
     ReleaseHistoryCache,
     Refresh,
-    DeviceChanged {
-        arrival_or_removal: bool,
-    },
+    TopologyChanged,
+    BluetoothPropertiesChanged,
     ConfigurationVisible(bool),
     ConfigurationRefresh,
     NotificationFailed(Notification),
@@ -432,22 +431,30 @@ fn provider_queue_wait<'a>(
     .min()
     .unwrap_or(Duration::from_secs(5))
 }
+fn schedule_bluetooth_property_refresh(
+    due: &mut BTreeMap<&str, Instant>,
+    last: &mut Option<Instant>,
+    now: Instant,
+) {
+    if last.is_some_and(|at| now.duration_since(at) < Duration::from_secs(10)) {
+        return;
+    }
+    *last = Some(now);
+    let next = now + Duration::from_secs(2);
+    due.entry("bluetooth")
+        .and_modify(|at| *at = (*at).min(next))
+        .or_insert(next);
+}
+
 fn schedule_connection_refresh<'a>(
     due: &mut BTreeMap<&'a str, Instant>,
     invalidated: &mut BTreeSet<&'a str>,
     ids: impl Iterator<Item = &'a str>,
     now: Instant,
-    settings: &Settings,
-    quiet: bool,
 ) {
-    let delay = if quiet {
-        effective_interval(settings.interval, true)
-    } else {
-        Duration::from_secs(2)
-    };
+    let next = now + Duration::from_secs(2);
     for id in ids {
         invalidated.insert(id);
-        let next = now + delay;
         due.entry(id)
             .and_modify(|at| *at = (*at).min(next))
             .or_insert(next);
@@ -1245,9 +1252,17 @@ impl Drop for Runtime {
         self.stop()
     }
 }
-fn relevant_device_event(id: &str) -> bool {
+fn device_event(id: &str, topology: impl FnOnce() -> bool) -> Option<Command> {
     let id = id.to_ascii_uppercase();
-    id.contains("BTH") || id.contains("HID#") || id.contains("BLUETOOTH")
+    let bluetooth = id.contains("BTH") || id.contains("BLUETOOTH");
+    if !bluetooth && !id.contains("HID#") {
+        return None;
+    }
+    if topology() {
+        Some(Command::TopologyChanged)
+    } else {
+        bluetooth.then_some(Command::BluetoothPropertiesChanged)
+    }
 }
 /// The watcher's initial listing is discovery, not a connection transition.
 /// Providers already perform startup discovery; forwarding that listing would
@@ -1257,9 +1272,11 @@ struct DeviceEventGate {
     enumeration_completed: AtomicBool,
 }
 impl DeviceEventGate {
-    fn forward(&self, commands: &Sender<Command>, id: &str, arrival_or_removal: bool) {
-        if self.enumeration_completed.load(Ordering::Acquire) && relevant_device_event(id) {
-            let _ = commands.try_send(Command::DeviceChanged { arrival_or_removal });
+    fn forward(&self, commands: &Sender<Command>, id: &str, topology: impl FnOnce() -> bool) {
+        if self.enumeration_completed.load(Ordering::Acquire)
+            && let Some(event) = device_event(id, topology)
+        {
+            let _ = commands.try_send(event);
         }
     }
 }
@@ -1291,7 +1308,7 @@ impl DeviceEvents {
             .Added(&TypedEventHandler::<_, DeviceInformation>::new(
                 move |_, args| {
                     if let Some(id) = args.as_ref().and_then(|a| a.Id().ok()) {
-                        added_gate.forward(&tx, &id.to_string(), true);
+                        added_gate.forward(&tx, &id.to_string(), || true);
                     }
                     Ok(())
                 },
@@ -1302,8 +1319,22 @@ impl DeviceEvents {
         let updated = watcher
             .Updated(&TypedEventHandler::<_, DeviceInformationUpdate>::new(
                 move |_, args| {
-                    if let Some(id) = args.as_ref().and_then(|a| a.Id().ok()) {
-                        updated_gate.forward(&tx, &id.to_string(), false);
+                    if let Some(update) = args.as_ref()
+                        && let Ok(id) = update.Id()
+                    {
+                        updated_gate.forward(&tx, &id.to_string(), || {
+                            // Changes to connection properties can be the first signal of a reconnect.
+                            update.Properties().map_or(true, |props| {
+                                [
+                                    windows::core::h!("System.Devices.Present"),
+                                    windows::core::h!("System.Devices.Connected"),
+                                    windows::core::h!("System.Devices.InterfaceEnabled"),
+                                    windows::core::h!("System.Devices.Aep.IsConnected"),
+                                ]
+                                .into_iter()
+                                .any(|key| props.HasKey(key).unwrap_or(true))
+                            })
+                        });
                     }
                     Ok(())
                 },
@@ -1314,7 +1345,7 @@ impl DeviceEvents {
             .Removed(&TypedEventHandler::<_, DeviceInformationUpdate>::new(
                 move |_, args| {
                     if let Some(id) = args.as_ref().and_then(|a| a.Id().ok()) {
-                        gate.forward(&tx, &id.to_string(), true);
+                        gate.forward(&tx, &id.to_string(), || true);
                     }
                     Ok(())
                 },
@@ -1857,9 +1888,7 @@ fn worker(
             let controller_token = if winrt {
                 let tx = commands.clone();
                 RawGameController::RawGameControllerAdded(&EventHandler::new(move |_, _| {
-                    let _ = tx.try_send(Command::DeviceChanged {
-                        arrival_or_removal: true,
-                    });
+                    let _ = tx.try_send(Command::TopologyChanged);
                     Ok(())
                 }))
                 .ok()
@@ -1868,9 +1897,7 @@ fn worker(
             };
             let removed_token = if winrt {
                 RawGameController::RawGameControllerRemoved(&EventHandler::new(move |_, _| {
-                    let _ = commands.try_send(Command::DeviceChanged {
-                        arrival_or_removal: true,
-                    });
+                    let _ = commands.try_send(Command::TopologyChanged);
                     Ok(())
                 }))
                 .ok()
@@ -3787,6 +3814,7 @@ fn run(
     let mut due: BTreeMap<&str, Instant> =
         providers.keys().map(|id| (*id, Instant::now())).collect();
     let mut invalidated = BTreeSet::new();
+    let mut last_bluetooth_refresh = None;
     let mut diagnostics = BTreeMap::new();
     let mut diagnostics_dirty = true;
     let mut snapshots = SnapshotPublisher::new(Instant::now());
@@ -4390,11 +4418,16 @@ fn run(
                     let _ = storage.send(Storage::Insights(key, until, request, cancelled));
                 }
             }
-            Work::Command(Ok(Command::DeviceChanged { arrival_or_removal })) => {
-                // Plug/unplug remains responsive while gaming. Routine property
-                // updates respect quiet cadence. Both paths coalesce event bursts
-                // through the existing due map instead of immediately polling.
-                let quiet_refresh = quiet && !arrival_or_removal;
+            Work::Command(Ok(Command::BluetoothPropertiesChanged)) => {
+                if !suspended && !quiet && engine.settings.enabled("bluetooth") {
+                    schedule_bluetooth_property_refresh(
+                        &mut due,
+                        &mut last_bluetooth_refresh,
+                        Instant::now(),
+                    );
+                }
+            }
+            Work::Command(Ok(Command::TopologyChanged)) => {
                 hid.invalidate();
                 usage_tracker.refresh(
                     hid.generation(),
@@ -4409,8 +4442,6 @@ fn run(
                         .map(|family| family.0)
                         .chain(["bluetooth", "xinput"]),
                     Instant::now(),
-                    &engine.settings,
-                    quiet_refresh,
                 );
             }
             Work::Completed(Ok(WorkerCompleted::Battery(mut r))) => {
@@ -7224,8 +7255,7 @@ mod tests {
         );
     }
     #[test]
-    fn native_connection_events_refresh_hid_providers_without_defeating_quiet_cadence() {
-        let settings = Settings::default();
+    fn topology_refreshes_all_providers_but_property_bursts_only_schedule_bluetooth() {
         let now = Instant::now();
         let mut due = BTreeMap::new();
         let mut invalidated = BTreeSet::new();
@@ -7234,25 +7264,23 @@ mod tests {
             &mut invalidated,
             ["razer", "logitech", "bluetooth", "xinput"].into_iter(),
             now,
-            &settings,
-            false,
         );
         for id in ["razer", "logitech", "bluetooth", "xinput"] {
             assert_eq!(due[id], now + Duration::from_secs(2));
             assert!(invalidated.contains(id));
         }
         due.clear();
-        due.insert("razer", now + Duration::from_secs(120));
-        schedule_connection_refresh(
-            &mut due,
-            &mut invalidated,
-            ["razer", "logitech"].into_iter(),
-            now,
-            &settings,
-            true,
+        let mut last = None;
+        schedule_bluetooth_property_refresh(&mut due, &mut last, now);
+        assert_eq!(
+            due,
+            BTreeMap::from([("bluetooth", now + Duration::from_secs(2))])
         );
-        assert_eq!(due["razer"], now + Duration::from_secs(120));
-        assert_eq!(due["logitech"], now + Duration::from_secs(300));
+        due.clear();
+        schedule_bluetooth_property_refresh(&mut due, &mut last, now + Duration::from_secs(9));
+        assert!(due.is_empty());
+        schedule_bluetooth_property_refresh(&mut due, &mut last, now + Duration::from_secs(10));
+        assert_eq!(due["bluetooth"], now + Duration::from_secs(12));
     }
     #[test]
     fn failed_collection_preserves_sibling_and_unrelated_provider_results_with_bounded_retry() {
@@ -8461,10 +8489,10 @@ mod tests {
             "bthledevice#battery",
             "Bluetooth#battery",
         ] {
-            assert!(relevant_device_event(id), "{id}");
+            assert!(device_event(id, || true).is_some(), "{id}");
         }
         for id in ["", "USB#printer", "SWD#audioendpoint"] {
-            assert!(!relevant_device_event(id));
+            assert!(device_event(id, || true).is_none());
         }
     }
     #[test]
@@ -9257,7 +9285,7 @@ mod tests {
             "BTH-initial-controller",
             "Bluetooth-initial-keyboard",
         ] {
-            gate.forward(&commands, id, true);
+            gate.forward(&commands, id, || true);
         }
         assert!(received.try_recv().is_err());
         // Added, Updated and Removed callbacks share this same gate. Once the
@@ -9269,12 +9297,15 @@ mod tests {
             ("BTH-changed-controller", false),
             ("Bluetooth-removed-keyboard", true),
         ] {
-            gate.forward(&commands, id, arrival_or_removal);
-            assert!(
-                matches!(received.try_recv(), Ok(Command::DeviceChanged {arrival_or_removal: actual}) if actual == arrival_or_removal)
-            );
+            gate.forward(&commands, id, || arrival_or_removal);
+            let event = received.try_recv().unwrap();
+            assert!(matches!(
+                (event, arrival_or_removal),
+                (Command::TopologyChanged, true) | (Command::BluetoothPropertiesChanged, false)
+            ));
         }
-        gate.forward(&commands, "USB-unrelated-storage", true);
+        gate.forward(&commands, "USB-unrelated-storage", || true);
+        gate.forward(&commands, "HID#unchanged-connection", || false);
         assert!(received.try_recv().is_err());
     }
     #[test]

@@ -93,7 +93,7 @@ pub struct HidProvider {
     playstation_since: BTreeMap<String, Duration>,
     playstation_budget: BTreeMap<String, Duration>,
     pa_accepted: bool,
-    razer_dead: BTreeMap<String, Duration>,
+    path_retry_after: BTreeMap<String, Duration>,
     steel_path: BTreeMap<String, String>,
     family_names: BTreeMap<String, String>,
     mchose_models: BTreeMap<String, u16>,
@@ -141,7 +141,7 @@ impl HidProvider {
             playstation_since: BTreeMap::new(),
             playstation_budget: BTreeMap::new(),
             pa_accepted: false,
-            razer_dead: BTreeMap::new(),
+            path_retry_after: BTreeMap::new(),
             steel_path: BTreeMap::new(),
             family_names: BTreeMap::new(),
             mchose_models: BTreeMap::new(),
@@ -245,7 +245,7 @@ impl HidProvider {
     fn prune_enumerated(&mut self, infos: &[&HidInfo], now: Duration) {
         if self.last.is_empty()
             && self.last_observed.is_empty()
-            && self.razer_dead.is_empty()
+            && self.path_retry_after.is_empty()
             && self.razer_cache.is_empty()
             && self.steel_path.is_empty()
             && self.family_names.is_empty()
@@ -254,7 +254,7 @@ impl HidProvider {
             return;
         }
         let paths: BTreeSet<_> = infos.iter().map(|i| i.path.as_str()).collect();
-        self.razer_dead
+        self.path_retry_after
             .retain(|path, until| *until > now && paths.contains(path.as_str()));
         self.razer_cache
             .retain(|_, (path, _)| paths.contains(path.as_str()));
@@ -736,27 +736,57 @@ impl HidProvider {
                 Ok(None)
             }
             "mchose" => {
+                let unconfirmed =
+                    d.variant == "family-probe" && !self.mchose_models.contains_key(&info.path);
+                let mut error = None;
+                let mut received = false;
                 for (id, length) in [(0x11, 20), (0x12, 64)] {
+                    if d.variant == "family-probe"
+                        && info.feature_length.is_some_and(|max| max < length + 1)
+                    {
+                        continue;
+                    }
+                    let mut packet = vec![255; length + 1];
+                    packet[0] = id;
+                    packet[1] = 6 ^ 255;
                     for _ in 0..4 {
                         if !c.active() {
                             break;
                         }
-                        let mut packet = vec![255; length + 1];
-                        packet[0] = id;
-                        packet[1] = 6 ^ 255;
-                        if s.send_feature(&packet).is_err() {
+                        if let Err(e) = s.send_feature(&packet) {
+                            error = Some(e);
                             break;
                         }
                         c.sleep(Duration::from_millis(120));
-                        if let Ok(reply) = s.feature(id, length + 1)
-                            && let Some(b) = p::mchose(&reply)
-                        {
+                        if !c.active() {
+                            break;
+                        }
+                        let reply = match s.feature(id, length + 1) {
+                            Ok(reply) => reply,
+                            Err(e) => {
+                                error = Some(e);
+                                continue;
+                            }
+                        };
+                        received = true;
+                        if let Some(b) = p::mchose(&reply) {
                             self.mchose_models.insert(
                                 info.path.clone(),
                                 u16::from_le_bytes([reply[4] ^ 255, reply[5] ^ 255]),
                             );
                             return Ok(Some(b));
                         }
+                    }
+                }
+                if unconfirmed && c.active() {
+                    if !received && let Some(e) = error {
+                        return Err(e);
+                    }
+                    if self.path_retry_after.len() < 64 {
+                        self.path_retry_after.insert(
+                            info.path.clone(),
+                            c.clock.monotonic() + Duration::from_secs(300),
+                        );
                     }
                 }
                 Ok(None)
@@ -2093,6 +2123,10 @@ impl BatteryProvider for HidProvider {
     }
     fn invalidate(&mut self) {
         self.jbl.clear();
+        if self.id == "mchose" {
+            self.path_retry_after.clear();
+            self.mchose_models.clear();
+        }
         self.centurion_features.clear();
         if let Some(state) = &mut self.community {
             state.invalidate();
@@ -2204,13 +2238,17 @@ impl BatteryProvider for HidProvider {
                 find_device(self.id, i.vendor_id, i.product_id)
                     .copied()
                     .or_else(|| {
-                        if self.id == "mchose" && [0x5253, 0x3837].contains(&i.vendor_id) {
+                        if self.id == "mchose"
+                            && [0x5253, 0x3837].contains(&i.vendor_id)
+                            && (i.usage_page, i.usage) == (0xff01, 1)
+                            && matches!(i.feature_length, None | Some(21 | 65))
+                        {
                             Some(Device {
                                 provider: "mchose",
                                 vid: i.vendor_id,
                                 pid: i.product_id,
                                 name: "MCHOSE mouse",
-                                variant: "",
+                                variant: "family-probe",
                                 parameter: 0,
                             })
                         } else {
@@ -2357,9 +2395,9 @@ impl BatteryProvider for HidProvider {
                 "{} {:04x}:{:04x} interface {} usage {:04x}:{:04x}",
                 d.name, i.vendor_id, i.product_id, i.interface, i.usage_page, i.usage
             ));
-            if self.id == "razer"
+            if (self.id == "razer" || d.variant == "family-probe")
                 && self
-                    .razer_dead
+                    .path_retry_after
                     .get(&i.path)
                     .is_some_and(|until| *until > c.clock.monotonic())
             {
@@ -2374,7 +2412,7 @@ impl BatteryProvider for HidProvider {
                         && (d.pid != 0x027b
                             || !self.razer_cache.values().any(|(path, _)| path == &i.path))
                     {
-                        self.razer_dead.insert(
+                        self.path_retry_after.insert(
                             i.path.clone(),
                             c.clock.monotonic() + Duration::from_secs(300),
                         );
@@ -2485,7 +2523,7 @@ impl BatteryProvider for HidProvider {
                 && result.is_err()
                 && (d.pid != 0x027b || !self.razer_cache.values().any(|(path, _)| path == &i.path))
             {
-                self.razer_dead.insert(
+                self.path_retry_after.insert(
                     i.path.clone(),
                     c.clock.monotonic() + Duration::from_secs(300),
                 );
@@ -3047,7 +3085,7 @@ mod cache_retention_tests {
                     .insert(key.clone(), Reading::new(&key, "Invented", id, 0));
                 provider.last_observed.insert(key.clone(), Duration::ZERO);
                 provider
-                    .razer_dead
+                    .path_retry_after
                     .insert(key.clone(), Duration::from_secs(300));
                 provider.razer_cache.insert(key.clone(), (key.clone(), 0));
                 provider.steel_path.insert(key.clone(), key.clone());
@@ -3060,7 +3098,7 @@ mod cache_retention_tests {
                     .is_err()
             );
             assert_eq!(provider.last.len(), 1000);
-            assert_eq!(provider.razer_dead.len(), 1000);
+            assert_eq!(provider.path_retry_after.len(), 1000);
             // After the existing finite MCHOSE absent-receiver grace, all rows
             // must be released; errors above did not establish absence.
             clock.0.store(301_000, std::sync::atomic::Ordering::Relaxed);
@@ -3072,7 +3110,7 @@ mod cache_retention_tests {
             );
             assert!(provider.last.is_empty());
             assert!(provider.last_observed.is_empty());
-            assert!(provider.razer_dead.is_empty());
+            assert!(provider.path_retry_after.is_empty());
             assert!(provider.razer_cache.is_empty());
             assert!(provider.steel_path.is_empty());
             assert!(provider.family_names.is_empty());
@@ -3144,7 +3182,7 @@ mod cache_retention_tests {
         provider.last.insert(key.clone(), reading);
         provider.last_observed.insert(key.clone(), Duration::ZERO);
         provider
-            .razer_dead
+            .path_retry_after
             .insert(device.path.clone(), Duration::from_secs(300));
         provider
             .razer_cache
@@ -3155,7 +3193,7 @@ mod cache_retention_tests {
         assert_eq!((sleeping.level, sleeping.charging), (None, None));
         assert_eq!(provider.last_observed.len(), 1);
         assert_eq!(provider.razer_cache.len(), 1);
-        assert!(provider.razer_dead.is_empty());
+        assert!(provider.path_retry_after.is_empty());
         provider.prune_enumerated(&[], Duration::from_secs(3601));
         assert!(provider.last.is_empty());
         assert!(provider.last_observed.is_empty());

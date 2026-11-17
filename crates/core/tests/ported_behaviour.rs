@@ -22,11 +22,12 @@ fn apply(
 fn drain(h: &mut Estimator, key: &str, start: f64, hours: f64, rate: f64) -> f64 {
     let n = (hours * 60.0) as usize;
     for i in 0..=n {
-        let reading = r(
+        let mut reading = r(
             key,
             Some((100.0 - rate * i as f64 / 60.0).round() as u8),
             Some(false),
         );
+        reading.timestamp += start as i64 + i as i64 * 60;
         h.record(&reading, start + i as f64 * 60.0);
     }
     start + (n + 1) as f64 * 60.0
@@ -424,10 +425,14 @@ fn estimator_steady_drain_minimum_span_and_drop() {
 fn estimator_charge_rise_reset_and_small_jitter_ignored() {
     let mut h = Estimator::default();
     let t = drain(&mut h, "one", 0.0, 3.0, 5.0);
-    h.record(&r("one", Some(85), Some(true)), t);
+    let mut charged = r("one", Some(85), Some(true));
+    charged.timestamp += t as i64;
+    h.record(&charged, t);
     assert!(h.devices["one"].samples.is_empty());
     let t = drain(&mut h, "one", t + 60.0, 3.0, 5.0);
-    h.record(&r("one", Some(95), Some(false)), t);
+    let mut risen = r("one", Some(95), Some(false));
+    risen.timestamp += t as i64;
+    h.record(&risen, t);
     assert_eq!(h.devices["one"].samples.len(), 1);
     assert_eq!(h.devices["one"].usage, 0.0);
     let mut h = Estimator::default();
@@ -474,7 +479,9 @@ fn estimator_stalled_level_slows_fit_and_samples_are_bounded() {
     let t = drain(&mut h, "one", 0.0, 3.0, 5.0);
     let fast = h.seconds_left("one", Some(85)).unwrap();
     for i in 0..180 {
-        h.record(&r("one", Some(85), Some(false)), t + i as f64 * 60.0);
+        let mut plateau = r("one", Some(85), Some(false));
+        plateau.timestamp += t as i64 + i * 60;
+        h.record(&plateau, t + i as f64 * 60.0);
     }
     assert!(h.seconds_left("one", Some(85)).unwrap() > fast);
 }
@@ -483,13 +490,15 @@ fn estimator_roundtrip_damaged_entries_expiry_and_baseline_reset() {
     let mut h = Estimator::default();
     let t = drain(&mut h, "one", 0.0, 3.0, 5.0);
     let value = serde_json::to_value(&h).unwrap();
-    let mut loaded = Estimator::from_value(value, 1_000_100);
+    let mut loaded = Estimator::from_value(value, 1_000_000 + t as i64);
     assert_eq!(
         loaded.seconds_left("one", Some(85)),
         h.seconds_left("one", Some(85))
     );
     let usage = loaded.devices["one"].usage;
-    loaded.record(&r("one", Some(85), Some(false)), t + 100_000.0);
+    let mut fresh = r("one", Some(85), Some(false));
+    fresh.timestamp += t as i64 + 100_000;
+    loaded.record(&fresh, t + 100_000.0);
     assert_eq!(loaded.devices["one"].usage, usage);
     let parsed = Estimator::from_value(
         json!({"devices":{"good":{"usage":60.0,"samples":[[0.0,80],[60.0,79]],"seen":1_000_000},"bad":{"samples":[["x",1]]},"bad_level":{"usage":1.0,"samples":[[0.0,255]]},"expired":{"seen":1,"usage":1.0,"samples":[]}}}),
@@ -510,12 +519,9 @@ fn snapshot_estimate_only_awake_exact_battery_and_enabled() {
     let mut e = engine();
     for i in 0..=180 {
         let level = (100.0 - 5.0 * i as f64 / 60.0).round() as u8;
-        e.apply(
-            "razer",
-            Ok(vec![r("one", Some(level), Some(false))]),
-            i as f64 * 60.0,
-            false,
-        );
+        let mut sample = r("one", Some(level), Some(false));
+        sample.timestamp += (i - 180) * 60;
+        e.apply("razer", Ok(vec![sample]), i as f64 * 60.0, false);
     }
     assert!(e.snapshot(0).devices[0].text.contains("h of use left"));
     let learned = e.estimator.clone();

@@ -449,6 +449,10 @@ impl Community {
                     }
                     Ok(None) => {
                         successful = true;
+                        if known && protocol(&d) == "ajazz-ak820" && mine.len() > 1 && c.active() {
+                            // Try the other eligible collection at the next scheduled poll.
+                            self.hints.get_mut(&endpoint).unwrap().path = None;
+                        }
                     }
                     Err(e) => {
                         self.log(format!("{}: {}", d.name, e));
@@ -1205,6 +1209,7 @@ impl Community {
                 .push(i);
         }
         let mut out = Vec::new();
+        let mut failure = None;
         for (id, mine) in groups.into_iter().take(MAX_DEVICES) {
             if !c.active() {
                 break;
@@ -1230,8 +1235,14 @@ impl Community {
                     (r.len() >= minimum_length && r.starts_with(echo)).then(|| r.to_vec())
                 })
             };
-            let Some(pairs) = ask(control, &[1, 0xa0, 0, 0], 7)? else {
-                continue;
+            let pairs = match ask(control, &[1, 0xa0, 0, 0], 7) {
+                Ok(Some(pairs)) => pairs,
+                Ok(None) => continue,
+                Err(error) => {
+                    self.log(format!("OMNI pair list: {error}"));
+                    failure = Some(error);
+                    continue;
+                }
             };
             // Only models with successful upstream owner tests. Pair-list
             // battery fields are shared by each peripheral class.
@@ -1313,11 +1324,19 @@ impl Community {
                 }
                 queried[channel] = true;
                 let charge_at = if mouse { 10 } else { 9 };
-                let r = ask(i, head, at.max(charge_at) + 1)?;
-                if let Some(r) = r
-                    && r[at] <= 100
-                    && (r[at] > 0 || r[charge_at] != 0)
-                {
+                if !c.active() {
+                    break;
+                }
+                let r = match ask(i, head, at.max(charge_at) + 1) {
+                    Ok(Some(reply)) => reply,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        self.log(format!("OMNI {name}: {error}"));
+                        failure = Some(error);
+                        continue;
+                    }
+                };
+                if r[at] <= 100 && (r[at] > 0 || r[charge_at] != 0) {
                     let mut reading = Reading::new(
                         format!("asus:omni:{id}:{model:04x}"),
                         name,
@@ -1332,6 +1351,11 @@ impl Community {
                     out.push(reading);
                 }
             }
+        }
+        if out.is_empty()
+            && let Some(error) = failure
+        {
+            return Err(error);
         }
         Ok(out)
     }

@@ -430,6 +430,32 @@ fn atk_v75x_checks_product_string_because_vid_pid_is_shared() {
 }
 
 #[test]
+fn atk_v75x_cache_hits_keep_the_level_without_adding_estimated_use() {
+    let mut device = device(0x320f, 0x5088, 0xff1c, 0x92);
+    device.product = "ATK V75X 2.4G Dongle".into();
+    let clock = FakeClock::default();
+    let mut provider = HidProvider::new("atk_keyboard");
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    for seconds in [1, 61, 121, 181, 241] {
+        clock.0.store(seconds * 1000, Ordering::Relaxed);
+        let steps = if seconds == 1 {
+            vec![
+                Step::Write(padded(&[4, 1, 0, 0x1a], 32)),
+                rd(&[4, 1, 0, 0x1a, 0, 0, 0, 0, 55, 0]),
+            ]
+        } else {
+            vec![]
+        };
+        let h = FakeHid::new(vec![device.clone()], steps);
+        let rows = poll(&mut provider, &h, &clock).unwrap();
+        assert_eq!((rows[0].level, rows[0].timestamp), (Some(55), 1));
+        engine.apply("atk_keyboard", Ok(rows), seconds as f64, false);
+        assert_eq!(engine.estimator.devices.values().next().unwrap().usage, 0.0);
+        h.done();
+    }
+}
+
+#[test]
 fn aula_keyboard_accepts_both_captured_update_types_and_drops_offline_rows() {
     for (lead, frame_type) in [(0, 0), (0, 0x18), (1, 0), (1, 0x18)] {
         let mut reply = vec![0; 32 + lead];
@@ -1013,6 +1039,70 @@ fn omni_queries_only_confirmed_paired_models_and_keeps_child_identities_distinct
             assert_eq!(rows[1].level, Some(66));
             assert_eq!(rows[1].kind, "keyboard");
         }
+        h.done();
+    }
+}
+
+#[test]
+fn omni_child_failures_preserve_successful_siblings_and_report_total_failure() {
+    let infos: Vec<_> = [(0xff02, "control"), (0xff01, "mouse"), (0xff00, "keyboard")]
+        .into_iter()
+        .map(|(page, name)| {
+            let mut i = device(0x0b05, 0x1ace, page, 1);
+            i.interface = 2;
+            i.container = Some("test-receiver".into());
+            i.path = name.into();
+            i
+        })
+        .collect();
+    let mut pairs = padded(&[1, 0xa0, 0, 1, 0], 64);
+    pairs[5..7].copy_from_slice(&0x1b65u16.to_le_bytes());
+    pairs[9..11].copy_from_slice(&0x1b06u16.to_le_bytes());
+    for (mouse, keyboard) in [(true, false), (false, true), (false, false)] {
+        let mut steps = vec![
+            rd(&[]),
+            Step::Write(padded(&[1, 0xa0, 0, 0], 64)),
+            rd(&pairs),
+        ];
+        for (enabled, head, at) in [(mouse, [3, 0x12, 7], 5), (keyboard, [2, 0x12, 1], 11)] {
+            if enabled {
+                let mut reply = padded(&head, 64);
+                reply[at] = 55;
+                steps.extend([rd(&[]), Step::Write(padded(&head, 64)), rd(&reply)]);
+            }
+        }
+        let mut inventory = infos.clone();
+        for name in ["aaa-receiver", "zzz-receiver"] {
+            let mut control = infos[0].clone();
+            control.container = Some(name.into());
+            control.path = name.into();
+            inventory.push(control);
+        }
+        let mut h = FakeHid::new(inventory, steps)
+            .fail_open("aaa-receiver", "unavailable receiver")
+            .fail_open("zzz-receiver", "unavailable receiver");
+        if !mouse {
+            h = h.fail_open("mouse", "test sharing violation");
+        }
+        if !keyboard {
+            h = h.fail_open("keyboard", "test sharing violation");
+        }
+        let mut provider = HidProvider::new("asus");
+        let result = poll(&mut provider, &h, &FakeClock::default());
+        if mouse || keyboard {
+            let rows = result.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].level, Some(55));
+            assert_eq!(rows[0].kind, if mouse { "mouse" } else { "keyboard" });
+        } else {
+            assert!(result.is_err());
+        }
+        assert!(
+            provider
+                .diagnostics()
+                .iter()
+                .any(|line| line.contains("test sharing violation"))
+        );
         h.done();
     }
 }

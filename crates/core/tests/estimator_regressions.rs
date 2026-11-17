@@ -2,16 +2,22 @@ use hb_core::*;
 use serde_json::json;
 
 fn reading(level: u8) -> Reading {
-    let mut reading = Reading::new("device", "Device", "test", 100);
+    let mut reading = Reading::new("device", "Device", "test", 10_800);
     reading.level = Some(level);
     reading.charging = Some(false);
     reading
 }
 
+fn record_at(estimator: &mut Estimator, level: u8, seconds: i64) {
+    let mut r = reading(level);
+    r.timestamp = seconds;
+    estimator.record(&r, seconds as f64);
+}
+
 fn learned() -> Estimator {
     let mut estimator = Estimator::default();
     for i in 0..=180 {
-        estimator.record(&reading(100 - (i / 12) as u8), i as f64 * 60.0);
+        record_at(&mut estimator, 100 - (i / 12) as u8, i * 60);
     }
     estimator
 }
@@ -27,7 +33,7 @@ fn unobserved_loss_preserves_learned_slope_without_counting_boundary_time() {
             "pause" => estimator.pause("device"),
             "gap" => time = 100_000.0,
             "restart" => {
-                estimator = Estimator::from_value(serde_json::to_value(estimator).unwrap(), 100);
+                estimator = Estimator::from_value(serde_json::to_value(estimator).unwrap(), 10_800);
             }
             "backwards" => time = 1.0,
             "unknown" => {
@@ -123,14 +129,37 @@ fn uncertain_readings_do_not_extend_discharge_evidence() {
 }
 
 #[test]
+fn cached_reports_neither_add_usage_nor_restart_a_paused_baseline() {
+    let mut e = Estimator::default();
+    let mut sample = reading(55);
+    e.record(&sample, 0.0);
+    for elapsed in [60.0, 120.0, 180.0, 240.0] {
+        e.record(&sample, elapsed);
+    }
+    assert_eq!(e.devices["device"].usage, 0.0);
+    e.pause("device");
+    e.record(&sample, 250.0);
+    sample.timestamp += 300;
+    e.record(&sample, 300.0);
+    assert_eq!(e.devices["device"].usage, 0.0);
+    // A level change within the same wall-clock second is genuine evidence.
+    sample.level = Some(54);
+    e.record(&sample, 300.5);
+    assert_eq!(e.devices["device"].samples.last().unwrap().1, 54);
+    sample.charging = Some(true);
+    e.record(&sample, 300.75);
+    assert!(e.devices["device"].samples.is_empty());
+}
+
+#[test]
 fn recent_drain_adapts_after_usage_conditions_change() {
     let mut estimator = Estimator::default();
     for i in 0..=120 {
-        estimator.record(&reading(100 - (i / 12) as u8), i as f64 * 300.0);
+        record_at(&mut estimator, 100 - (i / 12) as u8, i * 300);
     }
     let slow = estimator.seconds_left("device", Some(90)).unwrap();
     for i in 1..=60 {
-        estimator.record(&reading(90 - (i / 6) as u8), 36_000.0 + i as f64 * 60.0);
+        record_at(&mut estimator, 90 - (i / 6) as u8, 36_000 + i * 60);
     }
     let fast = estimator.seconds_left("device", Some(80)).unwrap();
     assert!(fast < slow / 5.0);
@@ -141,7 +170,7 @@ fn recent_drain_adapts_after_usage_conditions_change() {
 fn a_single_large_drop_does_not_support_an_estimate() {
     let mut estimator = Estimator::default();
     for i in 0..=30 {
-        estimator.record(&reading(if i == 30 { 90 } else { 100 }), i as f64 * 60.0);
+        record_at(&mut estimator, if i == 30 { 90 } else { 100 }, i * 60);
     }
     assert_eq!(estimator.seconds_left("device", Some(90)), None);
 }
@@ -150,11 +179,11 @@ fn a_single_large_drop_does_not_support_an_estimate() {
 fn full_level_plateau_and_small_upper_edge_jitter_do_not_reset_usage() {
     let mut estimator = Estimator::default();
     for i in 0..=30 {
-        estimator.record(&reading(100), i as f64 * 60.0);
+        record_at(&mut estimator, 100, i * 60);
     }
     assert_eq!(estimator.devices["device"].usage, 1800.0);
-    estimator.record(&reading(99), 1860.0);
-    estimator.record(&reading(100), 1920.0);
+    record_at(&mut estimator, 99, 1860);
+    record_at(&mut estimator, 100, 1920);
     assert_eq!(estimator.devices["device"].usage, 1920.0);
     assert_eq!(estimator.devices["device"].samples.len(), 2);
 }

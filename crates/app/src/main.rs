@@ -24,6 +24,26 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
+fn file_matches(path: &std::path::Path, expected: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() == expected.len() as u64)
+    {
+        return false;
+    }
+    let mut buffer = [0; 1024];
+    for chunk in expected.chunks(buffer.len()) {
+        if file.read_exact(&mut buffer[..chunk.len()]).is_err() || &buffer[..chunk.len()] != chunk {
+            return false;
+        }
+    }
+    matches!(file.read(&mut buffer[..1]), Ok(0))
+}
+
 fn application_data_directory(args: &[String]) -> hb_storage::DataDirectory {
     let explicit = args
         .iter()
@@ -294,7 +314,7 @@ fn entry() -> Result<(), ProviderError> {
     let icon: &[u8] = include_bytes!("../application.png");
     let registration = (|| {
         hb_windows::system::identify();
-        if std::fs::read(&icon_path).ok().as_deref() != Some(icon) {
+        if !file_matches(&icon_path, icon) {
             hb_storage::atomic_write(&icon_path, icon)?;
         }
         hb_windows::system::identify_registered_with_icon(&icon_path)
@@ -346,6 +366,29 @@ mod performance_fixture {
 #[cfg(test)]
 mod startup_mode_tests {
     use super::simulation_mode;
+    #[test]
+    fn startup_icon_checks_missing_changed_matching_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("application.png");
+        let expected = include_bytes!("../application.png");
+        assert!(!super::file_matches(&path, expected));
+        std::fs::write(&path, expected).unwrap();
+        assert!(super::file_matches(&path, expected));
+        let mut corrupt = *expected;
+        corrupt[expected.len() - 1] ^= 1;
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(!super::file_matches(&path, expected));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8 * 1024 * 1024)
+            .unwrap();
+        let (matches, stats) =
+            crate::allocation_counter::measure(|| super::file_matches(&path, expected));
+        assert!(!matches);
+        assert!(stats.bytes < 8192);
+    }
 
     #[test]
     fn simulation_rejects_live_diagnostics_before_opening_hardware() {

@@ -85,6 +85,78 @@ fn mchose_vendor_family_includes_unknown_pids_and_prefers_charging_source() {
     hid.done();
 }
 
+#[test]
+fn mchose_unlisted_receivers_require_matching_caps_and_back_off_until_reconnect() {
+    let mut candidate = info(0x3837, 0x7ffc, 0xff01);
+    candidate.feature_length = Some(21);
+    let mut wrong_page = candidate.clone();
+    wrong_page.usage_page = 0xff77;
+    let mut wrong_usage = candidate.clone();
+    wrong_usage.usage = 2;
+    let mut wrong_length = candidate.clone();
+    wrong_length.feature_length = Some(17);
+    let clock = FakeClock::default();
+    let cancel = AtomicBool::new(false);
+    let mut provider = HidProvider::new("mchose");
+    let incompatible = FakeHid::new(vec![wrong_page, wrong_usage, wrong_length], vec![]);
+    assert!(
+        provider
+            .poll(&incompatible, &context(&clock, &cancel))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(incompatible.opened.lock().unwrap().is_empty());
+    assert!(clock.monotonic().is_zero());
+    let mut request = vec![255; 21];
+    request[..2].copy_from_slice(&[0x11, 0xf9]);
+    let silent_steps: Vec<_> = (0..4)
+        .flat_map(|_| {
+            [
+                Step::Send(request.clone()),
+                Step::Feature(0x11, 21, Ok(vec![])),
+            ]
+        })
+        .collect();
+    let silent = FakeHid::new(vec![candidate.clone()], silent_steps.clone());
+    assert!(
+        provider
+            .poll(&silent, &context(&clock, &cancel))
+            .unwrap()
+            .is_empty()
+    );
+    silent.done();
+    let cached = FakeHid::new(vec![candidate.clone()], vec![]);
+    assert!(
+        provider
+            .poll(&cached, &context(&clock, &cancel))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(cached.opened.lock().unwrap().is_empty());
+    clock.0.store(301_000, Ordering::Relaxed);
+    let retry = FakeHid::new(vec![candidate.clone()], silent_steps);
+    assert!(
+        provider
+            .poll(&retry, &context(&clock, &cancel))
+            .unwrap()
+            .is_empty()
+    );
+    retry.done();
+    provider.invalidate();
+    let denied = FakeHid::new(
+        vec![candidate.clone()],
+        vec![Step::SendError(request, "feature transfer failed")],
+    );
+    assert!(provider.poll(&denied, &context(&clock, &cancel)).is_err());
+    denied.done();
+    let awake = FakeHid::new(vec![candidate], mchose_steps(48, false));
+    assert_eq!(
+        provider.poll(&awake, &context(&clock, &cancel)).unwrap()[0].level,
+        Some(48)
+    );
+    awake.done();
+}
+
 fn razer_reply(status: u8, cmd: u8, value: u8) -> Vec<u8> {
     let mut r = vec![0; 91];
     r[1] = status;

@@ -18,6 +18,16 @@ struct HistoryVertex {
     measured: bool,
 }
 
+fn empty_history_message(series: &HistorySeries) -> &'static str {
+    if series.axis == HistoryAxis::Calendar {
+        return "No battery readings for this period yet.";
+    }
+    if !series.samples.is_empty() && series.samples.iter().all(|s| s.reading.charging.is_none()) {
+        return "Charging status unavailable. Choose Calendar time to see battery levels.";
+    }
+    "No usage history yet. Readings appear as the device is used."
+}
+
 /// Trend anchors, with explicit holds across unavailable readings and charge
 /// jumps. Repeated percentages need no extra vertices. Remember their timestamps
 /// nevertheless, so a later sleeping interval starts at the last observation.
@@ -408,11 +418,7 @@ impl Chart {
             }
             if empty {
                 text(
-                    if series.axis == HistoryAxis::Usage {
-                        "No usage history yet. Readings appear as the device is used."
-                    } else {
-                        "No battery readings for this period yet."
-                    },
+                    empty_history_message(series),
                     left,
                     top + (bottom - top) / 2. - 12. * self.scale,
                     right - left,
@@ -453,6 +459,19 @@ mod tests {
         reading.level = level;
         reading.connection = connection;
         reading
+    }
+
+    #[test]
+    fn empty_usage_history_explains_where_to_find_recorded_battery_levels() {
+        let mut series = HistorySeries::default();
+        assert!(!empty_history_message(&series).contains("Calendar time"));
+        series.samples.push(HistorySample {
+            reading: sample(42, Some(81), Connection::Online),
+            position: 0,
+        });
+        assert!(empty_history_message(&series).contains("Choose Calendar time"));
+        series.samples[0].reading.charging = Some(true);
+        assert!(!empty_history_message(&series).contains("Charging status unavailable"));
     }
 
     fn calendar_trace(points: &[Reading], since: i64, until: i64) -> Vec<HistoryVertex> {

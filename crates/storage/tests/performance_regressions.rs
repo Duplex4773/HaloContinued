@@ -156,7 +156,7 @@ fn thirty_day_usage_sampling_allocations() {
 fn checkpoint_load_avoids_json_tree_and_recovers_valid_neighbours() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("history.db");
-    let store = Store::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
     let db = Connection::open(path).unwrap();
     let now = hb_core::Clock::unix(&hb_core::SystemClock::default());
     let devices = (0..32).map(|i| (format!("invented-{i}"), serde_json::json!({
@@ -193,8 +193,13 @@ fn checkpoint_load_avoids_json_tree_and_recovers_valid_neighbours() {
     // Skip oversized checkpoints without rewriting the original row or history.
     db.execute("UPDATE state SET payload=zeroblob(4194305)", [])
         .unwrap();
-    let (empty, skipped) = measure(|| store.load_estimator());
-    assert!(empty.devices.is_empty());
+    let (oversized, skipped) = measure(|| store.try_load_estimator());
+    assert!(oversized.is_err());
+    assert!(
+        !store
+            .create_estimator(&hb_core::Estimator::default())
+            .unwrap()
+    );
     assert!(
         skipped.bytes < 65536,
         "oversized checkpoint was materialised: {skipped:?}"

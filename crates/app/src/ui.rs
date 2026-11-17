@@ -903,6 +903,7 @@ fn polling_timestamp(timestamp: i64) -> String {
 }
 struct HistorySelection {
     axis: HistoryAxis,
+    explicit_axis: bool,
     usage_index: usize,
     calendar_index: usize,
 }
@@ -910,12 +911,22 @@ impl Default for HistorySelection {
     fn default() -> Self {
         Self {
             axis: HistoryAxis::Usage,
+            explicit_axis: false,
             usage_index: 2,
             calendar_index: 0,
         }
     }
 }
 impl HistorySelection {
+    fn select_default(&mut self, reading: Option<&Reading>) {
+        if !self.explicit_axis {
+            self.axis = if reading.is_some_and(|r| r.level.is_some() && r.charging.is_none()) {
+                HistoryAxis::Calendar
+            } else {
+                HistoryAxis::Usage
+            };
+        }
+    }
     fn index(&self) -> usize {
         match self.axis {
             HistoryAxis::Usage => self.usage_index,
@@ -1290,7 +1301,7 @@ fn charge_cycle_text(cycle: &ChargeCycle) -> String {
 /// Coalesced lifecycle and tray recovery messages, held without an allocation or a timer.
 /// Reposting while a native modal loop owns State would keep that loop busy.
 #[derive(Default)]
-struct DeferredDashboard(Cell<[Option<(u32, usize)>; 5]>);
+struct DeferredDashboard(Cell<[Option<(u32, usize)>; 6]>);
 impl DeferredDashboard {
     fn push(&self, message: u32, parameter: usize) {
         let mut messages = self.0.get();
@@ -1320,6 +1331,7 @@ mod deferred_dashboard_tests {
                 queue.push(WM_APP + 11, index);
                 queue.push(WM_APP + 12, 0);
                 queue.push(0xc123, 0); // Registered TaskbarCreated message.
+                queue.push(WM_DEVICECHANGE, DBT_DEVNODES_CHANGED as usize);
             }
             queue.push(WM_APP + 8, 0);
         });
@@ -1331,6 +1343,7 @@ mod deferred_dashboard_tests {
                 Some((WM_APP + 11, 999)),
                 Some((WM_APP + 12, 0)),
                 Some((0xc123, 0)),
+                Some((WM_DEVICECHANGE, DBT_DEVNODES_CHANGED as usize)),
                 Some((WM_APP + 8, 0)),
             ]
         );
@@ -1991,6 +2004,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         if explorer_restarted && hwnd != (*ptr).monitor.get() {
             return LRESULT(0);
         }
+        if msg == WM_DEVICECHANGE
+            && (hwnd != (*ptr).monitor.get()
+                || !matches!(
+                    wp.0 as u32,
+                    DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE | DBT_DEVNODES_CHANGED
+                ))
+        {
+            return LRESULT(1);
+        }
         if msg == WM_POWERBROADCAST {
             if hwnd == (*ptr).monitor.get() {
                 match wp.0 as u32 {
@@ -2037,6 +2059,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             // DefWindowProc handles WM_CLOSE by destroying the window. Never
             // let that bypass State cleanup while a native callback reenters.
             let deferred = match msg {
+                // Only the topology signal is needed after this callback returns.
+                WM_DEVICECHANGE => Some((WM_DEVICECHANGE, WPARAM(DBT_DEVNODES_CHANGED as usize))),
                 WM_CLOSE => Some((WM_APP + 9, WPARAM(hwnd.0 as usize))),
                 m if explorer_restarted
                     || m == WM_APP + 8
@@ -2122,12 +2146,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 LRESULT(0)
             }
             WM_DEVICECHANGE => {
-                s.runtime.send(Command::DeviceChanged {
-                    arrival_or_removal: matches!(
-                        wp.0 as u32,
-                        DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE
-                    ),
-                });
+                s.runtime.send(Command::TopologyChanged);
                 LRESULT(1)
             }
             TRAY => {
@@ -3465,6 +3484,8 @@ impl State {
                 }
             }
             2 => {
+                self.history
+                    .select_default(self.snapshot.devices.get(self.selected).map(|d| &d.reading));
                 self.heading(90, "Battery history", 20, 68, 740);
                 self.label(92, "Device", 20, 106, 360);
                 self.label(93, "Time scale", 420, 106, 160);
@@ -4244,6 +4265,7 @@ impl State {
                 self.build()
             }
             21 if notification == CBN_SELCHANGE as u16 => {
+                self.history.explicit_axis = true;
                 self.history.axis = if self.choice(21) == 0 {
                     HistoryAxis::Usage
                 } else {
@@ -9281,6 +9303,22 @@ mod history_tests {
         );
     }
     #[test]
+    fn unknown_power_devices_default_to_calendar_and_respect_an_explicit_time_scale() {
+        let mut history = HistorySelection::default();
+        let mut keyboard = Reading::new("test", "Test", "aula", 1);
+        keyboard.level = Some(58);
+        history.select_default(Some(&keyboard));
+        assert_eq!(history.axis, HistoryAxis::Calendar);
+        keyboard.charging = Some(false);
+        history.select_default(Some(&keyboard));
+        assert_eq!(history.axis, HistoryAxis::Usage);
+        history.explicit_axis = true;
+        keyboard.charging = None;
+        history.select_default(Some(&keyboard));
+        assert_eq!(history.axis, HistoryAxis::Usage);
+    }
+
+    #[test]
     fn time_used_is_default_and_routes_24_hours_to_usage_query() {
         let selection = HistorySelection::default();
         assert_eq!(selection.axis, HistoryAxis::Usage);
@@ -11948,6 +11986,7 @@ mod dashboard_lifecycle_tests {
                             && std::env::var("HALO_CAPTURE_DASHBOARD_TEST")
                                 .is_ok_and(|mode| mode == "history-trend")
                         {
+                            state.history.explicit_axis = true;
                             state.history.axis = HistoryAxis::Calendar;
                             state.history.calendar_index = 2;
                         }
@@ -13337,7 +13376,7 @@ mod dashboard_lifecycle_tests {
                         let first = baseline.unwrap();
                         assert!(
                             handles.0 <= first.0 && handles.1 <= first.1,
-                            "closed dashboard native resources grew: {first:?} -> {handles:?}"
+                            "closed dashboard native resources grew at cycle {cycle}: {first:?} -> {handles:?}"
                         );
                         if cycle == 39 {
                             eprintln!(

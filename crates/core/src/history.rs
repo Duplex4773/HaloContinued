@@ -15,6 +15,9 @@ pub struct Discharge {
     pub polling_rate: Option<PollingRate>,
     #[serde(skip)]
     last: Option<(f64, u16)>,
+    // Pausing the monotonic baseline must not make a replayed report fresh.
+    #[serde(skip)]
+    observed_level: Option<u8>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Estimator {
@@ -37,6 +40,7 @@ impl Estimator {
     pub fn clock_changed(&mut self, now: i64) {
         for discharge in self.devices.values_mut() {
             discharge.last = None;
+            discharge.observed_level = None;
             discharge.seen = discharge.seen.min(now.max(0));
         }
     }
@@ -58,6 +62,7 @@ impl Estimator {
     pub fn validate(&mut self, now: i64) {
         self.devices.retain(|_, d| {
             d.last = None;
+            d.observed_level = None;
             if !d.usage.is_finite()
                 || d.usage < 0.0
                 || d.seen < 0
@@ -122,7 +127,11 @@ impl Estimator {
             d.last = None;
             return;
         }
+        if r.charging == Some(false) && d.seen == r.timestamp && d.observed_level == Some(level) {
+            return;
+        }
         d.seen = r.timestamp;
+        d.observed_level = (r.charging == Some(false)).then_some(level);
         if r.charging == Some(true) {
             *d = Discharge {
                 seen: r.timestamp,

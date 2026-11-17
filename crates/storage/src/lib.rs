@@ -498,8 +498,15 @@ impl Store {
         transaction.commit().map_err(sql_error)?;
         self.last
             .retain(|_, observation| observation.reading.timestamp >= cutoff);
-        if self.db.total_changes() != changes {
-            self.usage_index.get_mut().take();
+        let index = self.usage_index.get_mut();
+        if self.db.total_changes() != changes
+            && (repair
+                || index
+                    .as_ref()
+                    .and_then(|i| i.bounds)
+                    .is_some_and(|(first, ..)| first < cutoff))
+        {
+            *index = None;
         }
         Ok(())
     }
@@ -1033,6 +1040,7 @@ impl Store {
     pub fn release_history_cache(&self) {
         self.usage_index.borrow_mut().take();
     }
+    const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
     pub fn load_estimator(&self) -> Estimator {
         self.try_load_estimator().unwrap_or_default()
     }
@@ -1041,12 +1049,11 @@ impl Store {
     pub fn try_load_estimator(&self) -> Result<Estimator, ProviderError> {
         // A damaged checkpoint must not allocate an arbitrarily large JSON
         // tree at startup. Keep the original row for recovery; history is intact.
-        const MAX_CHECKPOINT_BYTES: i64 = 4 * 1024 * 1024;
         let now = hb_core::Clock::unix(&hb_core::SystemClock::default());
         self.db
             .query_row(
-                "SELECT payload FROM state WHERE key='estimator' AND octet_length(payload) <= ?1",
-                [MAX_CHECKPOINT_BYTES],
+                "SELECT CASE WHEN octet_length(payload) <= ?1 THEN payload END FROM state WHERE key='estimator'",
+                [Self::MAX_CHECKPOINT_BYTES as i64],
                 |r| {
                     let payload = row_text(r, 0)?;
                     // Normal checkpoints deserialize directly into their final
@@ -1082,6 +1089,11 @@ impl Store {
     fn write_estimator(&mut self, sql: &str, estimator: &Estimator) -> Result<bool, ProviderError> {
         let payload = serde_json::to_string(estimator)
             .map_err(|error| ProviderError::new(error.to_string()))?;
+        if payload.len() > Self::MAX_CHECKPOINT_BYTES {
+            return Err(ProviderError::new(
+                "Battery estimate checkpoint exceeds the size limit",
+            ));
+        }
         self.db
             .execute(sql, [payload])
             .map(|rows| rows != 0)
@@ -1220,7 +1232,14 @@ impl HistoryStore for Store {
             }
         }
         transaction.commit().map_err(sql_error)?;
-        self.usage_index.get_mut().take();
+        let index = self.usage_index.get_mut();
+        if index.as_ref().is_some_and(|index| {
+            self.pending
+                .iter()
+                .any(|sample| sample.reading.key == index.key)
+        }) {
+            *index = None;
+        }
         self.pending.clear();
         // Large recovery bursts are exceptional. Do not retain their empty
         // backing allocation throughout subsequent quiet monitoring.
@@ -2313,11 +2332,15 @@ mod usage_index_tests {
             })
             .unwrap();
         store.usage_rows.set(0);
+        let mut headset = Reading::new("headset", "Headset", "simulation", until);
+        headset.level = Some(75);
+        store.record(&headset).unwrap();
+        store.flush().unwrap();
         let after_unrelated_writes = store.query_usage("mouse", until + 1, 600, 160).unwrap();
         assert_eq!(after_unrelated_writes.until, first.until);
         assert!(
             store.usage_rows.get() < 512,
-            "Unrelated checkpoint/activity writes rescanned {} history rows",
+            "Unrelated writes rescanned {} history rows",
             store.usage_rows.get()
         );
         store.prune_expired(until).unwrap();

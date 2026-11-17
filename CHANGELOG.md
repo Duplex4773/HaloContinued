@@ -1,3 +1,26 @@
+# Halo Continued 1.1.7
+
+Released 17 November 2026 for Windows 11 x64.
+
+## Device monitoring
+
+- MCHOSE skips incompatible HID collections and waits before retrying silent, unlisted receivers. A reconnect allows an immediate retry.
+- ASUS ROG OMNI receivers keep reporting responding devices when another paired device or receiver is unavailable.
+- AJAZZ AK820 Max Ultra can find a working battery interface again if the one it last used stops responding.
+- Routine Windows property updates no longer restart discovery for every provider. Actual connection changes still invalidate old readings and device-control requests.
+
+## Battery estimates and History
+
+- A cached ATK V75X reading no longer adds estimated usage each time the app checks the receiver.
+- An oversized saved battery estimate survives a restart so the original data remains available for recovery.
+- Recording one device's battery level no longer forces History to rescan another device's readings.
+- Devices that report battery level without charging status now open History in Calendar time by default. You can still choose your preferred time scale.
+
+## Startup and resource use
+
+- Startup checks the notification icon using bounded memory, even if the existing icon file is unusually large.
+- In three-minute simulated runs with the dashboard closed, the static tray icon averaged 0.017% of one logical CPU core and 4.72 MiB of private RAM. With charging animation enabled, the averages were 0.052% and 4.82 MiB. Results on physical hardware can vary.
+
 # Halo Continued 1.1.6
 
 Released 14 November 2026 for Windows 11 x64.

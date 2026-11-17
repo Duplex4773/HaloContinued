@@ -158,6 +158,44 @@ fn atk_prefers_proven_cable_and_caches_receiver_without_merging_vgn() {
 }
 
 #[test]
+fn ajazz_relearns_the_responsive_collection_after_a_silent_timeout() {
+    let mut primary = info(0x0c45, 0xfefc, 0xff70);
+    primary.product = "AJAZZ AK820MAX".into();
+    primary.container = Some("test-keyboard".into());
+    primary.output_length = Some(65);
+    primary.interface = 3;
+    primary.usage = 0x71;
+    let mut alternate = primary.clone();
+    alternate.path.push_str("-alternate");
+    alternate.interface = 2;
+    alternate.usage_page = 0xff80;
+    alternate.usage = 1;
+    let inventory = vec![primary.clone(), alternate.clone()];
+    let mut reply = padded(&[0x55, 0x10], 64);
+    reply[25] = 56;
+    let request = || vec![rd(&[]), Step::Write(padded(&[0, 0xaa, 0x10], 65))];
+    let good = || [request(), vec![rd(&reply)]].concat();
+    let silent = || [request(), vec![rd(&[]); 6]].concat();
+    let mut provider = HidProvider::new("ajazz");
+    let clock = FakeClock::default();
+    for (steps, paths) in [
+        (good(), vec![&primary.path]),
+        (silent(), vec![&primary.path]),
+        (
+            [silent(), good()].concat(),
+            vec![&primary.path, &alternate.path],
+        ),
+        (good(), vec![&alternate.path]),
+    ] {
+        let hid = FakeHid::new(inventory.clone(), steps);
+        let rows = poll(&mut provider, &hid, &clock);
+        assert_eq!(rows[0].level, Some(56));
+        assert_eq!(hid.opened.lock().unwrap().iter().collect::<Vec<_>>(), paths);
+        hid.done();
+    }
+}
+
+#[test]
 fn captured_harpe_void_delux_and_ajazz_frames_report_the_correct_battery() {
     let mut harpe = info(0x0b05, 0x1ad0, 0xff01);
     harpe.interface = 2;
