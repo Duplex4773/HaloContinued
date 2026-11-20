@@ -431,7 +431,8 @@ impl State {
     ) -> &'static str {
         match *device.connection {
             Connection::Sleeping => "Sleeping",
-            Connection::Stale => "Disconnected",
+            Connection::Stale => "Waiting for an update",
+            Connection::ConnectedLastKnown => "Connected",
             Connection::Online if battery.is_some_and(|b| b.reading.charging == Some(true)) => {
                 "Charging"
             }

@@ -1,3 +1,22 @@
+# Unreleased
+
+## Device monitoring and dashboard
+
+- Reconnects are picked up even during a burst of Windows device notifications. Bluetooth battery changes trigger a fresh check. If a connected device stops supplying a battery level, its last reading keeps its original timestamp.
+- PlayStation and 8BitDo controllers now report communication errors when a read fails. The dashboard identifies a wired gamepad as USB when Windows confirms the connection type.
+- Dashboard scrolling respects the Windows mouse-wheel setting, including scrolling by a page or disabling wheel scrolling.
+
+## History and settings
+
+- Calendar history starts a replacement device at its first known battery level. In the Time used view, the graph and its total now agree even if a reading changes while the graph is loading.
+- Damaged battery estimates are preserved for recovery. Large settings files are saved in a compact format, and a save that exceeds the size limit leaves the previous settings intact.
+
+## Performance
+
+- Time used history updates its index as new readings arrive. With 42,000 simulated readings, loading a ten-minute chart after one new reading fell from 51.1 ms to 0.077 ms (median of seven runs).
+- Idle PlayStation and 8BitDo controllers wait for incoming reports with fewer wakeups. In a simulated 400 ms idle interval, an 8BitDo controller needed 8 reads, down from 80.
+- Routine device polls reuse the registered list of hardware vendors, avoiding a scan of the device catalog on each poll.
+
 # Halo Continued 1.1.7
 
 Released 17 November 2026 for Windows 11 x64.

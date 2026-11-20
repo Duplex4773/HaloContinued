@@ -39,6 +39,8 @@ pub enum Connection {
     Online,
     Sleeping,
     Stale,
+    /// The link is confirmed, but the battery level is a cached observation.
+    ConnectedLastKnown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,7 +107,7 @@ impl Reading {
     }
     /// Name changes preserve evidence. Transport changes are separate interval
     /// boundaries; a changed unit/container must never inherit a battery fit.
-    pub(crate) fn same_battery_identity(&self, other: &Self) -> bool {
+    pub fn same_battery_identity(&self, other: &Self) -> bool {
         self.key == other.key
             && self.source == other.source
             && self.kind == other.kind
@@ -254,6 +256,12 @@ pub trait BatteryProvider: Send {
     fn id(&self) -> &'static str;
     fn poll(&mut self, hid: &dyn HidTransport, context: &PollContext<'_>) -> PollResult;
     fn diagnostics(&self) -> Vec<String>;
+    /// Ordered, unique vendor IDs whose HID collections this provider accesses.
+    fn hid_vendors(&self) -> &[u16] {
+        &[]
+    }
+    /// Refresh battery properties without starting a hotplug retry sequence.
+    fn refresh_properties(&mut self) {}
     /// Real connection events invalidate provider-specific connection caches.
     fn invalidate(&mut self) {}
     /// Additional scheduled retries (for delayed Windows battery properties).

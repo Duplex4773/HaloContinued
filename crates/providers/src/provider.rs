@@ -1003,12 +1003,8 @@ impl HidProvider {
                     let _ = s.feature(if d.parameter == 1 { 5 } else { 2 }, 64);
                 }
                 while c.active() && c.clock.monotonic() < deadline {
-                    let reply = match s.read(78, Duration::ZERO) {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
+                    let reply = controller_input(s, 78, deadline, c)?;
                     if reply.is_empty() {
-                        c.sleep(Duration::from_millis(5));
                         continue;
                     }
                     if bt && !c.playstation_full_mode && reply[0] == 1 {
@@ -1049,12 +1045,8 @@ impl HidProvider {
                 let deadline = (c.clock.monotonic() + Duration::from_millis(400)).min(c.deadline);
                 let mut reports = 0;
                 while c.active() && c.clock.monotonic() < deadline && reports < 16 {
-                    let reply = match s.read(64, Duration::ZERO) {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
+                    let reply = controller_input(s, 64, deadline, c)?;
                     if reply.is_empty() {
-                        c.sleep(Duration::from_millis(5));
                         continue;
                     }
                     reports += 1;
@@ -1842,6 +1834,35 @@ impl HidProvider {
 }
 include!("upstream114.rs");
 include!("upstream115.rs");
+// A timed HID read returns as soon as a report arrives. Bound cancellation
+// latency and pace transports which return an empty report before the timeout.
+fn controller_input(
+    session: &mut dyn HidSession,
+    len: usize,
+    deadline: Duration,
+    c: &PollContext<'_>,
+) -> Result<Vec<u8>, ProviderError> {
+    let start = c.clock.monotonic();
+    let timeout = deadline
+        .saturating_sub(start)
+        .min(Duration::from_millis(50));
+    let report = session.read(len, timeout)?;
+    if !c.active() {
+        return Err(ProviderError::new(
+            "Controller battery read cancelled or timed out",
+        ));
+    }
+    if c.clock.monotonic() > deadline {
+        return Ok(Vec::new());
+    }
+    if report.is_empty() {
+        let remaining = timeout.saturating_sub(c.clock.monotonic().saturating_sub(start));
+        if !remaining.is_zero() {
+            c.sleep(remaining);
+        }
+    }
+    Ok(report)
+}
 fn set_battery(r: &mut Reading, b: Battery) {
     r.level = Some(b.level);
     r.charging = b.charging;
@@ -2109,6 +2130,9 @@ fn candidate_group(id: &str, d: &Device, i: &HidInfo, infos: &[&HidInfo]) -> boo
     }
 }
 impl BatteryProvider for HidProvider {
+    fn hid_vendors(&self) -> &[u16] {
+        &self.vendors
+    }
     fn id(&self) -> &'static str {
         self.id
     }

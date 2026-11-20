@@ -22,6 +22,8 @@ pub fn connection_label_parts(key: &str, kind: &str, source: &str, via: &str) ->
         || model.is_some_and(|m| m.name.contains("(Wired)"))
     {
         "USB cable"
+    } else if source == "xinput" && via == "wireless" {
+        "Wireless"
     } else if via == "wireless"
         || model.is_some_and(|m| m.name.contains("(Wireless)") || m.name.contains("(Receiver)"))
         || source == "razer"

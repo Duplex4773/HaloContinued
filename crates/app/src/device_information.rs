@@ -90,7 +90,8 @@ fn connection_text(device: &ConfigurationDevice) -> String {
     let state = match device.connection {
         Connection::Online => "Connected",
         Connection::Sleeping => "Sleeping",
-        Connection::Stale => "Disconnected",
+        Connection::Stale => "Waiting for an update",
+        Connection::ConnectedLastKnown => "Connected",
     };
     format!("{transport} · {state}")
 }

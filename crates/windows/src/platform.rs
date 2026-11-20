@@ -192,11 +192,16 @@ impl Drop for Link {
         }
     }
 }
+struct CachedLevel {
+    level: u8,
+    observed: i64,
+    container: Option<String>,
+}
 #[derive(Default)]
 pub struct BluetoothProvider {
     links: BTreeMap<String, Link>,
     link_status: BTreeMap<String, Option<bool>>,
-    levels: BTreeMap<String, u8>,
+    levels: BTreeMap<String, CachedLevel>,
     readings: Vec<Reading>,
     snapshot_error: Option<ProviderError>,
     changed: Arc<AtomicBool>,
@@ -285,16 +290,38 @@ impl BluetoothProvider {
         }
         Ok(())
     }
-    fn battery_level(&mut self, mac: &str, reported: Option<u8>) -> Option<u8> {
-        if let Some(level) = reported {
-            self.levels.insert(mac.into(), level);
-        }
-        let level = self.levels.get(mac).copied();
-        if level.is_none() {
+    fn battery_level(&mut self, mac: &str, node: &Node, now: i64) -> Option<(u8, i64)> {
+        // Never lend a Windows container's last reading to a replacement.
+        if self
+            .levels
+            .get(mac)
+            .is_some_and(|cached| cached.container != node.container)
+        {
+            self.levels.remove(mac);
             self.links.remove(mac);
             self.link_status.remove(mac);
         }
-        level
+        if let Some(level) = node.level {
+            if let Some(cached) = self.levels.get_mut(mac) {
+                cached.level = level;
+                cached.observed = now;
+            } else {
+                self.levels.insert(
+                    mac.into(),
+                    CachedLevel {
+                        level,
+                        observed: now,
+                        container: node.container.clone(),
+                    },
+                );
+            }
+        }
+        if let Some(cached) = self.levels.get(mac) {
+            return Some((cached.level, cached.observed));
+        }
+        self.links.remove(mac);
+        self.link_status.remove(mac);
+        None
     }
     fn snapshot(&mut self, c: &PollContext<'_>) -> PollResult {
         let set = DeviceSet(
@@ -397,7 +424,7 @@ impl BluetoothProvider {
         self.diagnostics.clear();
         for (mac, node) in nodes {
             // Nodes without battery evidence do not need a WinRT link.
-            let Some(level) = self.battery_level(&mac, node.level) else {
+            let Some((level, observed)) = self.battery_level(&mac, &node, clock.unix()) else {
                 continue;
             };
             let key = format!("bluetooth:{mac}");
@@ -430,7 +457,7 @@ impl BluetoothProvider {
             } else {
                 format!("Bluetooth {mac}")
             };
-            let mut r = Reading::new(key, name, "bluetooth", clock.unix());
+            let mut r = Reading::new(key, name, "bluetooth", observed);
             r.level = Some(level);
             r.serial = Some(mac.clone());
             r.container = node.container;
@@ -443,8 +470,7 @@ impl BluetoothProvider {
                 .unwrap_or(if node.audio { "headset" } else { "" })
                 .into();
             if node.level.is_none() {
-                r.connection = Connection::Stale;
-                r.approx = Some("Last battery level reported by Windows".into())
+                r.connection = Connection::ConnectedLastKnown;
             }
             out.push(r);
         }
@@ -455,6 +481,9 @@ impl BluetoothProvider {
     }
 }
 impl BatteryProvider for BluetoothProvider {
+    fn refresh_properties(&mut self) {
+        self.next_full = Duration::ZERO;
+    }
     fn id(&self) -> &'static str {
         "bluetooth"
     }
@@ -596,6 +625,9 @@ fn xinput_reading(
     r
 }
 impl BatteryProvider for ControllerProvider {
+    fn hid_vendors(&self) -> &[u16] {
+        &[0x20bc, 0x3537, 0x37d7]
+    }
     fn id(&self) -> &'static str {
         "xinput"
     }
@@ -646,7 +678,7 @@ impl BatteryProvider for ControllerProvider {
                 flydigi.push(out.len());
             }
             let bt = xbox_bluetooth(vendor, product);
-            r.via = if bt { "bluetooth" } else { "wireless" }.into();
+            r.via = controller_transport(raw.IsWireless().ok(), bt).into();
             if vendor_name.is_none()
                 && let Ok(report) = raw.TryGetBatteryReport()
             {
@@ -716,12 +748,67 @@ impl BatteryProvider for ControllerProvider {
     }
 }
 
+fn controller_transport(wireless: Option<bool>, bluetooth_model: bool) -> &'static str {
+    match wireless {
+        Some(false) => "usb",
+        _ if bluetooth_model => "bluetooth",
+        Some(true) => "wireless",
+        None => "",
+    }
+}
 fn single_vendor_controller(wgi_gamepads: usize, xinput_slots: usize) -> bool {
     wgi_gamepads == 1 && xinput_slots == 1
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn controller_transport_requires_evidence() {
+        assert_eq!(controller_transport(Some(false), true), "usb");
+        assert_eq!(controller_transport(Some(true), true), "bluetooth");
+        assert_eq!(controller_transport(Some(true), false), "wireless");
+        assert_eq!(controller_transport(None, false), "");
+    }
+    #[test]
+    fn missing_bluetooth_level_preserves_time_and_requires_the_same_container() {
+        let mut provider = BluetoothProvider::default();
+        let make = |container: &str, level| Node {
+            container: Some(container.to_owned()),
+            level,
+            ..Default::default()
+        };
+        let mut snapshot = |time, node| {
+            struct At(i64);
+            impl Clock for At {
+                fn unix(&self) -> i64 {
+                    self.0
+                }
+                fn monotonic(&self) -> Duration {
+                    Duration::from_secs(self.0 as u64)
+                }
+                fn sleep(&self, _: Duration) {
+                    unreachable!()
+                }
+            }
+            provider
+                .snapshot_from_nodes(
+                    BTreeMap::from([("unit".into(), node)]),
+                    &At(time),
+                    |_, _, _| Some(true),
+                )
+                .unwrap()
+        };
+        assert_eq!(snapshot(100, make("A", Some(75)))[0].timestamp, 100);
+        let cached = snapshot(160, make("A", None));
+        assert_eq!(cached[0].connection, Connection::ConnectedLastKnown);
+        assert_eq!((cached[0].timestamp, cached[0].level), (100, Some(75)));
+        assert!(!cached[0].online());
+        assert!(snapshot(220, make("B", None)).is_empty());
+        provider.complete_snapshot(Ok(vec![]), Duration::from_secs(220));
+        provider.refresh_properties();
+        assert!(provider.refresh_due(Duration::from_secs(222)));
+        assert!(provider.retries.is_empty());
+    }
     #[test]
     fn vendor_controller_requires_unambiguous_inventories_and_ignores_placeholders() {
         for wgi in 0..=3 {
@@ -742,12 +829,28 @@ mod tests {
             ..Default::default()
         };
         provider.link_status.insert("unrelated".into(), Some(true));
-        assert_eq!(provider.battery_level("unrelated", None), None);
+        assert_eq!(
+            provider.battery_level("unrelated", &Node::default(), 0),
+            None
+        );
         assert!(provider.links.is_empty());
         assert!(provider.link_status.is_empty());
         assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(60)));
-        assert_eq!(provider.battery_level("mouse", Some(42)), Some(42));
-        assert_eq!(provider.battery_level("mouse", None), Some(42));
+        assert_eq!(
+            provider.battery_level(
+                "mouse",
+                &Node {
+                    level: Some(42),
+                    ..Default::default()
+                },
+                100
+            ),
+            Some((42, 100))
+        );
+        assert_eq!(
+            provider.battery_level("mouse", &Node::default(), 160),
+            Some((42, 100))
+        );
     }
 
     #[test]
@@ -901,22 +1004,46 @@ mod tests {
     #[test]
     fn bluetooth_level_cache_tracks_inventory_and_retains_sleeping_paired_devices() {
         let mut provider = BluetoothProvider::default();
-        provider.levels.insert("sleeping-paired".into(), 75);
-        provider.levels.insert("removed-pairing".into(), 40);
+        provider.battery_level(
+            "sleeping-paired",
+            &Node {
+                level: Some(75),
+                ..Default::default()
+            },
+            1,
+        );
+        provider.battery_level(
+            "removed-pairing",
+            &Node {
+                level: Some(40),
+                ..Default::default()
+            },
+            1,
+        );
         let mut nodes = BTreeMap::new();
         nodes.insert("sleeping-paired".into(), Node::default());
         provider.retain_inventory(&nodes);
-        assert_eq!(provider.levels.get("sleeping-paired"), Some(&75));
+        assert_eq!(
+            provider.levels.get("sleeping-paired").map(|c| c.level),
+            Some(75)
+        );
         assert!(!provider.levels.contains_key("removed-pairing"));
         for index in 0..1000 {
             let mac = format!("new-pairing-{index}");
-            provider.levels.insert(mac.clone(), 50);
+            provider.battery_level(
+                &mac,
+                &Node {
+                    level: Some(50),
+                    ..Default::default()
+                },
+                1,
+            );
             nodes.retain(|key, _| key == "sleeping-paired");
             nodes.insert(mac, Node::default());
             provider.retain_inventory(&nodes);
             assert_eq!(provider.levels.len(), 2);
         }
-        assert_eq!(provider.levels["sleeping-paired"], 75);
+        assert_eq!(provider.levels["sleeping-paired"].level, 75);
     }
     #[test]
     fn service_node_mac_and_boundaries() {

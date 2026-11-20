@@ -6,7 +6,7 @@ use crate::{
 use hb_core::*;
 use std::collections::BTreeMap;
 
-pub const CONFIGURATION_VENDORS: &[u16] = &[0x1532, 0x1b1c, 0x1038, 0x0b05];
+pub const CONFIGURATION_VENDORS: &[u16] = &[0x0b05, 0x1038, 0x1532, 0x1b1c];
 pub const CORSAIR_UNAVAILABLE: &str = "Polling changes unavailable: this model requires a maintained software session, which is disabled by design.";
 const LIMIT: usize = 512;
 fn corsair_name(pid: u16) -> Option<&'static str> {

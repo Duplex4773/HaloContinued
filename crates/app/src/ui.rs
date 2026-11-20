@@ -1628,6 +1628,7 @@ struct State {
     page_host: Option<HWND>,
     page_scroll: i32,
     wheel_remainder: i32,
+    wheel_lines: Option<u32>,
     page_height: i32,
     more_options: bool,
     startup_initial: Option<bool>,
@@ -1851,6 +1852,7 @@ pub fn run(
                 page_host: None,
                 page_scroll: 0,
                 wheel_remainder: 0,
+                wheel_lines: None,
                 page_height: 0,
                 more_options: false,
                 startup_initial: None,
@@ -1951,6 +1953,17 @@ pub fn run(
         Ok(())
     }
 }
+fn wheel_movement(delta: i32, lines: u32, page: i32, remainder: &mut i32) -> i32 {
+    let distance = if lines == u32::MAX {
+        i64::from(page)
+    } else {
+        i64::from(lines) * 16
+    };
+    let scaled = i64::from(delta) * distance + i64::from(*remainder);
+    *remainder = (scaled % 120) as i32;
+    (scaled / 120).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 // Route pointer scrolling before dialog processing: closed combo boxes otherwise
 // consume wheel events as value changes. Only keyboard focus navigation may reveal
 // an offscreen control; pointer messages must never snap back to the old focus.
@@ -2081,6 +2094,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         let s = &mut *guard;
         if let Some(update) = tray_message_update(msg, taskbar) {
             if msg == WM_SETTINGCHANGE {
+                s.wheel_lines = None;
+                s.wheel_remainder = 0;
                 s.refresh_theme();
                 s.refresh_mouse_acceleration();
             }
@@ -2256,9 +2271,18 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_MOUSEWHEEL if Some(hwnd) == s.dashboard && s.page_host.is_some() => {
                 let delta = ((wp.0 >> 16) as u16 as i16) as i32;
-                s.wheel_remainder += delta * 48;
-                let movement = s.wheel_remainder / 120;
-                s.wheel_remainder %= 120;
+                let lines = *s
+                    .wheel_lines
+                    .get_or_insert_with(hb_windows::system::wheel_scroll_lines);
+                let page = if lines == u32::MAX {
+                    let host = s.page_host.unwrap();
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(host, &mut rect);
+                    rect.bottom.saturating_mul(96) / GetDpiForWindow(host).max(96) as i32
+                } else {
+                    0
+                };
+                let movement = wheel_movement(delta, lines, page, &mut s.wheel_remainder);
                 s.scroll_page(s.page_scroll.saturating_sub(movement));
                 LRESULT(0)
             }
@@ -6730,6 +6754,7 @@ fn device_detail(d: &DeviceView) -> String {
         Connection::Online => "Connected",
         Connection::Sleeping => "Sleeping",
         Connection::Stale => "Waiting for an update",
+        Connection::ConnectedLastKnown => "Connected",
     };
     format!(
         "{} · {} · {} · updated {}",
@@ -10899,6 +10924,7 @@ mod dashboard_lifecycle_tests {
                     page_host: None,
                     page_scroll: 0,
                     wheel_remainder: 0,
+                    wheel_lines: None,
                     page_height: 0,
                     more_options: false,
                     startup_initial: None,
@@ -12997,6 +13023,7 @@ mod dashboard_lifecycle_tests {
                     DispatchMessageW(&message);
                 }
             };
+            context.state.borrow_mut().wheel_lines = Some(3);
             let wheel = |delta: i16| WPARAM((delta as u16 as usize) << 16);
             let bottom = context.state.borrow().page_scroll;
             let focused = GetFocus();
@@ -13544,4 +13571,14 @@ mod audit_restore_regressions {
             assert!(ui.previous.is_empty());
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn wheel_respects_lines_page_disable_and_precise_deltas() {
+    let mut remainder = 0;
+    assert_eq!(wheel_movement(120, 0, 300, &mut remainder), 0);
+    assert_eq!(wheel_movement(-120, 7, 300, &mut remainder), -112);
+    assert_eq!(wheel_movement(60, u32::MAX, 301, &mut remainder), 150);
+    assert_eq!(wheel_movement(60, u32::MAX, 301, &mut remainder), 151);
 }

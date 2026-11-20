@@ -200,9 +200,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ProviderError> {
     }
     result
 }
+const MAX_SETTINGS_BYTES: u64 = 2 * 1024 * 1024;
+
 pub fn load_settings(path: &Path) -> Result<Settings, ProviderError> {
     // Bound startup allocations even if a damaged or replaced config is enormous.
-    const MAX_SETTINGS_BYTES: u64 = 2 * 1024 * 1024;
     let bytes = fs::File::open(path).and_then(|file| {
         if file.metadata()?.len() > MAX_SETTINGS_BYTES {
             return Err(std::io::Error::new(
@@ -278,10 +279,17 @@ fn preserve_damaged_settings(path: &Path) -> Result<(), ProviderError> {
 }
 
 pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), ProviderError> {
-    atomic_write(
-        path,
-        &serde_json::to_vec_pretty(settings).map_err(|e| ProviderError::new(e.to_string()))?,
-    )
+    let mut bytes =
+        serde_json::to_vec_pretty(settings).map_err(|e| ProviderError::new(e.to_string()))?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        bytes = serde_json::to_vec(settings).map_err(|e| ProviderError::new(e.to_string()))?;
+        if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(ProviderError::new(
+                "Settings exceed the file size limit. The previous settings were kept.",
+            ));
+        }
+    }
+    atomic_write(path, &bytes)
 }
 
 /// Explicit changes only: save and sync recovery data before a worker may write HID.
@@ -353,7 +361,10 @@ impl Serialize for StatusDevices<'_> {
                 name: &d.name,
                 level: d.reading.level,
                 charging: d.reading.charging.unwrap_or(false),
-                online: d.reading.online(),
+                online: matches!(
+                    d.reading.connection,
+                    hb_core::Connection::Online | hb_core::Connection::ConnectedLastKnown
+                ),
                 kind: &d.icon,
                 approx: &d.reading.approx,
                 low_alert_at: d.low_alert_at,
@@ -498,15 +509,10 @@ impl Store {
         transaction.commit().map_err(sql_error)?;
         self.last
             .retain(|_, observation| observation.reading.timestamp >= cutoff);
-        let index = self.usage_index.get_mut();
-        if self.db.total_changes() != changes
-            && (repair
-                || index
-                    .as_ref()
-                    .and_then(|i| i.bounds)
-                    .is_some_and(|(first, ..)| first < cutoff))
-        {
-            *index = None;
+        // Ordinary retention only removes a prefix. Rebase the bounded index
+        // on its next query; startup repair can also change interior metadata.
+        if repair && self.db.total_changes() != changes {
+            self.usage_index.get_mut().take();
         }
         Ok(())
     }
@@ -771,27 +777,85 @@ impl Store {
         let limit = max_points.clamp(2, 4096);
         let retained_since = until.saturating_sub(30 * 86400);
         let sql = if self.sequenced {
-            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC,sequence DESC"
+            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND (SELECT ts FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC LIMIT 1) IS NOT NULL ORDER BY ts DESC,sequence DESC"
         } else {
-            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC"
+            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND (SELECT ts FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC LIMIT 1) IS NOT NULL ORDER BY ts DESC,rowid DESC"
         };
         let mut query = self.db.prepare(sql).map_err(sql_error)?;
         let mut baseline = None;
+        let mut identity = None;
         let mut rows = query
             .query(params![key, retained_since, since.min(until)])
             .map_err(sql_error)?;
         while let Some(row) = rows.next().map_err(sql_error)? {
-            if let Some(reading) = history_reading(row, key).map_err(sql_error)?
-                && reading.level.is_some_and(|level| level <= 100)
+            let Some(reading) = history_reading(row, key).map_err(sql_error)? else {
+                continue;
+            };
+            if identity
+                .as_ref()
+                .is_some_and(|latest: &Reading| !latest.same_battery_identity(&reading))
             {
+                break;
+            }
+            if reading.level.is_some() {
                 baseline = Some(reading);
                 break;
             }
+            if identity.is_none() {
+                identity = Some(reading);
+            }
+        }
+        let mut interval =
+            self.query(key, since, until, limit - usize::from(baseline.is_some()))?;
+        // Downsampling keeps the endpoints. Start the visible trace again when
+        // a receiver slot belongs to a different battery; retain the raw rows.
+        if let Some(latest) = interval.last() {
+            if let Some(previous) = interval
+                .iter()
+                .rposition(|r| !latest.same_battery_identity(r))
+            {
+                let first_hint = &interval[previous + 1];
+                let mut start = first_hint.timestamp;
+                let mut find = self.db.prepare(
+                    "SELECT ts,payload FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC"
+                ).map_err(sql_error)?;
+                let mut rows = find
+                    .query(params![
+                        key,
+                        interval[previous].timestamp,
+                        first_hint.timestamp
+                    ])
+                    .map_err(sql_error)?;
+                while let Some(row) = rows.next().map_err(sql_error)? {
+                    let Some(r) = history_reading(row, key).map_err(sql_error)? else {
+                        continue;
+                    };
+                    if !latest.same_battery_identity(&r) {
+                        break;
+                    }
+                    start = r.timestamp;
+                }
+                interval = self.query(key, start, until, limit)?;
+                // Different devices can occupy the slot within the same second.
+                if let Some(last) = interval.last()
+                    && let Some(i) = interval
+                        .iter()
+                        .rposition(|r| !last.same_battery_identity(r))
+                {
+                    interval.drain(..=i);
+                }
+                return Ok(interval);
+            }
+            if baseline
+                .as_ref()
+                .is_some_and(|r| !latest.same_battery_identity(r))
+            {
+                baseline = None;
+            }
         }
         let Some(baseline) = baseline else {
-            return self.query(key, since, until, limit);
+            return Ok(interval);
         };
-        let mut interval = self.query(key, since, until, limit - 1)?;
         // The raw query reserves at least two endpoints. With a two-point chart,
         // retain the latest interval observation alongside the predecessor.
         if interval.len() > limit - 1 {
@@ -813,6 +877,8 @@ impl Store {
     ) -> Result<hb_core::HistorySeries, ProviderError> {
         use hb_core::{HistoryAxis, HistorySeries};
         use usage_sampler::Sample;
+        // Bounds, cache revision and both scans must see the same history flush.
+        let snapshot = self.db.unchecked_transaction().map_err(sql_error)?;
         let limit = max_points.clamp(2, 4096);
         let bounds_sql = if self.sequenced {
             "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1)"
@@ -830,7 +896,7 @@ impl Store {
                 },
             )
             .map_err(sql_error)?;
-        // flush/prune invalidate this cache when local history changes.
+        // Interior writes invalidate the index. Tail appends and retention reuse its overlap.
         // Check other connections here, but do not invalidate for unrelated
         // estimator checkpoints or polling-activity writes on this connection.
         let revision = self
@@ -842,9 +908,29 @@ impl Store {
             .as_ref()
             .is_some_and(|i| i.key == key && i.bounds == bounds && i.revision == revision)
         {
-            let mut fresh = usage_index::UsageIndex::new(key, bounds, revision);
-            fresh.total = self.stream_usage(key, until, None, |_, r, position, row| {
-                if r.level.is_some_and(|level| level <= 100) {
+            // Take ownership before any cancellable scan. A partial update
+            // must never become the cache for a later request.
+            let mut previous = index
+                .take()
+                .filter(|i| i.key == key && i.revision == revision);
+            if let Some(i) = previous.as_mut()
+                && !self.rebase_usage_index(i, key, bounds)?
+            {
+                previous = None;
+            }
+            let mut fresh =
+                previous.unwrap_or_else(|| usage_index::UsageIndex::new(key, None, revision));
+            let tail = fresh
+                .bounds
+                .map(|(_, _, timestamp, row)| usage_index::Checkpoint {
+                    timestamp,
+                    row,
+                    position: fresh.total,
+                });
+            fresh.total = self.stream_usage(key, until, tail, |_, r, position, row| {
+                if r.level.is_some_and(|level| level <= 100)
+                    && !tail.is_some_and(|old| (r.timestamp, row) == (old.timestamp, old.row))
+                {
                     fresh.push(usage_index::Checkpoint {
                         timestamp: r.timestamp,
                         row,
@@ -852,6 +938,7 @@ impl Store {
                     });
                 }
             })?;
+            fresh.bounds = bounds;
             *index = Some(fresh);
         }
         let total = index.as_ref().map_or(0, |i| i.total);
@@ -899,6 +986,7 @@ impl Store {
                 }
             },
         )?;
+        snapshot.commit().map_err(sql_error)?;
         let mut samples = Vec::with_capacity(limit);
         if let Some(sample) = first {
             samples.push(sample);
@@ -922,6 +1010,52 @@ impl Store {
             since,
             until: total,
         })
+    }
+    /// Reuse the overlap of two forward-moving windows. When the retention
+    /// boundary moves, only replay the short prefix up to a surviving checkpoint.
+    fn rebase_usage_index(
+        &self,
+        index: &mut usage_index::UsageIndex,
+        key: &str,
+        bounds: Option<(i64, i64, i64, i64)>,
+    ) -> Result<bool, ProviderError> {
+        let (
+            Some((old_first, old_first_row, old_last, old_last_row)),
+            Some((first, ordinal, last, end)),
+        ) = (index.bounds, bounds)
+        else {
+            return Ok(false);
+        };
+        let previous_first = (old_first, old_first_row);
+        let previous_last = (old_last, old_last_row);
+        if (first, ordinal) < previous_first
+            || (first, ordinal) > previous_last
+            || (last, end) < previous_last
+        {
+            return Ok(false);
+        }
+        if (first, ordinal) == previous_first {
+            return Ok(true);
+        }
+        let Some(anchor) = index.first_retained(first, ordinal) else {
+            return Ok(false);
+        };
+        let start = usage_index::Checkpoint {
+            timestamp: first,
+            row: ordinal,
+            position: 0,
+        };
+        let mut offset = None;
+        self.stream_usage(key, anchor.timestamp, Some(start), |_, r, position, row| {
+            if (r.timestamp, row) == (anchor.timestamp, anchor.row) {
+                offset = Some(anchor.position - position);
+            }
+        })?;
+        if let Some(offset) = offset {
+            index.rebase(first, ordinal, offset);
+            return Ok(true);
+        }
+        Ok(false)
     }
     fn stream_usage(
         &self,
@@ -1059,13 +1193,18 @@ impl Store {
                     // Normal checkpoints deserialize directly into their final
                     // representation. A malformed entry still permits recovery
                     // of valid neighbours through the tolerant fallback.
-                    let mut estimator =
-                        serde_json::from_str::<Estimator>(payload).unwrap_or_else(|_| {
-                            serde_json::from_str(payload)
-                                .map(|value| Estimator::from_value(value, now))
-                                .unwrap_or_default()
-                        });
-                    estimator.validate(now);
+                    let damaged = || rusqlite::Error::InvalidQuery;
+                    if !payload.trim_start().starts_with('{') { return Err(damaged()); }
+                    let estimator = match serde_json::from_str::<Estimator>(payload) {
+                        Ok(mut estimator) => { estimator.validate(now); estimator }
+                        Err(_) => {
+                            let value: serde_json::Value = serde_json::from_str(payload).map_err(|_| damaged())?;
+                            if !value.get("devices").is_some_and(|v| v.is_object()) { return Err(damaged()); }
+                            let recovered = Estimator::from_value(value, now);
+                            if recovered.devices.is_empty() { return Err(damaged()); }
+                            recovered
+                        }
+                    };
                     Ok(estimator)
                 },
             )
@@ -1234,9 +1373,12 @@ impl HistoryStore for Store {
         transaction.commit().map_err(sql_error)?;
         let index = self.usage_index.get_mut();
         if index.as_ref().is_some_and(|index| {
-            self.pending
-                .iter()
-                .any(|sample| sample.reading.key == index.key)
+            self.pending.iter().any(|sample| {
+                sample.reading.key == index.key
+                    && index
+                        .bounds
+                        .is_some_and(|(_, _, tail, _)| sample.reading.timestamp <= tail)
+            })
         }) {
             *index = None;
         }
@@ -1923,6 +2065,58 @@ mod tests {
         );
     }
     #[test]
+    fn calendar_drops_the_old_units_level_even_when_the_replacement_has_no_level() {
+        let (_dir, mut db) = baseline_store();
+        let mut r = Reading::new("slot", "Mouse", "test", 100);
+        r.serial = Some("first".into());
+        r.level = Some(82);
+        db.record(&r).unwrap();
+        r.serial = Some("second".into());
+        r.timestamp = 200;
+        r.level = None;
+        db.record(&r).unwrap();
+        db.flush().unwrap();
+        for since in [90, 190, 210] {
+            assert!(
+                db.query_with_baseline("slot", since, 220, 20)
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.level.is_none())
+            );
+        }
+        r.timestamp = 400;
+        r.level = Some(30);
+        db.record(&r).unwrap();
+        db.flush().unwrap();
+        let series = db.query_with_baseline("slot", 90, 410, 20).unwrap();
+        assert_eq!(
+            series.iter().map(|r| r.level).collect::<Vec<_>>(),
+            [None, Some(30)]
+        );
+    }
+    #[test]
+    fn downsampling_a_shared_slot_keeps_the_replacement_batterys_measurements() {
+        let (_dir, mut db) = baseline_store();
+        let mut r = Reading::new("slot", "Mouse", "test", 0);
+        for (ts, serial, level) in [
+            (1, "A", Some(5)),
+            (2, "A", Some(100)),
+            (3, "B", Some(58)),
+            (4, "B", Some(56)),
+            (5, "B", None),
+            (6, "B", None),
+        ] {
+            r.timestamp = ts;
+            r.serial = Some(serial.to_owned());
+            r.level = level;
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        let samples = db.query_with_baseline("slot", 0, 7, 3).unwrap();
+        assert!(samples.iter().all(|r| r.serial.as_deref() == Some("B")));
+        assert!(samples.iter().any(|r| r.level == Some(58)));
+    }
+    #[test]
     fn baseline_retention_is_relative_to_interval_end_and_inclusive() {
         let (_dir, mut store) = baseline_store();
         let until = 30 * 86400 + 100;
@@ -2301,6 +2495,104 @@ mod tests {
 mod usage_index_tests {
     use super::*;
     #[test]
+    fn append_and_rolling_retention_match_a_cold_query_with_bounded_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let mut store = Store::open(&path).unwrap();
+        let mut r = Reading::new("a", "Mouse", "test", 0);
+        r.level = Some(80);
+        r.charging = Some(false);
+        // Include sparse periods and same-second samples on both sides of the window.
+        let horizon = 30 * 86400;
+        for n in 0..4000 {
+            r.timestamp = if n < 1000 {
+                n * 60
+            } else {
+                horizon - (4000 - n) * 60
+            };
+            r.level = Some((100 - n % 51) as u8);
+            store.record(&r).unwrap();
+            if n % 61 == 0 {
+                r.level = Some(85);
+                store.record(&r).unwrap();
+            }
+        }
+        store.flush().unwrap();
+        store.query_usage("a", horizon, 600, 160).unwrap();
+        for n in 1..=4 {
+            r.timestamp = horizon + n * 60;
+            r.level = Some(63);
+            store.record(&r).unwrap();
+            store.flush().unwrap();
+            if n % 2 == 0 {
+                store.prune_expired(r.timestamp).unwrap();
+            }
+            store.usage_rows.set(0);
+            let fast = store.query_usage("a", r.timestamp, 600, 160).unwrap();
+            assert!(
+                store.usage_rows.get() < 800,
+                "replayed {} rows",
+                store.usage_rows.get()
+            );
+            let cold = Store::read_only(&path)
+                .unwrap()
+                .query_usage("a", r.timestamp, 600, 160)
+                .unwrap();
+            assert_eq!(format!("{fast:?}"), format!("{cold:?}"));
+        }
+    }
+    #[test]
+    fn usage_total_and_samples_share_a_snapshot_during_an_external_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let mut writer = Store::open(&path).unwrap();
+        let mut reading = Reading::new("mouse", "Mouse", "simulation", 0);
+        reading.level = Some(55);
+        reading.charging = Some(false);
+        for minute in 0..400 {
+            reading.timestamp = minute * 60;
+            writer.record(&reading).unwrap();
+        }
+        writer.flush().unwrap();
+        let mut reader = Store::read_only(&path).unwrap();
+        let until = reading.timestamp;
+        reading.connection = hb_core::Connection::Sleeping;
+        let payload = serde_json::to_string(&reading).unwrap();
+        let mut updated = false;
+        reader
+            .db
+            .progress_handler(
+                1000,
+                Some(move || {
+                    if !updated {
+                        Connection::open(&path)
+                            .unwrap()
+                            .execute(
+                                "UPDATE readings SET payload=?1 WHERE device='mouse' AND ts=?2",
+                                params![payload, until],
+                            )
+                            .unwrap();
+                        updated = true;
+                    }
+                    false
+                }),
+            )
+            .unwrap();
+        let first = reader.query_usage("mouse", until, 600, 80).unwrap();
+        reader.db.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert_eq!(first.until, until);
+        assert_eq!(
+            first.samples.last().unwrap().reading.connection,
+            hb_core::Connection::Online
+        );
+        let second = reader.query_usage("mouse", until, 600, 80).unwrap();
+        assert_eq!(second.until, until - 60);
+        assert_eq!(
+            second.samples.last().unwrap().reading.connection,
+            hb_core::Connection::Sleeping
+        );
+    }
+    #[test]
     fn short_usage_queries_reuse_a_bounded_index_and_release_it_on_close() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
@@ -2390,5 +2682,52 @@ mod usage_index_tests {
         assert!(store.usage_rows.get() >= 4000);
         store.release_history_cache();
         assert!(store.usage_index.borrow().is_none());
+    }
+}
+
+#[cfg(test)]
+mod persistence_boundaries {
+    use super::*;
+    #[test]
+    fn invalid_checkpoint_is_preserved_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Store::open(&dir.path().join("history.db")).unwrap();
+        for broken in [r#"{"devices":{"unit":"#, "[]", "{}"] {
+            db.db
+                .execute(
+                    "INSERT OR REPLACE INTO state VALUES('estimator',?1)",
+                    [broken],
+                )
+                .unwrap();
+            assert!(db.try_load_estimator().is_err());
+            assert!(!db.create_estimator(&Estimator::default()).unwrap());
+            let saved: String = db
+                .db
+                .query_row("SELECT payload FROM state", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(saved, broken);
+        }
+    }
+    #[test]
+    fn large_settings_round_trip_or_preserve_the_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.json");
+        let mut settings = Settings {
+            low: 29,
+            ..Default::default()
+        };
+        for n in 0..11000 {
+            settings.device_mut(&format!("unit-{n}"));
+        }
+        save_settings(&file, &settings).unwrap();
+        let restored = load_settings(&file).unwrap();
+        assert_eq!(restored.low, 29);
+        assert_eq!(restored.devices.len(), 11000);
+        let saved = std::fs::read(&file).unwrap();
+        for n in 11000..22000 {
+            settings.device_mut(&format!("unit-{n}"));
+        }
+        assert!(save_settings(&file, &settings).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), saved);
     }
 }

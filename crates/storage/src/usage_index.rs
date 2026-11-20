@@ -44,6 +44,22 @@ impl UsageIndex {
         }
         self.points.push(point);
     }
+    pub fn first_retained(&self, timestamp: i64, row: i64) -> Option<Checkpoint> {
+        self.points
+            .iter()
+            .copied()
+            .find(|p| (p.timestamp, p.row) >= (timestamp, row))
+    }
+    pub fn rebase(&mut self, timestamp: i64, row: i64, offset: i64) {
+        self.points.retain_mut(|p| {
+            if (p.timestamp, p.row) < (timestamp, row) {
+                return false;
+            }
+            p.position -= offset;
+            true
+        });
+        self.total -= offset;
+    }
     #[cfg(test)]
     pub fn points_len_for_test(&self) -> usize {
         self.points.len()

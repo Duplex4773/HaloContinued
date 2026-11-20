@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, TryLockError,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -433,14 +433,13 @@ fn provider_queue_wait<'a>(
 }
 fn schedule_bluetooth_property_refresh(
     due: &mut BTreeMap<&str, Instant>,
-    last: &mut Option<Instant>,
+    pending: &mut Option<Instant>,
+    last_read: Option<Instant>,
     now: Instant,
 ) {
-    if last.is_some_and(|at| now.duration_since(at) < Duration::from_secs(10)) {
-        return;
-    }
-    *last = Some(now);
-    let next = now + Duration::from_secs(2);
+    let next = *pending.get_or_insert_with(|| {
+        (now + Duration::from_secs(2)).max(last_read.map_or(now, |at| at + Duration::from_secs(10)))
+    });
     due.entry("bluetooth")
         .and_modify(|at| *at = (*at).min(next))
         .or_insert(next);
@@ -778,6 +777,7 @@ impl ControlPermission {
     }
 }
 struct Lifecycle {
+    device_events: (DeviceSignals, Receiver<()>),
     cancel: Arc<AtomicBool>,
     permission: Arc<ControlPermission>,
     configuration: Arc<ConfigurationWatch>,
@@ -810,7 +810,7 @@ struct WorkerAccess {
 // Never hold some vendor gates while waiting for another: a stuck native call
 // must not indefinitely occupy both I/O workers or lock unrelated vendors.
 fn acquire_vendor_gates<'a>(
-    vendors: &BTreeSet<u16>,
+    vendors: &[u16],
     gates: &'a BTreeMap<u16, Mutex<()>>,
     deadline: Instant,
     cancelled: impl Fn() -> bool,
@@ -821,7 +821,8 @@ fn acquire_vendor_gates<'a>(
             return None;
         }
         let mut blocked = false;
-        for gate in vendors.iter().filter_map(|vendor| gates.get(vendor)) {
+        for vendor in vendors {
+            let gate = gates.get(vendor)?;
             match gate.try_lock() {
                 Ok(guard) => guards.push(guard),
                 Err(TryLockError::Poisoned(error)) => guards.push(error.into_inner()),
@@ -960,6 +961,7 @@ impl PowerSignals {
 }
 
 pub struct Runtime {
+    device_signals: DeviceSignals,
     commands: Sender<Command>,
     pub events: Receiver<Event>,
     thread: Option<JoinHandle<()>>,
@@ -978,7 +980,9 @@ impl Runtime {
         let cancelled = cancel.clone();
         let permission = Arc::new(ControlPermission::for_settings(&settings));
         let configuration = Arc::new(ConfigurationWatch::default());
+        let (device_signals, device_events) = DeviceSignals::channel();
         let lifecycle = Lifecycle {
+            device_events: (device_signals.clone(), device_events),
             cancel: cancelled,
             permission: permission.clone(),
             configuration: configuration.clone(),
@@ -994,6 +998,7 @@ impl Runtime {
             .stack_size(512 * 1024)
             .spawn(move || run(dir, settings, simulate, hid, lifecycle, rx, output))?;
         Ok(Self {
+            device_signals,
             commands,
             events: events_rx,
             thread: Some(thread),
@@ -1025,6 +1030,10 @@ impl Runtime {
     }
     pub fn send(&self, command: Command) {
         let command = match command {
+            Command::TopologyChanged | Command::BluetoothPropertiesChanged => {
+                self.device_signals.notify(command);
+                return;
+            }
             Command::ConfigurationVisible(visible) => {
                 if !self.configuration.set_visible(visible) {
                     return;
@@ -1264,6 +1273,42 @@ fn device_event(id: &str, topology: impl FnOnce() -> bool) -> Option<Command> {
         bluetooth.then_some(Command::BluetoothPropertiesChanged)
     }
 }
+// A full wake queue already guarantees a visit by the owner. Preserve the
+// strongest notification independently until the owner consumes it.
+#[derive(Clone)]
+struct DeviceSignals {
+    pending: Arc<AtomicU8>,
+    wake: Sender<()>,
+}
+impl DeviceSignals {
+    fn channel() -> (Self, Receiver<()>) {
+        let (wake, receiver) = bounded(1);
+        (
+            Self {
+                pending: Arc::default(),
+                wake,
+            },
+            receiver,
+        )
+    }
+    fn notify(&self, command: Command) {
+        let bit = match command {
+            Command::TopologyChanged => 2,
+            Command::BluetoothPropertiesChanged => 1,
+            _ => unreachable!("not a device notification"),
+        };
+        if self.pending.fetch_or(bit, Ordering::AcqRel) == 0 {
+            let _ = self.wake.try_send(());
+        }
+    }
+    fn take(&self) -> Command {
+        if self.pending.swap(0, Ordering::AcqRel) & 2 != 0 {
+            Command::TopologyChanged
+        } else {
+            Command::BluetoothPropertiesChanged
+        }
+    }
+}
 /// The watcher's initial listing is discovery, not a connection transition.
 /// Providers already perform startup discovery; forwarding that listing would
 /// revoke a startup polling readback once for every installed HID device.
@@ -1272,11 +1317,11 @@ struct DeviceEventGate {
     enumeration_completed: AtomicBool,
 }
 impl DeviceEventGate {
-    fn forward(&self, commands: &Sender<Command>, id: &str, topology: impl FnOnce() -> bool) {
+    fn forward(&self, commands: &DeviceSignals, id: &str, topology: impl FnOnce() -> bool) {
         if self.enumeration_completed.load(Ordering::Acquire)
             && let Some(event) = device_event(id, topology)
         {
-            let _ = commands.try_send(event);
+            commands.notify(event);
         }
     }
 }
@@ -1288,7 +1333,7 @@ struct DeviceEvents {
     enumeration_completed: Option<i64>,
 }
 impl DeviceEvents {
-    fn new(commands: &Sender<Command>) -> Option<Self> {
+    fn new(commands: &DeviceSignals) -> Option<Self> {
         let watcher = DeviceInformation::CreateWatcher().ok()?;
         let gate = Arc::new(DeviceEventGate::default());
         let completed_gate = gate.clone();
@@ -1872,7 +1917,7 @@ fn worker(
     hid: Arc<WindowsHid>,
     cancel: Arc<AtomicBool>,
     winrt: bool,
-    commands: Sender<Command>,
+    commands: DeviceSignals,
     access: Arc<WorkerAccess>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -1888,7 +1933,7 @@ fn worker(
             let controller_token = if winrt {
                 let tx = commands.clone();
                 RawGameController::RawGameControllerAdded(&EventHandler::new(move |_, _| {
-                    let _ = tx.try_send(Command::TopologyChanged);
+                    tx.notify(Command::TopologyChanged);
                     Ok(())
                 }))
                 .ok()
@@ -1897,7 +1942,7 @@ fn worker(
             };
             let removed_token = if winrt {
                 RawGameController::RawGameControllerRemoved(&EventHandler::new(move |_, _| {
-                    let _ = commands.try_send(Command::TopologyChanged);
+                    commands.notify(Command::TopologyChanged);
                     Ok(())
                 }))
                 .ok()
@@ -1913,42 +1958,17 @@ fn worker(
                 // used by a protocol family, including multi-collection sessions.
                 // It prevents interleaving shared-vendor protocols without locking
                 // individual opens (Logitech opens both long and short channels).
-                let vendors: BTreeSet<_> = match &job {
-                    WorkerJob::Hdr(_) => BTreeSet::new(),
-                    WorkerJob::Battery(job) => hb_providers::catalog::DEVICES
-                        .iter()
-                        .filter(|d| d.provider == job.provider.id())
-                        .map(|d| d.vid)
-                        .collect(),
-                    WorkerJob::Sleep(request, _, _, _, _) => {
-                        control_vendors(&request.target.device.source)
-                            .into_iter()
-                            .collect()
-                    }
-                    WorkerJob::DeviceInfo(request, _, _) => {
-                        control_vendors(&request.target.device.source)
-                            .into_iter()
-                            .collect()
-                    }
-                    WorkerJob::Dpi(request, _, _, _) => {
-                        control_vendors(&request.target.device.source)
-                            .into_iter()
-                            .collect()
-                    }
-                    WorkerJob::Polling(request, _, _, _, _, _) => {
-                        control_vendors(&request.target.device.source)
-                            .into_iter()
-                            .collect()
-                    }
-                    WorkerJob::Configuration(_, _, _) => {
-                        hb_providers::configuration::CONFIGURATION_VENDORS
-                            .iter()
-                            .copied()
-                            .collect()
-                    }
+                let vendors: &[u16] = match &job {
+                    WorkerJob::Hdr(_) => &[],
+                    WorkerJob::Battery(job) => job.provider.hid_vendors(),
+                    WorkerJob::Sleep(request, ..) => control_vendors(&request.target.device.source),
+                    WorkerJob::DeviceInfo(request, ..) => control_vendors(&request.target.device.source),
+                    WorkerJob::Dpi(request, ..) => control_vendors(&request.target.device.source),
+                    WorkerJob::Polling(request, ..) => control_vendors(&request.target.device.source),
+                    WorkerJob::Configuration(..) => hb_providers::configuration::CONFIGURATION_VENDORS,
                 };
                 let Some(_guards) = acquire_vendor_gates(
-                    &vendors,
+                    vendors,
                     &access.gates,
                     Instant::now() + Duration::from_secs(30),
                     || {
@@ -2222,15 +2242,15 @@ fn worker(
         })
         .expect("create I/O worker")
 }
-fn control_vendors(source: &str) -> Vec<u16> {
+fn control_vendors(source: &str) -> &'static [u16] {
     match source {
-        "razer" => vec![0x1532],
-        "logitech" => vec![0x046d],
-        "mchose" => vec![0x3837],
-        "corsair" => vec![0x1b1c],
-        "steelseries" => vec![0x1038],
-        "asus" => vec![0x0b05],
-        _ => Vec::new(),
+        "razer" => &[0x1532],
+        "logitech" => &[0x046d],
+        "mchose" => &[0x3837],
+        "corsair" => &[0x1b1c],
+        "steelseries" => &[0x1038],
+        "asus" => &[0x0b05],
+        _ => &[],
     }
 }
 struct InventoryTransport<'a> {
@@ -3739,6 +3759,7 @@ fn run(
     let mut saver_dirty = true;
     let mut saver_generation = hid.generation();
     let Lifecycle {
+        device_events: (device_signals, event_rx),
         cancel,
         permission,
         configuration,
@@ -3761,16 +3782,21 @@ fn run(
     let (jobs, job_rx) = bounded(2);
     let (winrt, winrt_rx) = bounded(2);
     let (results, result_rx) = bounded(4);
-    let (event_tx, event_rx) = bounded(8);
     let mut workers = Vec::new();
+    let mut providers: BTreeMap<&str, Box<dyn BatteryProvider>> = hb_providers::providers()
+        .into_iter()
+        .map(|p| (p.id(), p))
+        .collect();
+    providers.insert("bluetooth", Box::new(BluetoothProvider::default()));
+    providers.insert("xinput", Box::new(ControllerProvider));
     let gates = Arc::new(WorkerAccess {
         storage: storage.clone(),
         recovery: recovery.clone(),
         permission: permission.clone(),
         configuration: configuration.clone(),
-        gates: hb_providers::catalog::DEVICES
-            .iter()
-            .map(|d| d.vid)
+        gates: providers
+            .values()
+            .flat_map(|provider| provider.hid_vendors().iter().copied())
             .chain(
                 hb_providers::configuration::CONFIGURATION_VENDORS
                     .iter()
@@ -3789,7 +3815,7 @@ fn run(
             hid.clone(),
             cancel.clone(),
             false,
-            event_tx.clone(),
+            device_signals.clone(),
             gates.clone(),
         ))
     }
@@ -3799,22 +3825,17 @@ fn run(
         hid.clone(),
         cancel.clone(),
         true,
-        event_tx,
+        device_signals.clone(),
         gates,
     ));
     drop(results);
-    let mut providers: BTreeMap<&str, Box<dyn BatteryProvider>> = hb_providers::providers()
-        .into_iter()
-        .map(|p| (p.id(), p))
-        .collect();
-    providers.insert("bluetooth", Box::new(BluetoothProvider::default()));
-    providers.insert("xinput", Box::new(ControllerProvider));
     let mut inflight = 0usize;
     let mut hdr_busy = false;
     let mut due: BTreeMap<&str, Instant> =
         providers.keys().map(|id| (*id, Instant::now())).collect();
     let mut invalidated = BTreeSet::new();
     let mut last_bluetooth_refresh = None;
+    let mut bluetooth_property_due = None;
     let mut diagnostics = BTreeMap::new();
     let mut diagnostics_dirty = true;
     let mut snapshots = SnapshotPublisher::new(Instant::now());
@@ -4106,6 +4127,13 @@ fn run(
                     &jobs
                 };
                 let mut provider = providers.remove(id).unwrap();
+                if id == "bluetooth"
+                    && bluetooth_property_due.is_some_and(|at| Instant::now() >= at)
+                {
+                    provider.refresh_properties();
+                    bluetooth_property_due = None;
+                    last_bluetooth_refresh = Some(Instant::now());
+                }
                 if invalidated.remove(id) {
                     provider.invalidate();
                 }
@@ -4257,7 +4285,7 @@ fn run(
         let work = if let Some(command) = startup_command.or(boost_command).or(saver_command) {
             Work::Command(Ok(command))
         } else {
-            select! {recv(commands)->m=>Work::Command(m),recv(event_rx)->m=>Work::Command(m),recv(result_rx)->r=>Work::Completed(r),default(wait)=>Work::Idle}
+            select! {recv(commands)->m=>Work::Command(m),recv(event_rx)->m=>Work::Command(m.map(|()| device_signals.take())),recv(result_rx)->r=>Work::Completed(r),default(wait)=>Work::Idle}
         };
         let observed_now = clock.unix();
         if synchronize_battery_clock(&mut engine, &mut usage_tracker, observed_now) {
@@ -4422,7 +4450,8 @@ fn run(
                 if !suspended && !quiet && engine.settings.enabled("bluetooth") {
                     schedule_bluetooth_property_refresh(
                         &mut due,
-                        &mut last_bluetooth_refresh,
+                        &mut bluetooth_property_due,
+                        last_bluetooth_refresh,
                         Instant::now(),
                     );
                 }
@@ -4528,6 +4557,11 @@ fn run(
                     quiet,
                 );
                 schedule_completed_provider(&mut due, id, Instant::now(), delay);
+                if id == "bluetooth"
+                    && let Some(next) = bluetooth_property_due
+                {
+                    due.entry(id).and_modify(|at| *at = (*at).min(next));
+                }
                 providers.insert(id, r.provider);
                 usage_tracker.synchronize(
                     hid.generation(),
@@ -7270,17 +7304,23 @@ mod tests {
             assert!(invalidated.contains(id));
         }
         due.clear();
-        let mut last = None;
-        schedule_bluetooth_property_refresh(&mut due, &mut last, now);
+        let mut pending = None;
+        schedule_bluetooth_property_refresh(&mut due, &mut pending, None, now);
         assert_eq!(
             due,
             BTreeMap::from([("bluetooth", now + Duration::from_secs(2))])
         );
+        let last_read = pending.take();
         due.clear();
-        schedule_bluetooth_property_refresh(&mut due, &mut last, now + Duration::from_secs(9));
-        assert!(due.is_empty());
-        schedule_bluetooth_property_refresh(&mut due, &mut last, now + Duration::from_secs(10));
-        assert_eq!(due["bluetooth"], now + Duration::from_secs(12));
+        for seconds in [9, 10, 13] {
+            schedule_bluetooth_property_refresh(
+                &mut due,
+                &mut pending,
+                last_read,
+                now + Duration::from_secs(seconds),
+            );
+            assert_eq!(due["bluetooth"], now + Duration::from_secs(12));
+        }
     }
     #[test]
     fn failed_collection_preserves_sibling_and_unrelated_provider_results_with_bounded_retry() {
@@ -7960,6 +8000,7 @@ mod tests {
             let configuration = Arc::new(ConfigurationWatch::default());
             configuration.set_visible(true);
             let runtime = Runtime {
+                device_signals: DeviceSignals::channel().0,
                 commands,
                 events,
                 thread: None,
@@ -9278,7 +9319,7 @@ mod tests {
     }
     #[test]
     fn device_watcher_initial_inventory_does_not_invalidate_startup_readback() {
-        let (commands, received) = bounded(8);
+        let (commands, received) = DeviceSignals::channel();
         let gate = DeviceEventGate::default();
         for id in [
             "HID#initial-mouse",
@@ -9298,12 +9339,19 @@ mod tests {
             ("Bluetooth-removed-keyboard", true),
         ] {
             gate.forward(&commands, id, || arrival_or_removal);
-            let event = received.try_recv().unwrap();
+            received.try_recv().unwrap();
+            let event = commands.take();
             assert!(matches!(
                 (event, arrival_or_removal),
                 (Command::TopologyChanged, true) | (Command::BluetoothPropertiesChanged, false)
             ));
         }
+        for _ in 0..32 {
+            gate.forward(&commands, "BTH-changed", || false);
+        }
+        gate.forward(&commands, "HID#reconnected", || true);
+        received.try_recv().unwrap();
+        assert!(matches!(commands.take(), Command::TopologyChanged));
         gate.forward(&commands, "USB-unrelated-storage", || true);
         gate.forward(&commands, "HID#unchanged-connection", || false);
         assert!(received.try_recv().is_err());
@@ -9705,6 +9753,7 @@ mod tests {
         commands.send(Command::Refresh).unwrap();
         let (event_tx, events) = bounded(1);
         let runtime = Runtime {
+            device_signals: DeviceSignals::channel().0,
             configuration: Arc::new(ConfigurationWatch::default()),
             commands,
             events,
@@ -9785,7 +9834,8 @@ mod tests {
     #[test]
     fn vendor_gate_timeout_releases_other_gates_and_never_claims_a_write() {
         let gates = BTreeMap::from([(1, Mutex::new(())), (2, Mutex::new(()))]);
-        let vendors = BTreeSet::from([1, 2]);
+        let vendors = [1, 2];
+        assert!(acquire_vendor_gates(&[99], &gates, Instant::now(), || false).is_none());
         let held = gates[&2].lock().unwrap();
         assert!(acquire_vendor_gates(&vendors, &gates, Instant::now(), || false).is_none());
         assert!(
@@ -9824,6 +9874,7 @@ mod tests {
         let (event_tx, events) = bounded(8);
         let permission = Arc::new(ControlPermission::new(true));
         let runtime = Runtime {
+            device_signals: DeviceSignals::channel().0,
             configuration: Arc::new(ConfigurationWatch::default()),
             commands,
             events,
@@ -9868,6 +9919,7 @@ mod tests {
         let (event_tx, events) = bounded(4);
         let permission = Arc::new(ControlPermission::new(true));
         let runtime = Runtime {
+            device_signals: DeviceSignals::channel().0,
             configuration: Arc::new(ConfigurationWatch::default()),
             commands,
             events,

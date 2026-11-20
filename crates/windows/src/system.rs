@@ -185,6 +185,23 @@ pub fn high_contrast() -> bool {
             && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
     }
 }
+pub fn wheel_scroll_lines() -> u32 {
+    let mut lines = 3u32;
+    if unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&mut lines as *mut u32).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok()
+    {
+        lines
+    } else {
+        3
+    }
+}
 /// Read account-wide pointer acceleration without accessing input or changing
 /// settings. The dashboard queries this only in response to UI events.
 pub fn mouse_acceleration() -> Result<bool, ProviderError> {

@@ -431,7 +431,12 @@ fn eightbitdo_passive_enhanced_bluetooth_and_usb_report_ids() {
 }
 #[test]
 fn eightbitdo_idle_unknown_mode_is_bounded_passive_and_explained() {
-    let h = FakeHid::new(vec![d("eightbitdo", 0x6006, EBT, "pad")], empty(80));
+    let h = FakeHid::new(
+        vec![d("eightbitdo", 0x6006, EBT, "pad")],
+        (0..8)
+            .map(|_| Step::ReadSized(64, Duration::from_millis(50), Ok(vec![])))
+            .collect(),
+    );
     let clock = FakeClock::default();
     let mut p = HidProvider::new("eightbitdo");
     let r = p
@@ -505,4 +510,22 @@ fn playstation_normalized_usb_collections_preserve_identity_without_blank_serial
     assert_eq!(r.len(), 1);
     assert!(!r[0].key.ends_with(':'));
     h.done();
+}
+
+#[test]
+fn controller_read_errors_preserve_transport_diagnostics() {
+    for (family, pid, path) in [("playstation", 0x0ce6, BT), ("eightbitdo", 0x6006, EBT)] {
+        let hid = FakeHid::new(
+            vec![d(family, pid, path, "pad")],
+            vec![Step::Read(Err("read failed"))],
+        );
+        let error = HidProvider::new(family)
+            .poll(
+                &hid,
+                &context(&FakeClock::default(), &AtomicBool::new(false)),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("read failed"));
+        hid.done();
+    }
 }
