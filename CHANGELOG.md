@@ -1,4 +1,6 @@
-# Unreleased
+# Halo Continued 1.1.8
+
+Released 20 November 2026 for Windows 11 x64.
 
 ## Device monitoring and dashboard
 
