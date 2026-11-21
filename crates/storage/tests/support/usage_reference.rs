@@ -24,63 +24,76 @@ pub fn query_usage(
     let since = total.saturating_sub(seconds.max(1)).max(0);
     let slots = limit.saturating_sub(2);
     let buckets = if slots == 2 { 1 } else { slots / 3 };
-    let mut extremes: Vec<Option<(HistorySample, HistorySample, Option<HistorySample>)>> =
-        vec![None; buckets];
+    let mut input = Vec::new();
     let mut baseline = None;
-    let mut first = None;
-    let mut flat_run = false;
-    let mut last: Option<HistorySample> = None;
     stream_usage(db, key, until, |reading, position| {
-        if !reading.level.is_some_and(|level| level <= 100) {
-            return;
-        }
-        let sample = HistorySample { reading, position };
-        if position < since {
-            baseline = Some(sample);
-            return;
-        }
-        if first.is_none() {
-            first = Some(baseline.take().unwrap_or_else(|| sample.clone()));
-        }
-        let anchor = last
-            .as_ref()
-            .filter(|p| slots >= 3 && flat_run && p.reading.level > sample.reading.level);
-        flat_run = last
-            .as_ref()
-            .is_some_and(|p| p.reading.level == sample.reading.level);
-        if buckets > 0 {
-            let span = total.saturating_sub(since).max(1);
-            let bucket = ((position.saturating_sub(since) as i128 * buckets as i128) / span as i128)
-                .min(buckets as i128 - 1) as usize;
-            if let Some((low, high, before_drop)) = &mut extremes[bucket] {
-                if before_drop.is_none() {
-                    *before_drop = anchor.cloned();
-                }
-                if sample.reading.level < low.reading.level {
-                    *low = sample.clone();
-                }
-                if sample.reading.level > high.reading.level {
-                    *high = sample.clone();
-                }
+        if reading.level.is_some_and(|l| l <= 100) {
+            let sample = HistorySample { reading, position };
+            if position < since {
+                baseline = Some(sample);
             } else {
-                extremes[bucket] = Some((sample.clone(), sample.clone(), anchor.cloned()));
+                input.extend(baseline.take());
+                input.push(sample);
             }
         }
-        last = Some(sample);
     })?;
-    let mut samples = Vec::with_capacity(limit);
-    if let Some(sample) = first {
-        samples.push(sample);
+    let mut edges = Vec::new();
+    for run in input.chunk_by(|a, b| {
+        a.reading.level == b.reading.level
+            && a.reading.online() == b.reading.online()
+            && a.reading.charging == b.reading.charging
+    }) {
+        edges.push((&run[0], false));
+        if run.len() > 1 {
+            edges.push((run.last().unwrap(), true));
+        }
     }
-    for (low, high, anchor) in extremes.into_iter().flatten() {
-        samples.extend([low, high]);
-        samples.extend(anchor);
-    }
-    if let Some(sample) = last {
-        samples.push(sample);
-    }
-    samples.sort_by_key(|sample| sample.reading.timestamp);
-    samples.dedup_by_key(|sample| sample.reading.timestamp);
+    let samples = if edges.len() <= limit {
+        edges.iter().map(|(s, _)| (*s).clone()).collect()
+    } else {
+        let mut samples = vec![
+            input.first().unwrap().clone(),
+            input.last().unwrap().clone(),
+        ];
+        let span = (total - since).max(1);
+        for i in 0..buckets {
+            let mut points = edges
+                .iter()
+                .enumerate()
+                .filter(|(_, (s, _))| {
+                    (((s.position - since).max(0) as i128 * buckets as i128 / span as i128)
+                        as usize)
+                        .min(buckets - 1)
+                        == i
+                })
+                .peekable();
+            if let Some(&(_, (first, _))) = points.peek() {
+                let (mut low, mut high, mut anchor) = (*first, *first, None);
+                for (n, (s, end)) in points {
+                    if s.reading.level < low.reading.level {
+                        low = s;
+                    }
+                    if s.reading.level > high.reading.level {
+                        high = s;
+                    }
+                    if slots >= 3
+                        && *end
+                        && anchor.is_none()
+                        && edges
+                            .get(n + 1)
+                            .is_some_and(|(next, _)| next.reading.level < s.reading.level)
+                    {
+                        anchor = Some(*s);
+                    }
+                }
+                samples.extend([low.clone(), high.clone()]);
+                samples.extend(anchor.cloned());
+            }
+        }
+        samples.sort_by_key(|s| s.reading.timestamp);
+        samples.dedup_by_key(|s| s.reading.timestamp);
+        samples
+    };
     Ok(HistorySeries {
         samples,
         axis: HistoryAxis::Usage,

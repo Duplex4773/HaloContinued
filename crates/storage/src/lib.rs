@@ -967,13 +967,9 @@ impl Store {
             });
         }
         let since = total.saturating_sub(seconds.max(1)).max(0);
-        let slots = limit.saturating_sub(2);
-        let buckets = if slots == 2 { 1 } else { slots / 3 };
-        let mut extremes: Vec<Option<(Sample, Sample, Option<Sample>)>> = vec![None; buckets];
-        let mut baseline: Option<Sample> = None;
-        let mut first = None;
-        let mut flat_run = false;
+        let mut edges = usage_sampler::ChartEdges::new(limit, since, total);
         let mut last: Option<Sample> = None;
+        let mut run_started = None;
         let checkpoint = index.as_ref().and_then(|i| i.before(since).or(i.segment));
         self.stream_usage(
             key,
@@ -983,65 +979,40 @@ impl Store {
                 if !reading.level.is_some_and(|level| level <= 100) {
                     return;
                 }
-                if position < since {
-                    baseline
-                        .get_or_insert_with(Sample::default)
+                let row = (reading.timestamp, ordinal);
+                if position >= since {
+                    if let Some(previous) = &last {
+                        let previous_row = (previous.timestamp, previous.ordinal);
+                        if run_started.is_none() {
+                            edges.push(previous, false);
+                            run_started = Some(previous_row);
+                        }
+                        if !previous.same_run(reading) {
+                            if run_started != Some(previous_row) {
+                                edges.push(previous, previous.level > reading.level);
+                            }
+                            run_started = None;
+                        }
+                    }
+                    let current = last.get_or_insert_with(Sample::default);
+                    current.replace(payload, reading, position, ordinal);
+                    if run_started.is_none() {
+                        edges.push(current, false);
+                        run_started = Some(row);
+                    }
+                } else {
+                    last.get_or_insert_with(Sample::default)
                         .replace(payload, reading, position, ordinal);
-                    return;
                 }
-                if first.is_none() {
-                    first = Some(baseline.take().unwrap_or_else(|| {
-                        let mut sample = Sample::default();
-                        sample.replace(payload, reading, position, ordinal);
-                        sample
-                    }));
-                }
-                if buckets > 0 {
-                    let span = total.saturating_sub(since).max(1);
-                    let bucket = ((position.saturating_sub(since) as i128 * buckets as i128)
-                        / span as i128)
-                        .min(buckets as i128 - 1) as usize;
-                    let (low, high, before_drop) = extremes[bucket].get_or_insert_with(|| {
-                        let mut sample = Sample::default();
-                        sample.replace(payload, reading, position, ordinal);
-                        (sample.clone(), sample, None)
-                    });
-                    if reading.level < low.level {
-                        low.replace(payload, reading, position, ordinal);
-                    }
-                    if reading.level > high.level {
-                        high.replace(payload, reading, position, ordinal);
-                    }
-                    if slots >= 3
-                        && flat_run
-                        && let Some(previous) = &last
-                        && previous.level > reading.level
-                        && before_drop.is_none()
-                    {
-                        *before_drop = Some(previous.clone());
-                    }
-                }
-                flat_run = last.as_ref().is_some_and(|old| old.level == reading.level);
-                last.get_or_insert_with(Sample::default)
-                    .replace(payload, reading, position, ordinal);
             },
         )?;
         snapshot.commit().map_err(sql_error)?;
-        let mut samples = Vec::with_capacity(limit);
-        if let Some(sample) = first {
-            samples.push(sample);
+        if let Some(last) = &last
+            && run_started != Some((last.timestamp, last.ordinal))
+        {
+            edges.push(last, false);
         }
-        for (low, high, before_drop) in extremes.into_iter().flatten() {
-            samples.extend([low, high]);
-            samples.extend(before_drop);
-        }
-        if let Some(sample) = last {
-            samples.push(sample);
-        }
-        // A timestamp alone does not identify an observation. Keep ordered
-        // same-second changes so the newest charge/rate transition stays visible.
-        samples.sort_by_key(|sample| (sample.timestamp, sample.ordinal));
-        samples.dedup_by_key(|sample| (sample.timestamp, sample.ordinal));
+        let samples = edges.finish(last);
         Ok(HistorySeries {
             samples: samples
                 .into_iter()
@@ -2389,6 +2360,43 @@ mod tests {
         assert_eq!(series.axis, hb_core::HistoryAxis::Usage);
         assert_eq!(series.samples.last().unwrap().reading.timestamp, 10480);
         assert_eq!(series.samples.last().unwrap().position, 180);
+    }
+    #[test]
+    fn usage_chart_keeps_both_edges_of_intermediate_plateaus_within_budget() {
+        let (_dir, mut store) = baseline_store();
+        for minute in 0..600 {
+            let level = match minute {
+                0..10 => 100,
+                10..130 => 80,
+                _ => 60,
+            };
+            usage_seed(
+                &mut store,
+                minute * 60,
+                Some(level),
+                hb_core::Connection::Online,
+                Some(false),
+            );
+        }
+        for budget in [6, 900] {
+            let series = store.query_usage("usage", 599 * 60, 86400, budget).unwrap();
+            let edges: Vec<_> = series
+                .samples
+                .iter()
+                .map(|s| (s.position / 60, s.reading.level.unwrap()))
+                .collect();
+            assert_eq!(
+                edges,
+                [
+                    (0, 100),
+                    (9, 100),
+                    (10, 80),
+                    (129, 80),
+                    (130, 60),
+                    (599, 60)
+                ]
+            );
+        }
     }
     #[test]
     fn dense_usage_preserves_the_last_confirmed_flat_sample_before_a_drop() {

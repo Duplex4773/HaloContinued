@@ -1686,11 +1686,11 @@ pub(crate) fn manual_handoff_owner(
         return None;
     }
     let key = device.shared_preference_key()?;
-    let saver = saver.wired_handoff_owner(&key, sleep);
+    let saver = saver.wired_handoff_owner(&key, device, sleep);
     let boost = if sleep {
         None
     } else {
-        boost.wired_handoff_owner(&key)
+        boost.wired_handoff_owner(&key, device)
     };
     if let (Some(a), Some(b)) = (saver, boost)
         && !a.same_control_unit(b)
@@ -2747,18 +2747,26 @@ fn recovery_reading_ready(reading: &Reading, now: i64) -> bool {
 }
 
 struct StartupPolling {
+    permission_epoch: u64,
     restore: StartupPollingRestore,
     reads: InitialPollingReads,
 }
 impl StartupPolling {
     fn new(settings: &Settings, now: Instant) -> Self {
         Self {
+            permission_epoch: 0,
             restore: StartupPollingRestore::new(settings, now),
             reads: InitialPollingReads::new(settings, now),
         }
     }
     fn active(&self) -> bool {
         self.reads.active() || !self.restore.pending.is_empty()
+    }
+    fn observe_permission(&mut self, epoch: u64, suspended: bool) {
+        if epoch != self.permission_epoch || suspended {
+            self.cancel();
+            self.permission_epoch = epoch;
+        }
     }
     fn blocks_automation(&self, now: Instant) -> bool {
         // A slow receiver must not extend the original automation startup wait.
@@ -2830,6 +2838,7 @@ impl StartupPollingRestore {
                 settings
                     .devices
                     .iter()
+                    .filter(|(key, p)| p.startup_rate_registered(key))
                     .filter_map(|(key, settings)| {
                         settings.requested_polling_rate.map(|rate| {
                             (
@@ -2858,19 +2867,58 @@ impl StartupPollingRestore {
     /// queued. Serial aliases here only cancel work; they never authorize it.
     fn cancel_device(&mut self, device: &ConfigurationDevice) {
         let alias = device.shared_preference_key();
-        self.pending.remove(&device.key);
-        if let Some(alias) = &alias {
-            self.pending.remove(alias);
-        }
+        self.remove_owned_choices(device, alias.as_deref());
         for (target, cancelled) in self.inflight.values() {
-            if target.key == device.key
-                || alias
-                    .as_ref()
-                    .is_some_and(|alias| target.shared_preference_key().as_ref() == Some(alias))
-            {
+            if target.same_control_unit(device) {
                 cancelled.store(true, Ordering::Release);
             }
         }
+    }
+    fn remove_owned_choices(&mut self, device: &ConfigurationDevice, alias: Option<&str>) {
+        for key in std::iter::once(device.key.as_str()).chain(alias) {
+            if self
+                .pending
+                .get(key)
+                .is_some_and(|(_, owner)| device.owns_polling_choice(owner.as_deref()))
+            {
+                self.pending.remove(key);
+            }
+        }
+    }
+    fn saved_rate(
+        &self,
+        key: &str,
+        preferred: &str,
+        owns: impl Fn(Option<&str>) -> bool,
+    ) -> Option<PollingRate> {
+        [preferred, key].into_iter().find_map(|k| {
+            let (rate, owner) = self.pending.get(k)?;
+            owns(owner.as_deref()).then_some(*rate)
+        })
+    }
+    fn needs_inventory(&self, engine: &Engine, keyboards: &[ConfigurationDevice]) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        engine.raw_readings().any(|r| {
+            r.online()
+                && r.kind == "mouse"
+                && polling_battery_source(&r.source)
+                && self
+                    .saved_rate(&r.key, engine.settings.preference_key(&r.key), |owner| {
+                        r.owns_polling_choice(owner)
+                    })
+                    .is_some()
+        }) || keyboards.iter().any(|d| {
+            d.online()
+                && d.kind == "keyboard"
+                && matches!(d.capability, PollingCapability::ReadWrite)
+                && self
+                    .saved_rate(&d.key, engine.settings.preference_key(&d.key), |owner| {
+                        d.owns_polling_choice(owner)
+                    })
+                    .is_some()
+        })
     }
     fn guard(&self, request: u64) -> Option<Arc<AtomicBool>> {
         self.inflight.get(&request).map(|(_, guard)| guard.clone())
@@ -2903,23 +2951,15 @@ impl StartupPollingRestore {
             if !device.online() || !supported {
                 continue;
             }
-            let preference_key = device
-                .shared_preference_key()
-                .unwrap_or_else(|| device.key.clone());
-            let saved_key = if self.pending.contains_key(&preference_key) {
-                &preference_key
-            } else {
-                &device.key
-            };
-            let Some((rate, owner)) = self.pending.get(saved_key) else {
+            let alias = device.shared_preference_key();
+            let Some(rate) = self.saved_rate(
+                &device.key,
+                alias.as_deref().unwrap_or(&device.key),
+                |owner| device.owns_polling_choice(owner),
+            ) else {
                 continue;
             };
-            if !device.owns_polling_choice(owner.as_deref()) {
-                continue;
-            }
-            let rate = *rate;
-            self.pending.remove(&preference_key);
-            self.pending.remove(&device.key);
+            self.remove_owned_choices(&device, alias.as_deref());
             if device.kind == "mouse"
                 && !hb_providers::controls::polling_menu_rates(&device).contains(&rate.hz())
             {
@@ -3575,6 +3615,20 @@ impl UsageTracker {
         self.device_sessions.clear();
         self.connections.clear();
     }
+    fn stale_completion(&self, outcome: &ControlOutcome, generation: u64) -> bool {
+        outcome.target().is_some_and(|t| {
+            (!outcome.may_have_changed && t.generation != generation)
+                || outcome.failure.is_some()
+                    && self.rates.get(&outcome.key).is_some_and(|rate| {
+                        let current = &rate.observation.target;
+                        !current.device.same_control_unit(&t.device)
+                            || current
+                                .connection_stamp
+                                .zip(t.connection_stamp)
+                                .is_some_and(|(a, b)| a != b)
+                    })
+        })
+    }
     fn observe(&mut self, outcome: &ControlOutcome) {
         // Configuration-only keyboards have no battery observations to learn.
         if outcome
@@ -4086,9 +4140,8 @@ fn run(
         let requested_suspend = permission.suspended.load(Ordering::Acquire);
         // Revocation is immediate even if its command/settings acknowledgment
         // is queued. Re-enabling during this process cannot restart restoration.
-        if permission.epoch.load(Ordering::Acquire) != 0 || requested_suspend {
-            startup_polling.cancel();
-        }
+        startup_polling
+            .observe_permission(permission.epoch.load(Ordering::Acquire), requested_suspend);
         if requested_suspend != suspended {
             snapshots.changed = true;
             suspended = requested_suspend;
@@ -4147,10 +4200,12 @@ fn run(
             }
         }
         startup_polling.reads.expire_initial(Instant::now());
-        if !suspended && !stop && boost.due(Instant::now()) && boost.wanted(&engine.settings) {
-            boost.sample(
+        if !suspended && !stop {
+            boost.sample_if_needed(
                 Instant::now(),
-                hb_windows::system::fullscreen_polling_state(),
+                &engine.settings,
+                engine.raw_readings(),
+                hb_windows::system::fullscreen_polling_state,
             );
         }
         // Capture changes before snapshot publication clears its dirty flag.
@@ -4341,6 +4396,11 @@ fn run(
             (visible && configuration_valid && configuration_generation == hid.generation())
                 .then(|| configuration.epoch.load(Ordering::Acquire));
         let startup_worker_available = simulate || !jobs.is_full();
+        if !startup_polling.restore.pending.is_empty()
+            && Instant::now() >= startup_polling.restore.until
+        {
+            startup_polling.restore.cancel();
+        }
         let initial_read_window = startup_polling.reads.initial_open;
         let initial_work = initial_read_window || !startup_polling.restore.pending.is_empty();
         let readback_ready = startup_polling.active()
@@ -4351,13 +4411,19 @@ fn run(
                 || (inflight == 0
                     && commands.is_empty()
                     && !boost.ready(&engine.settings, |id| engine.provider_readings(id))))
-            && (!startup_polling.restore.pending.is_empty()
-                || startup_polling.reads.needs_inventory(
-                    Instant::now(),
-                    clock.unix(),
-                    engine.raw_readings(),
-                    &configuration_devices,
-                ));
+            && (startup_polling.restore.needs_inventory(
+                &engine,
+                if keyboard_epoch.is_some() {
+                    &configuration_devices
+                } else {
+                    &[]
+                },
+            ) || startup_polling.reads.needs_inventory(
+                Instant::now(),
+                clock.unix(),
+                engine.raw_readings(),
+                &configuration_devices,
+            ));
         let startup_command =
             if !startup_polling.active() || !startup_worker_available || !readback_ready {
                 None
@@ -5125,6 +5191,9 @@ fn run(
                         clock.unix(),
                     );
                     handoff = manual_handoff_owner(&request.target.device, false, &saver, &boost);
+                    if let Some(owner) = handoff.as_deref() {
+                        startup_polling.restore.cancel_device(owner);
+                    }
                     saver.manual(&request.target.device, false);
                     boost.manual_device(&request.target.device);
                 }
@@ -5314,11 +5383,15 @@ fn run(
                     && !suspended
                     && !stop
                     && configuration_epoch.is_none_or(|epoch| configuration.active(epoch));
-                let stale_read = !outcome.may_have_changed
-                    && outcome
-                        .observation
-                        .as_ref()
-                        .is_some_and(|o| o.target.generation != hid.generation());
+                let stale_read = usage_tracker.stale_completion(&outcome, hid.generation())
+                    || outcome.target().is_some_and(|target| {
+                        engine
+                            .provider_readings(&target.device.source)
+                            .iter()
+                            .any(|r| {
+                                r.key == target.device.key && !target.device.matches_reading(r)
+                            })
+                    });
                 let publish = finish_polling_completion(
                     &mut boost,
                     &mut saver,
@@ -5340,7 +5413,7 @@ fn run(
                         &mut deferred_recovery_rearms,
                     );
                 }
-                if changed_configuration(&outcome, &mut observed_rates) {
+                if !stale_read && changed_configuration(&outcome, &mut observed_rates) {
                     engine.reset_estimate(&outcome.key);
                     snapshots.changed = true;
                     let _ = storage.send(estimator_state(&engine.estimator, &observed_rates));
@@ -9724,6 +9797,77 @@ mod tests {
         }
     }
     #[test]
+    fn unchanged_permission_epoch_allows_fresh_recovery_reads_only() {
+        let now = Instant::now();
+        let sample = recovery_sample(1000, 11);
+        let mut startup = StartupPolling::new(&startup_settings(), now);
+        for epoch in [1, 2] {
+            startup.observe_permission(epoch, true);
+            assert!(!startup.active());
+            startup.observe_permission(epoch, false);
+            startup
+                .reads
+                .observe_usage(std::slice::from_ref(&sample), true, now, 1000);
+            startup.observe_permission(epoch, false);
+            let Some(Command::Polling(request, _, _)) = startup.next(
+                now,
+                epoch,
+                7,
+                std::iter::once(ConfigurationDevice::from_reading(&sample.reading)),
+                None,
+                true,
+            ) else {
+                panic!("fresh recovery GET was lost")
+            };
+            assert_eq!(request.action, ControlAction::Read);
+            assert!(startup.restore.pending.is_empty());
+        }
+    }
+    #[test]
+    fn late_failed_get_cannot_invalidate_replacement_rate_evidence() {
+        let mut request = control_request(ControlAction::Read, 7);
+        request.target.device.container = Some("new-receiver".into());
+        let mut tracker = UsageTracker::new(7, true);
+        let result = simulate_control(&request, &mut 1000.try_into().unwrap(), 7, 1000);
+        tracker.observe(&result);
+        let current = ControlOutcome::failed(&request, "busy");
+        assert!(!tracker.stale_completion(&current, 7));
+        request.target.device.container = Some("previous-receiver".into());
+        assert!(tracker.stale_completion(&ControlOutcome::failed(&request, "busy"), 7));
+        request.target.device.container = Some("new-receiver".into());
+        request.target.generation = 6;
+        assert!(tracker.stale_completion(&ControlOutcome::failed(&request, "late"), 7));
+    }
+    #[test]
+    fn startup_restore_preflight_has_no_allocations_for_unavailable_or_unbound_mice() {
+        let now = Instant::now();
+        for owner in [None, Some("absent-container"), Some("present-container")] {
+            let mut r = control_reading();
+            r.source = "razer".into();
+            r.key = "razer:00bf:TESTUNIT".into();
+            r.via = "usb".into();
+            r.container = Some("present-container".into());
+            let mut settings = startup_settings();
+            settings.devices.clear();
+            let p = settings.device_mut(&r.key);
+            p.requested_polling_rate = Some(1000.try_into().unwrap());
+            p.polling_owner_container = owner.map(str::to_owned);
+            let startup = StartupPollingRestore::new(&settings, now);
+            assert_eq!(startup.pending.is_empty(), owner.is_none());
+            let mut engine = Engine::new(settings, Default::default());
+            engine.apply("razer", Ok(vec![r]), 0., false);
+            let (_, cost) = crate::allocation_counter::measure(|| {
+                for _ in 0..100 {
+                    assert_eq!(
+                        startup.needs_inventory(&engine, &[]),
+                        owner == Some("present-container")
+                    );
+                }
+            });
+            assert_eq!(cost.calls, 0);
+        }
+    }
+    #[test]
     fn manual_choice_cancels_only_matching_pending_and_inflight_startup_restores() {
         let now = Instant::now();
         let mut wireless = control_reading();
@@ -9747,6 +9891,10 @@ mod tests {
         settings.device_mut(&other.key).polling_owner_container = other.container.clone();
 
         let mut pending = StartupPollingRestore::new(&settings, now);
+        let mut replacement = wireless.clone();
+        replacement.container = Some("replacement-unit".into());
+        pending.cancel_device(&replacement);
+        assert!(pending.pending.contains_key(&wireless.key));
         pending.cancel_device(&wired);
         assert!(!pending.pending.contains_key(&wireless.key));
         assert!(pending.pending.contains_key(&other.key));
@@ -9788,6 +9936,8 @@ mod tests {
             &configuration,
             &permission
         ));
+        inflight.cancel_device(&replacement);
+        assert!(!guard.load(Ordering::Acquire));
         inflight.cancel_device(&wired);
         assert!(guard.load(Ordering::Acquire));
         assert!(

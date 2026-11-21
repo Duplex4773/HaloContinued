@@ -3473,7 +3473,14 @@ impl State {
                         self.heading(89, "Device preferences", 20, 212, 740);
                         self.label(92, "Display &name", 20, 255, 120);
                         self.edit(11, &d.name, 150, 251, 360);
-                        self.check(12, "&Hide tray icon", d.hidden, 540, 251, 240);
+                        self.check(
+                            12,
+                            "&Hide icon, mute alerts and pause time-left estimates",
+                            d.hidden,
+                            20,
+                            252,
+                            560,
+                        );
                         self.label(93, "Low battery alert (%)", 400, 298, 190);
                         let low = self
                             .settings
@@ -4284,7 +4291,7 @@ impl State {
                         self.set_control_text(49, if enabled { "On" } else { "Off" });
                         self.set_control_text(
                             95,
-                            "Check the current polling rate before turning on game boost.",
+                            "Select an available boost rate. Check the current rate if none are listed.",
                         );
                         return;
                     }
@@ -4983,6 +4990,11 @@ impl State {
             let preference = self.settings.device(&key);
             let saved =
                 preference.and_then(|p| p.boost_for(&reading.source, reading.container.as_deref()));
+            let display_rate = saved.or_else(|| {
+                preference
+                    .filter(|p| p.boost_owner_container.is_none())?
+                    .fullscreen_boost_rate
+            });
             let enabled = boost_draft.as_ref().map_or(saved.is_some(), |d| d.0) && can_bind;
             let caption = if !can_bind {
                 "Reconnect the mouse so Windows can identify it."
@@ -5009,14 +5021,23 @@ impl State {
                 .filter(|r| r.hz() > 1000)
                 .copied()
                 .collect();
-            let labels: Vec<_> = rates
+            let mut labels: Vec<_> = rates
                 .iter()
                 .map(|r| format!("{} Hz", device_overview::number(r.hz())))
                 .collect();
+            let saved_index = display_rate.map(|rate| {
+                rates.iter().position(|r| *r == rate).unwrap_or_else(|| {
+                    labels.push(format!(
+                        "{} Hz (unavailable)",
+                        device_overview::number(rate.hz())
+                    ));
+                    labels.len() - 1
+                })
+            });
             let selected = boost_draft
                 .as_ref()
                 .and_then(|d| labels.iter().position(|label| label == &d.1))
-                .or_else(|| saved.and_then(|r| rates.iter().position(|v| *v == r)))
+                .or(saved_index)
                 .unwrap_or(0);
             self.combo(50, &labels, selected, 20, 792, 230);
             self.enable_control(
@@ -5402,39 +5423,59 @@ impl State {
             self.control(447, w!("STATIC"), "Inactive while plugged in. Your saved power-saving settings are kept for battery use.", WINDOW_STYLE::default(), 20, y + 42, 750, 54);
             return;
         }
-        let saved = self
-            .settings
-            .device(&device.key)
-            .and_then(|p| p.saver_for(&device.source, device.container.as_deref()));
-        let rates = self.battery_saver_rates(&device);
+        let preference = self.settings.device(&device.key);
+        let saved =
+            preference.and_then(|p| p.saver_for(&device.source, device.container.as_deref()));
+        let display = saved.or_else(|| {
+            preference
+                .filter(|p| p.saver_owner_container.is_none())?
+                .low_battery_mode
+        });
+        let rates = if polling {
+            self.battery_saver_rates(&device)
+        } else {
+            Vec::new()
+        };
         let times: Vec<u16> = sleep
             .map(|m| m.choices().into_iter().filter(|s| *s != 0).collect())
             .unwrap_or_default();
-        let rate_index = saved
-            .and_then(|s| s.polling_rate)
-            .and_then(|r| rates.iter().position(|hz| *hz == r.hz()))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let sleep_index = saved
-            .and_then(|s| s.sleep_seconds)
-            .and_then(|s| times.iter().position(|v| *v == s))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let values = if self.sleep.saver_key.as_ref() == Some(&device.key) {
-            draft
-        } else {
-            None
-        }
-        .unwrap_or((
-            saved.is_some(),
-            saved.map(|s| s.threshold).unwrap_or(20).to_string(),
-            rate_index
-                .checked_sub(1)
-                .and_then(|i| rates.get(i))
-                .map(|r| format!("{r} Hz"))
-                .unwrap_or_else(|| "Keep polling rate".into()),
-            sleep_index,
-        ));
+        let display_rate = display.and_then(|s| s.polling_rate);
+        let display_sleep = display.and_then(|s| s.sleep_seconds);
+        let mut rate_labels = vec!["Keep polling rate".to_owned()];
+        rate_labels.extend(rates.iter().map(|r| format!("{r} Hz")));
+        let mut sleep_labels = vec!["Keep sleep time".to_owned()];
+        sleep_labels.extend(times.iter().map(|s| format!("{} min", s / 60)));
+        let rate_label = display_rate
+            .map(|r| {
+                if rates.contains(&r.hz()) {
+                    format!("{} Hz", r.hz())
+                } else {
+                    let label = format!("{} Hz (unavailable)", r.hz());
+                    rate_labels.push(label.clone());
+                    label
+                }
+            })
+            .unwrap_or_else(|| rate_labels[0].clone());
+        let sleep_index = display_sleep.map_or(0, |seconds| {
+            times
+                .iter()
+                .position(|s| *s == seconds)
+                .map(|i| i + 1)
+                .unwrap_or_else(|| {
+                    sleep_labels.push(format!("{} s (unavailable)", seconds));
+                    sleep_labels.len() - 1
+                })
+        });
+        let values = draft
+            .filter(|_| self.sleep.saver_key.as_ref() == Some(&device.key))
+            .unwrap_or_else(|| {
+                (
+                    saved.is_some(),
+                    display.map_or(20, |s| s.threshold).to_string(),
+                    rate_label,
+                    sleep_index,
+                )
+            });
         let can_bind = !device.requires_polling_owner() || device.polling_owner().is_some();
         self.sleep.saver_key = Some(device.key);
         let y = self.page_height + PAGE_TOP + 12;
@@ -5451,14 +5492,10 @@ impl State {
         self.label(441, "Start at or below (%)", 20, y + 86, 230);
         self.edit(442, &values.1, 270, y + 82, 90);
         self.label(443, "Polling rate / sleep after", 20, y + 134, 240);
-        let mut labels = vec!["Keep polling rate".to_owned()];
-        if polling {
-            labels.extend(rates.iter().map(|r| format!("{r} Hz")));
-        }
         self.combo(
             444,
-            &labels,
-            labels
+            &rate_labels,
+            rate_labels
                 .iter()
                 .position(|label| label == &values.2)
                 .unwrap_or(0),
@@ -5466,12 +5503,10 @@ impl State {
             y + 130,
             220,
         );
-        let mut labels = vec!["Keep sleep time".to_owned()];
-        labels.extend(times.iter().map(|s| format!("{} min", s / 60)));
         self.combo(
             445,
-            &labels,
-            values.3.min(labels.len() - 1),
+            &sleep_labels,
+            values.3.min(sleep_labels.len() - 1),
             510,
             y + 130,
             220,
@@ -5481,10 +5516,15 @@ impl State {
         for id in [440, 442, 444, 445, 446] {
             self.enable_control(id, can_bind && self.settings.polling_controls);
         }
-        self.enable_control(444, can_bind && self.settings.polling_controls && polling);
+        self.enable_control(
+            444,
+            can_bind && self.settings.polling_controls && (polling || display_rate.is_some()),
+        );
         self.enable_control(
             445,
-            can_bind && self.settings.polling_controls && sleep.is_some(),
+            can_bind
+                && self.settings.polling_controls
+                && (sleep.is_some() || display_sleep.is_some()),
         );
     }
     fn can_save_automation(&mut self, device: &ConfigurationDevice) -> bool {
@@ -5538,6 +5578,7 @@ impl State {
             let rate = self
                 .choice(444)
                 .checked_sub(1)
+                .filter(|_| hb_providers::controls::polling_menu_candidate(&device))
                 .and_then(|i| self.battery_saver_rates(&device).get(i).copied())
                 .and_then(|v| PollingRate::try_from(v).ok());
             let seconds = hb_providers::sleep_controls::model(&device)
@@ -5547,6 +5588,13 @@ impl State {
                         .checked_sub(1)
                         .and_then(|i| m.choices().into_iter().filter(|s| *s != 0).nth(i))
                 });
+            if self.choice(444) > 0 && rate.is_none() || self.choice(445) > 0 && seconds.is_none() {
+                self.set_control_text(
+                    95,
+                    "Choose an available setting or select Keep before saving.",
+                );
+                return;
+            }
             if threshold.is_none() || (rate.is_none() && seconds.is_none()) {
                 self.error =
                     "Enter a threshold from 1 to 95 and choose a polling rate or sleep time."
@@ -5692,12 +5740,7 @@ impl State {
     fn polling_outcome(&mut self, outcome: ControlOutcome) {
         // A queued readback can arrive after the inventory has already replaced
         // this key. It cannot confirm a rate or a status message for its new owner.
-        if let Some(target) = outcome
-            .observation
-            .as_ref()
-            .map(|o| &o.target)
-            .or(outcome.failure_target.as_deref())
-        {
+        if let Some(target) = outcome.target() {
             let current = self
                 .snapshot
                 .devices
@@ -6864,7 +6907,7 @@ pub(crate) static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 
 fn device_alert_summary(settings: &Settings, key: &str) -> String {
     if settings.device(key).is_some_and(|d| d.hidden) {
-        return "The tray icon and battery alerts are hidden for this device.".into();
+        return "The tray icon is hidden. Battery alerts, sounds and time-left estimates are paused.".into();
     }
     if !settings.notify && !settings.low_sound {
         return "Notifications and low-battery sounds are both off in Settings.".into();
@@ -8273,7 +8316,12 @@ fn popup_menu(
                 507,
                 w!("Name, alerts and tray &icon…"),
             )?;
-            AppendMenuW(options.0, MF_STRING, 505, w!("&Hide tray icon"))?;
+            AppendMenuW(
+                options.0,
+                MF_STRING,
+                505,
+                w!("&Hide icon, mute alerts and pause time-left estimates"),
+            )?;
             AppendMenuW(options.0, MF_STRING, 501, w!("&Refresh devices"))?;
             AppendMenuW(options.0, MF_SEPARATOR, 0, None)?;
             AppendMenuW(options.0, MF_STRING, 502, w!("E&xit Halo Continued"))?;
@@ -10702,6 +10750,61 @@ mod dashboard_lifecycle_tests {
                 button.top >= panel.bottom,
                 "Restore is beneath the workspace panel"
             );
+            {
+                let prior = state.settings.clone();
+                let prior_obs = state.polling.observations.clone();
+                let d = ConfigurationDevice::from_reading(&reading);
+                let generation = state.polling.generation;
+                state.polling.observations.insert(
+                    reading.key.clone(),
+                    PollingObservation {
+                        target: ControlTarget {
+                            device: d,
+                            generation,
+                            connection_stamp: None,
+                        },
+                        supported: [125, 1000, 2000, 4000, 8000]
+                            .into_iter()
+                            .map(|r| PollingRate::try_from(r).unwrap())
+                            .collect(),
+                        rate: PollingRate::try_from(1000).ok(),
+                        timestamp: 0,
+                        evidence: "fixture".into(),
+                    },
+                );
+                let p = state.settings.device_mut(&reading.key);
+                p.boost_owner_container = None;
+                p.saver_owner_container = None;
+                p.fullscreen_boost_rate = PollingRate::try_from(4000).ok();
+                p.low_battery_mode = Some(hb_core::settings::LowBatteryMode {
+                    threshold: 35,
+                    polling_rate: PollingRate::try_from(125).ok(),
+                    sleep_seconds: Some(60),
+                });
+                state.device_form_key = None;
+                state.sleep.saver_key = None;
+                state.build();
+
+                assert!(!state.checked(49) && !state.checked(440));
+                assert_eq!(state.text(50), "4,000 Hz");
+                assert_eq!(state.text(442), "35");
+                assert_eq!(state.text(444), "125 Hz");
+                assert_eq!(state.text(445), "1 min");
+                let pref = state.settings.device_mut(&reading.key);
+                pref.boost_owner_container = Some("different-mouse".into());
+                pref.saver_owner_container = Some("different-mouse".into());
+                state.device_form_key = None;
+                state.sleep.saver_key = None;
+                state.build();
+                assert!(!state.checked(49) && !state.checked(440));
+                assert_ne!(state.text(50), "4,000 Hz");
+                assert_eq!(state.text(442), "20");
+                state.settings = prior;
+                state.polling.observations = prior_obs;
+                state.device_form_key = None;
+                state.sleep.saver_key = None;
+                state.build();
+            }
             let descriptor = ConfigurationDevice::from_reading(&reading);
             let observation = PollingObservation {
                 target: ControlTarget {

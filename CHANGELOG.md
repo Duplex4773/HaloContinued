@@ -5,8 +5,10 @@ Provisional changelog for the `main` branch.
 ## Device identity and recovery
 
 - Game boost and Battery saver now remember the mouse's Windows device identity separately. If either was enabled before this change, turn it on once on your usual wireless connection.
-- Changing polling or sleep settings on a replacement mouse preserves the original mouse’s recovery settings, even when both report the same serial. A manual change over USB can override a pending wireless restore when Halo has confirmed the handoff to the cable.
+- Changing polling or sleep settings on a replacement mouse preserves the original mouse’s recovery settings, even when both report the same serial. A manual change during USB charging can override the wireless restore only on the identified cable connection. Switching to another cable-connected mouse preserves the original restore.
 - Startup polling restoration now checks the Windows device identity saved when you applied the rate. If you saved a mouse rate in v1.1.8, apply it once on your usual connection to enable restoration for that connection.
+- A manual rate change on a replacement receiver leaves the original mouse’s queued startup restore intact. After waking Windows or re-enabling polling controls, Halo can check the current rate again without reapplying the startup setting.
+- When older Game boost or Battery saver settings need confirmation, Devices shows the saved rate, threshold and sleep time for review. Unsupported choices are marked unavailable. Settings already bound to a different mouse stay separate.
 - Razer mice that report the same serial keep separate history and tray icons after a restart, even when only one is plugged in. A replacement Logitech G535 receiver with a different HID serial also gets its own battery history.
 - Logitech receivers recheck which device occupies each slot. If one receiver or headset battery interface stops responding, Halo Continued keeps its last reading marked stale while other devices continue updating. Game boost and Battery saver can resume restoration when the matching mouse responds again.
 - Busy Logitech receivers can now report battery levels even when unrelated messages arrive ahead of the reply. Halo reports a connection error if the required receiver interface is missing. A silent replacement G535 receiver no longer shows the previous headset’s sleeping battery level.
@@ -15,12 +17,15 @@ Provisional changelog for the `main` branch.
 ## History, Insights and alerts
 
 - Both Calendar time and Time used keep the last confirmed point of a flat stretch before drawing a battery drop on a dense graph. Calendar history also preserves sleep and wake transitions when fitting many readings onto the screen.
+- Time used now keeps both ends of each battery-level plateau when they fit on the graph. For example, a two-hour stretch at 80% remains visible between readings of 100% and 60%.
 - History and battery-life estimates start again when a different physical device reuses a receiver slot. Insights excludes ambiguous boost activity when two sessions share a timestamp. Repeated checks of an unchanged Bluetooth reading no longer add usage evidence.
-- Insights marks approximate battery percentages consistently with Devices. The dashboard and tray discard late polling replies and errors from a replaced device, so its replacement keeps its confirmed rate in the tooltip.
+- Insights marks approximate battery percentages consistently with Devices. A late polling error from a previous connection can no longer clear the replacement mouse’s confirmed rate in Insights or interrupt its usage session. The dashboard and tray also discard late replies from a replaced device.
+- Devices and the tray menu explain that hiding a device icon also mutes its battery alerts and pauses its time-left estimate.
 - Devices sharing a receiver keep independent low-battery sound reminders. Settings also makes it clearer when notification pop-ups are disabled.
 
 ## Resource use and packaging
 
+- Game boost skips Windows fullscreen checks while its configured mice are absent. Startup polling skips rebuilding the device list for missing mice and older rate choices with no confirmed owner. In a regression test, 100 startup eligibility checks made zero allocations.
 - Worker events share a dashboard wake-up when they arrive together. In a test, 32 queued events needed one Windows message. Logitech also reuses its receiver slot information. In a separate test, 100 repeat slot-cache checks made zero allocations.
 - Silent Logitech receivers use fewer battery-report reads while keeping the existing timeouts. In a simulated HID++ 1.0 slot test, the same 1.2-second timeout took 72 reads, down from 480.
 - In a simulation with eight devices and one low battery, 100 refreshes made 1,800 allocations with sounds enabled, down from 14,100. The sound-disabled run also made 1,800.

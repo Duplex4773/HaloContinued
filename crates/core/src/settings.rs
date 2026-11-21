@@ -41,6 +41,10 @@ impl DevicePreferences {
         self.fullscreen_boost_rate.is_some()
             && Self::registered(key, self.boost_owner_container.as_deref())
     }
+    pub fn startup_rate_registered(&self, key: &str) -> bool {
+        self.requested_polling_rate.is_some()
+            && Self::registered(key, self.polling_owner_container.as_deref())
+    }
     pub fn saver_registered(&self, key: &str) -> bool {
         self.low_battery_mode.is_some()
             && Self::registered(key, self.saver_owner_container.as_deref())

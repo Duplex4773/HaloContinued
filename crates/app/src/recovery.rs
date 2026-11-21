@@ -567,6 +567,30 @@ impl Journal {
     }
 }
 
+/// Manual supersession across USB transports requires the originally observed cable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CableEndpoint(Option<Box<str>>);
+impl CableEndpoint {
+    pub fn new(container: Option<&str>) -> Self {
+        Self(container.map(Box::from))
+    }
+    pub fn observe(&mut self, container: Option<&str>) {
+        if !self
+            .0
+            .as_deref()
+            .zip(container)
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            self.0 = None;
+        }
+    }
+    pub fn matches(&self, radio: &ConfigurationDevice, cable: &ConfigurationDevice) -> bool {
+        cable.wired_mouse()
+            && cable.owns_polling_choice(self.0.as_deref())
+            && radio.charging_alias(cable)
+    }
+}
+
 /// A changed native connection may be rebound only when the original hardware
 /// serial is embedded in its stable key and Windows also supplies a container.
 /// Provider enumeration must independently confirm both and reject ambiguity.

@@ -19,10 +19,10 @@ enum Setting {
     Active { before: u32, applied: u32 },
     Done,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum WiredTransition {
     Awaiting(i64),
-    Seen,
+    Seen(crate::recovery::CableEndpoint),
 }
 #[derive(Clone, Copy, Default)]
 struct RestoreRetry {
@@ -338,6 +338,7 @@ impl BatterySaver {
     pub fn wired_handoff_owner(
         &self,
         wireless_key: &str,
+        device: &ConfigurationDevice,
         sleep: bool,
     ) -> Option<&ConfigurationDevice> {
         let entry = self.entries.get(wireless_key)?;
@@ -346,7 +347,7 @@ impl BatterySaver {
         } else {
             (entry.rate, entry.rate_stamp)
         };
-        (entry.wired_transition == Some(WiredTransition::Seen)
+        (matches!(&entry.wired_transition, Some(WiredTransition::Seen(endpoint)) if endpoint.matches(&entry.target.device, device))
             && matches!(setting, Setting::Active { .. })
             && stamp.is_some())
         .then_some(&entry.target.device)
@@ -357,9 +358,7 @@ impl BatterySaver {
         let mut cancel = false;
         for entry in self.entries.values_mut() {
             if entry.target.device.same_control_unit(device)
-                || device.wired_mouse()
-                    && entry.wired_transition.is_some()
-                    && entry.target.device.charging_alias(device)
+                || matches!(&entry.wired_transition, Some(WiredTransition::Seen(endpoint)) if endpoint.matches(&entry.target.device, device))
             {
                 if sleep {
                     entry.sleep = Setting::Done;
@@ -464,55 +463,51 @@ impl BatterySaver {
                             && entry.rate_stamp == pending.action.target().connection_stamp
                     }
             });
-            let alias = (!entry.target.device.wired_mouse()
+            let track_cable = !entry.target.device.wired_mouse()
                 && (entry.has_proven_original() || pending_original)
-                && (!present || possible_wired || entry.wired_transition.is_some()))
-            .then(|| entry.target.device.shared_preference_key())
-            .flatten();
-            let wired = alias.as_ref().map_or(0, |alias| {
-                readings
-                    .iter()
-                    .filter(|r| {
-                        r.online()
-                            && r.wired_mouse()
-                            && r.timestamp <= now
-                            && now.saturating_sub(r.timestamp) <= 120
-                            && ConfigurationDevice::from_reading(r)
-                                .shared_preference_key()
-                                .as_ref()
-                                == Some(alias)
-                    })
-                    .take(2)
-                    .count()
-            });
+                && (!present || possible_wired || entry.wired_transition.is_some());
+            let (cable, ambiguous) = if track_cable {
+                entry.target.device.charging_cables(readings, now)
+            } else {
+                (None, false)
+            };
             let mut cancel = false;
             let expired = matches!(entry.wired_transition, Some(WiredTransition::Awaiting(since))
                 if now < since || now.saturating_sub(since) > 120);
             if conflicting
                 || expired
-                || (wired > 1 && (!present || entry.wired_transition.is_some()))
+                || (ambiguous && (!present || entry.wired_transition.is_some()))
             {
                 entry.discard_originals();
                 cancel = true;
-            } else if wired == 1 {
+            } else if let Some(cable) = cable.filter(|_| !ambiguous) {
                 // This proves only that charging occurred. A later restoration
                 // still targets the original wireless identity and connection
                 // stamp, and compares its current value before writing.
-                cancel = entry.wired_transition != Some(WiredTransition::Seen);
-                entry.wired_transition = Some(WiredTransition::Seen);
+                cancel = !matches!(entry.wired_transition, Some(WiredTransition::Seen(_)));
+                match &mut entry.wired_transition {
+                    Some(WiredTransition::Seen(endpoint)) => {
+                        endpoint.observe(cable.container.as_deref())
+                    }
+                    slot => {
+                        *slot = Some(WiredTransition::Seen(crate::recovery::CableEndpoint::new(
+                            cable.container.as_deref(),
+                        )))
+                    }
+                }
                 entry.low = false;
             } else if online {
                 match entry.wired_transition {
                     Some(WiredTransition::Awaiting(_)) => entry.discard_originals(),
-                    Some(WiredTransition::Seen) => entry.wired_transition = None,
+                    Some(WiredTransition::Seen(_)) => entry.wired_transition = None,
                     None => {}
                 }
             } else if !present {
                 match entry.wired_transition {
-                    Some(WiredTransition::Seen) => {}
+                    Some(WiredTransition::Seen(_)) => {}
                     Some(WiredTransition::Awaiting(since))
                         if now >= since && now.saturating_sub(since) <= 120 => {}
-                    None if alias.is_some() => {
+                    None if track_cable && entry.target.device.has_charging_alias() => {
                         entry.wired_transition = Some(WiredTransition::Awaiting(now));
                     }
                     _ => entry.discard_originals(),
@@ -539,7 +534,7 @@ impl BatterySaver {
                     Some(WiredTransition::Awaiting(_)) => {
                         boost.hold_for_charging(&entry.target.device, stamp, saver_rate);
                     }
-                    Some(WiredTransition::Seen) => {
+                    Some(WiredTransition::Seen(_)) => {
                         if let Some(handoff) =
                             boost.handoff_for_charging(&entry.target.device, stamp, saver_rate)
                         {
@@ -1456,6 +1451,29 @@ mod tests {
         }
     }
     #[test]
+    fn a_substituted_or_unidentified_cable_cannot_retire_wireless_recovery() {
+        for replacement in [Some("other-cable"), None] {
+            let (mut saver, _, radios, boost) = paired_charging_fixture();
+            let mut cable = wired_reading(&radios[0], 101);
+            let radio = &radios[0].key;
+            saver.observe_provider("razer", std::slice::from_ref(&cable), 101);
+            let original = ConfigurationDevice::from_reading(&cable);
+            cable.container = replacement.map(str::to_owned);
+            let other = ConfigurationDevice::from_reading(&cable);
+            for sleep in [true, false] {
+                assert!(
+                    crate::runtime::manual_handoff_owner(&other, sleep, &saver, &boost).is_none()
+                );
+                saver.manual(&other, sleep);
+            }
+            saver.observe_provider("razer", std::slice::from_ref(&cable), 101);
+            assert!(saver.wired_handoff_owner(radio, &other, true).is_none());
+            assert!(saver.wired_handoff_owner(radio, &original, true).is_none());
+            saver.manual(&other, true);
+            assert!(matches!(saver.entries[radio].sleep, Setting::Active { .. }));
+        }
+    }
+    #[test]
     fn manual_recovery_needs_an_observed_unambiguous_cable_handoff() {
         for ambiguous in [false, true] {
             let (mut saver, _, readings, boost) = paired_charging_fixture();
@@ -1972,7 +1990,9 @@ mod tests {
             saver.observe_provider("razer", &readings, 102);
             boost.sample(now + Duration::from_secs(20), Some(false));
             boost.sample(now + Duration::from_secs(35), Some(false));
-            if scenario < 2 {
+            // Only the manual choice made after observing the cable supersedes
+            // the radio. An earlier choice retains the guarded compare-before-restore.
+            if scenario != 2 {
                 let rate_action = saver.next(&settings, 2, &readings, 102, &boost).unwrap();
                 assert!(matches!(&rate_action, Action::Polling(q)
                     if q.target.connection_stamp == ConnectionStamp::new(1)
@@ -2442,12 +2462,12 @@ mod tests {
         prefs.fullscreen_boost_rate = Some(rate(4000));
         prefs.boost_owner_container = None;
         prefs.saver_owner_container = None;
-        assert!(!boost.wanted(&settings));
+        assert!(!boost.wanted(&settings, readings.iter()));
         assert!(!saver.wanted(&settings));
         let prefs = settings.device_mut(&readings[0].key);
         prefs.saver_owner_container = readings[0].container.clone();
         assert!(saver.wanted(&settings));
-        assert!(!boost.wanted(&settings));
+        assert!(!boost.wanted(&settings, readings.iter()));
     }
     #[test]
     fn automation_never_starts_on_a_replacement_with_the_same_key_and_serial() {

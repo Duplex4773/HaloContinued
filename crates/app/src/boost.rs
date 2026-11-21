@@ -32,11 +32,11 @@ struct Entry {
     restore_failures: u8,
     recovered: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum ChargingWait {
     Saver,
     Awaiting(i64),
-    Seen,
+    Seen(crate::recovery::CableEndpoint),
 }
 struct Pending {
     request: ControlRequest,
@@ -147,11 +147,55 @@ impl Boost {
             sequence: (1 << 63) | REQUEST_BIT,
         }
     }
-    pub fn wanted(&self, settings: &Settings) -> bool {
+    pub fn wanted<'a>(
+        &self,
+        settings: &Settings,
+        mut readings: impl Iterator<Item = &'a Reading>,
+    ) -> bool {
         settings.polling_controls
-            && (self.entries.values().any(|entry| entry.active)
-                || self.pending.is_some()
-                || settings.devices.iter().any(|(k, d)| d.boost_registered(k)))
+            && (self.pending.is_some()
+                || readings.any(|r| {
+                    if !r.online()
+                        || r.kind != "mouse"
+                        || !(r.source == "simulation"
+                            || hb_providers::controls::POLLING_PROVIDERS
+                                .contains(&r.source.as_str()))
+                    {
+                        return false;
+                    }
+                    let mut owned = false;
+                    if let Some(entry) = self.entries.get(&r.key) {
+                        if entry.charging_wait.is_some() || !entry.target.device.matches_reading(r)
+                        {
+                            return false;
+                        }
+                        owned = entry.active;
+                    }
+                    owned
+                        || settings
+                            .device(&r.key)
+                            .and_then(|p| p.boost_for(&r.source, r.container.as_deref()))
+                            .is_some()
+                }))
+    }
+    pub fn sample_if_needed<'a>(
+        &mut self,
+        now: Instant,
+        settings: &Settings,
+        readings: impl Iterator<Item = &'a Reading>,
+        shell: impl FnOnce() -> Option<bool>,
+    ) {
+        if !self.due(now) {
+            return;
+        }
+        if self.wanted(settings, readings) {
+            self.sample(now, shell());
+        } else {
+            self.entries.retain(|_, e| e.active);
+            self.next_sample = now + Duration::from_secs(5);
+            self.candidate = None;
+            self.stable = None;
+        }
     }
     pub fn due(&self, now: Instant) -> bool {
         now >= self.next_sample
@@ -217,54 +261,50 @@ impl Boost {
                 possible_wired |= reading.online() && reading.wired_mouse();
             }
             let has_pending = pending_key == Some(e.target.device.key.as_str());
-            let alias = ((e.active || has_pending)
+            let track_cable = (e.active || has_pending)
                 && e.baseline.is_some()
                 && e.target.connection_stamp.is_some()
                 && !e.target.device.wired_mouse()
-                && (!present || possible_wired || e.charging_wait.is_some()))
-            .then(|| e.target.device.shared_preference_key())
-            .flatten();
-            let wired = alias.as_ref().map_or(0, |alias| {
-                readings
-                    .iter()
-                    .filter(|reading| {
-                        reading.online()
-                            && reading.wired_mouse()
-                            && reading.timestamp <= now
-                            && now.saturating_sub(reading.timestamp) <= 120
-                            && ConfigurationDevice::from_reading(reading)
-                                .shared_preference_key()
-                                .as_ref()
-                                == Some(alias)
-                    })
-                    .take(2)
-                    .count()
-            });
+                && (!present || possible_wired || e.charging_wait.is_some());
+            let (cable, ambiguous) = if track_cable {
+                e.target.device.charging_cables(readings, now)
+            } else {
+                (None, false)
+            };
             let expired = matches!(e.charging_wait, Some(ChargingWait::Awaiting(since))
                 if now < since || now.saturating_sub(since) > 120);
-            if conflicting || expired || (wired > 1 && (!present || e.charging_wait.is_some())) {
+            if conflicting || expired || (ambiguous && (!present || e.charging_wait.is_some())) {
                 return false;
             }
-            if wired == 1 {
+            if let Some(cable) = cable.filter(|_| !ambiguous) {
                 if has_pending {
                     // A confirmed original remains owned until the pending
                     // restore reports whether a SET began. Charging cancels
                     // the request; an uncertain completion still discards it.
                     cancel_pending = true;
                 }
-                e.charging_wait = Some(ChargingWait::Seen);
+                match &mut e.charging_wait {
+                    Some(ChargingWait::Seen(endpoint)) => {
+                        endpoint.observe(cable.container.as_deref())
+                    }
+                    slot => {
+                        *slot = Some(ChargingWait::Seen(crate::recovery::CableEndpoint::new(
+                            cable.container.as_deref(),
+                        )))
+                    }
+                }
             } else if online {
                 match e.charging_wait {
                     Some(ChargingWait::Awaiting(_)) => return false,
-                    Some(ChargingWait::Seen) => e.charging_wait = None,
+                    Some(ChargingWait::Seen(_)) => e.charging_wait = None,
                     _ => {}
                 }
             } else if !present {
                 match e.charging_wait {
-                    Some(ChargingWait::Seen) => {}
+                    Some(ChargingWait::Seen(_)) => {}
                     Some(ChargingWait::Awaiting(since))
                         if now >= since && now.saturating_sub(since) <= 120 => {}
-                    None if alias.is_some() => {
+                    None if track_cable && e.target.device.has_charging_alias() => {
                         e.charging_wait = Some(ChargingWait::Awaiting(now));
                         cancel_pending |= has_pending;
                     }
@@ -489,9 +529,13 @@ impl Boost {
             self.attempted.insert(key.into());
         }
     }
-    pub fn wired_handoff_owner(&self, wireless_key: &str) -> Option<&ConfigurationDevice> {
+    pub fn wired_handoff_owner(
+        &self,
+        wireless_key: &str,
+        device: &ConfigurationDevice,
+    ) -> Option<&ConfigurationDevice> {
         let entry = self.entries.get(wireless_key)?;
-        (entry.charging_wait == Some(ChargingWait::Seen)
+        (matches!(&entry.charging_wait, Some(ChargingWait::Seen(endpoint)) if endpoint.matches(&entry.target.device, device))
             && entry.active
             && entry.target.connection_stamp.is_some())
         .then_some(&entry.target.device)
@@ -500,16 +544,17 @@ impl Boost {
     /// owned by its wireless connection. Aliases never authorize writes.
     pub fn manual_device(&mut self, device: &ConfigurationDevice) {
         let matches = |key: &str, state: &Self| {
-            let matches_entry = state.entries.get(key).is_none_or(|entry| {
-                entry.target.device.same_control_unit(device)
-                    || entry.charging_wait.is_some() && entry.target.device.charging_alias(device)
+            let entry = state.entries.get(key);
+            let observed_cable = entry.is_some_and(|e| {
+                matches!(&e.charging_wait, Some(ChargingWait::Seen(endpoint)) if endpoint.matches(&e.target.device, device))
             });
-            matches_entry
+            entry.is_none_or(|e| e.target.device.same_control_unit(device) || observed_cable)
                 && state.pending.as_ref().is_none_or(|p| {
-                    p.request.target.device.key != key
-                        || p.request.target.device.same_control_unit(device)
-                        || state.entries.contains_key(key)
-                            && p.request.target.device.charging_alias(device)
+                    let target = &p.request.target.device;
+                    target.key != key
+                        || target.same_control_unit(device)
+                        || observed_cable
+                            && entry.is_some_and(|e| e.target.device.same_control_unit(target))
                 })
         };
         if matches(&device.key, self) {
@@ -864,6 +909,39 @@ mod tests {
         );
     }
     #[test]
+    fn absent_boost_target_skips_shell_and_restarts_debounce_on_return() {
+        let now = Instant::now();
+        let (settings, devices) = fixture();
+        let mut boost = Boost::new(now);
+        settle(&mut boost, now, true);
+        let mut checks = 0;
+        for second in 30..90 {
+            boost.sample_if_needed(
+                now + Duration::from_secs(second),
+                &settings,
+                [].iter(),
+                || {
+                    checks += 1;
+                    Some(true)
+                },
+            );
+        }
+        assert_eq!(checks, 0);
+        for second in [90, 95, 100] {
+            boost.sample_if_needed(
+                now + Duration::from_secs(second),
+                &settings,
+                devices.iter(),
+                || {
+                    checks += 1;
+                    Some(true)
+                },
+            );
+            assert_eq!(boost.stable, (second == 100).then_some(true));
+        }
+        assert_eq!(checks, 3);
+    }
+    #[test]
     fn desktop_and_settled_sessions_skip_inventory_but_new_opt_ins_are_discovered() {
         let now = Instant::now();
         let (mut settings, readings) = fixture();
@@ -893,7 +971,7 @@ mod tests {
             .get_mut(&readings[0].key)
             .unwrap()
             .fullscreen_boost_rate = None;
-        assert!(!boost.wanted(&settings));
+        assert!(!boost.wanted(&settings, readings.iter()));
         assert!(boost.next(&settings, 1, &readings).is_none());
         assert!(!boost.needs_inventory(&settings));
     }
@@ -1040,6 +1118,17 @@ mod tests {
                     .next(&settings, 2, std::slice::from_ref(&wired))
                     .is_none()
             );
+            let mut substitute = wired.clone();
+            substitute.container = Some("different-cable".into());
+            let substitute_device = ConfigurationDevice::from_reading(&substitute);
+            assert!(
+                boost
+                    .wired_handoff_owner(&reading.key, &substitute_device)
+                    .is_none()
+            );
+            boost.observe_provider("razer", std::slice::from_ref(&substitute), 101);
+            boost.manual_device(&substitute_device);
+            assert!(boost.owns(&reading.key));
             reading.timestamp = 102;
             boost.observe_provider("razer", std::slice::from_ref(&reading), 102);
             let restore = boost
@@ -1171,7 +1260,7 @@ mod tests {
         let mut b = Boost::new(now);
         let (mut s, r) = fixture();
         s.polling_controls = false;
-        assert!(!b.wanted(&s));
+        assert!(!b.wanted(&s, r.iter()));
         assert!(!b.needs_inventory(&s));
         s.polling_controls = true;
         b.sample(now, Some(true));

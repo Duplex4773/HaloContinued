@@ -74,9 +74,10 @@ impl ConfigurationDevice {
             return false;
         }
         self.key == other.key
-            || self
-                .shared_preference_key()
-                .is_some_and(|key| other.shared_preference_key().as_ref() == Some(&key))
+            || self.polling_owner().is_some()
+                && self
+                    .shared_preference_key()
+                    .is_some_and(|key| other.shared_preference_key().as_ref() == Some(&key))
     }
     /// A cable and receiver usually have different Windows containers. Only
     /// the live charging handoff may use this protocol-specific serial alias.
@@ -85,6 +86,40 @@ impl ConfigurationDevice {
             && self
                 .shared_preference_key()
                 .is_some_and(|key| other.shared_preference_key().as_ref() == Some(&key))
+    }
+    /// Inspect the small provider cache without materializing device descriptors or keys.
+    pub fn charging_cables<'a>(
+        &self,
+        readings: &'a [Reading],
+        now: i64,
+    ) -> (Option<&'a Reading>, bool) {
+        let unit = preference_unit(
+            &self.key,
+            &self.kind,
+            &self.source,
+            &self.via,
+            self.serial.as_deref(),
+        );
+        let mut matches = readings.iter().filter(|r| {
+            unit.is_some()
+                && r.online()
+                && r.wired_mouse()
+                && r.timestamp <= now
+                && now.saturating_sub(r.timestamp) <= 120
+                && preference_unit(&r.key, &r.kind, &r.source, &r.via, r.serial.as_deref()) == unit
+        });
+        let first = matches.next();
+        (first, first.is_some() && matches.next().is_some())
+    }
+    pub fn has_charging_alias(&self) -> bool {
+        preference_unit(
+            &self.key,
+            &self.kind,
+            &self.source,
+            &self.via,
+            self.serial.as_deref(),
+        )
+        .is_some()
     }
     /// A receiver also uses USB; only exact wired model IDs establish external power.
     pub fn wired_mouse(&self) -> bool {
@@ -144,6 +179,13 @@ pub(crate) fn owner_matches(current: Option<&str>, saved: Option<&str>) -> bool 
         .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 impl Reading {
+    pub fn owns_polling_choice(&self, saved: Option<&str>) -> bool {
+        if self.source == "simulation" && self.kind == "mouse" {
+            saved.is_none()
+        } else {
+            owner_matches(self.container.as_deref(), saved)
+        }
+    }
     pub fn wired_mouse(&self) -> bool {
         wired_mouse(&self.key, &self.kind, &self.source, &self.via)
     }
@@ -159,6 +201,7 @@ pub(crate) fn shared_preference_key(
     Some(format!("razer:{}:{}", unit.wireless_pid, unit.serial))
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct PreferenceUnit<'a> {
     pub wired_pid: &'static str,
     pub wireless_pid: &'static str,
@@ -312,6 +355,12 @@ impl ControlOutcome {
             may_have_changed: false,
             failure: Some(message.into()),
         }
+    }
+    pub fn target(&self) -> Option<&ControlTarget> {
+        self.observation
+            .as_ref()
+            .map(|o| &o.target)
+            .or(self.failure_target.as_deref())
     }
     pub fn confirmed_change(&self) -> bool {
         self.failure.is_none()

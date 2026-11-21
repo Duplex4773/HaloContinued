@@ -108,6 +108,8 @@ pub(super) struct Sample {
     pub ordinal: i64,
     pub level: Option<u8>,
     position: i64,
+    online: bool,
+    charging: Option<bool>,
 }
 impl Sample {
     pub fn replace(
@@ -125,6 +127,13 @@ impl Sample {
         self.ordinal = ordinal;
         self.level = reading.level;
         self.position = position;
+        self.online = reading.connection == Connection::Online;
+        self.charging = reading.charging;
+    }
+    pub fn same_run(&self, reading: &TimingReading<'_>) -> bool {
+        self.level == reading.level
+            && self.online == (reading.connection == Connection::Online)
+            && self.charging == reading.charging
     }
     pub fn decode(self) -> Result<HistorySample, ProviderError> {
         let reading = serde_json::from_str::<Reading>(&self.payload)
@@ -133,6 +142,81 @@ impl Sample {
             reading,
             position: self.position,
         })
+    }
+}
+
+/// Keep both ends of every flat run until the plot actually exceeds its pixel budget.
+type ChartBucket = Option<(Sample, Sample, Option<Sample>)>;
+pub(super) struct ChartEdges {
+    limit: usize,
+    since: i64,
+    span: i64,
+    edges: Vec<(Sample, bool)>,
+    buckets: Option<Vec<ChartBucket>>,
+    first: Option<Sample>,
+}
+impl ChartEdges {
+    pub fn new(limit: usize, since: i64, until: i64) -> Self {
+        Self {
+            limit,
+            since,
+            span: (until - since).max(1),
+            edges: Vec::new(),
+            buckets: None,
+            first: None,
+        }
+    }
+    pub fn push(&mut self, sample: &Sample, before_drop: bool) {
+        if self.buckets.is_none() {
+            if self.edges.len() < self.limit {
+                self.edges.push((sample.clone(), before_drop));
+                return;
+            }
+            let slots = self.limit - 2;
+            self.buckets = Some(vec![None; if slots == 2 { 1 } else { slots / 3 }]);
+            let edges = std::mem::take(&mut self.edges);
+            self.first = edges.first().map(|(first, _)| first.clone());
+            for (edge, drop) in edges {
+                self.bucket(&edge, drop);
+            }
+        }
+        self.bucket(sample, before_drop);
+    }
+    fn bucket(&mut self, sample: &Sample, before_drop: bool) {
+        let buckets = self.buckets.as_mut().unwrap();
+        if buckets.is_empty() {
+            return;
+        }
+        let index = ((sample.position.saturating_sub(self.since).max(0) as i128
+            * buckets.len() as i128)
+            / self.span as i128)
+            .min(buckets.len() as i128 - 1) as usize;
+        let (low, high, anchor) =
+            buckets[index].get_or_insert_with(|| (sample.clone(), sample.clone(), None));
+        if sample.level < low.level {
+            low.clone_from(sample);
+        }
+        if sample.level > high.level {
+            high.clone_from(sample);
+        }
+        if self.limit >= 5 && before_drop && anchor.is_none() {
+            *anchor = Some(sample.clone());
+        }
+    }
+    pub fn finish(self, last: Option<Sample>) -> Vec<Sample> {
+        let Some(buckets) = self.buckets else {
+            return self.edges.into_iter().map(|(s, _)| s).collect();
+        };
+        let mut samples = Vec::with_capacity(self.limit);
+        samples.extend(self.first);
+        for (low, high, anchor) in buckets.into_iter().flatten() {
+            samples.extend([low, high]);
+            samples.extend(anchor);
+        }
+        samples.extend(last);
+        samples.sort_unstable_by_key(|s| (s.timestamp, s.ordinal));
+        samples.dedup_by_key(|s| (s.timestamp, s.ordinal));
+        samples
     }
 }
 
