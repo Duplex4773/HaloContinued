@@ -1,4 +1,4 @@
-// Frozen pre-optimization sampler used only as a behavioural/performance oracle.
+// Straightforward owned-reading sampler used only as a behavioural/performance oracle.
 // Keep this independent of the production sampler so representation changes
 // cannot silently alter selected extrema, boundaries or usage coordinates.
 use hb_core::{ProviderError, Reading};
@@ -22,11 +22,14 @@ pub fn query_usage(
     let limit = max_points.clamp(2, 4096);
     let total = stream_usage(db, key, until, |_, _| {})?;
     let since = total.saturating_sub(seconds.max(1)).max(0);
-    let buckets = limit.saturating_sub(2) / 2;
-    let mut extremes: Vec<Option<(HistorySample, HistorySample)>> = vec![None; buckets];
+    let slots = limit.saturating_sub(2);
+    let buckets = if slots == 2 { 1 } else { slots / 3 };
+    let mut extremes: Vec<Option<(HistorySample, HistorySample, Option<HistorySample>)>> =
+        vec![None; buckets];
     let mut baseline = None;
     let mut first = None;
-    let mut last = None;
+    let mut flat_run = false;
+    let mut last: Option<HistorySample> = None;
     stream_usage(db, key, until, |reading, position| {
         if !reading.level.is_some_and(|level| level <= 100) {
             return;
@@ -39,29 +42,39 @@ pub fn query_usage(
         if first.is_none() {
             first = Some(baseline.take().unwrap_or_else(|| sample.clone()));
         }
-        last = Some(sample.clone());
+        let anchor = last
+            .as_ref()
+            .filter(|p| slots >= 3 && flat_run && p.reading.level > sample.reading.level);
+        flat_run = last
+            .as_ref()
+            .is_some_and(|p| p.reading.level == sample.reading.level);
         if buckets > 0 {
             let span = total.saturating_sub(since).max(1);
             let bucket = ((position.saturating_sub(since) as i128 * buckets as i128) / span as i128)
                 .min(buckets as i128 - 1) as usize;
-            if let Some((low, high)) = &mut extremes[bucket] {
+            if let Some((low, high, before_drop)) = &mut extremes[bucket] {
+                if before_drop.is_none() {
+                    *before_drop = anchor.cloned();
+                }
                 if sample.reading.level < low.reading.level {
                     *low = sample.clone();
                 }
                 if sample.reading.level > high.reading.level {
-                    *high = sample;
+                    *high = sample.clone();
                 }
             } else {
-                extremes[bucket] = Some((sample.clone(), sample));
+                extremes[bucket] = Some((sample.clone(), sample.clone(), anchor.cloned()));
             }
         }
+        last = Some(sample);
     })?;
     let mut samples = Vec::with_capacity(limit);
     if let Some(sample) = first {
         samples.push(sample);
     }
-    for (low, high) in extremes.into_iter().flatten() {
+    for (low, high, anchor) in extremes.into_iter().flatten() {
         samples.extend([low, high]);
+        samples.extend(anchor);
     }
     if let Some(sample) = last {
         samples.push(sample);

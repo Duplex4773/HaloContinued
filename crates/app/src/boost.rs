@@ -151,10 +151,7 @@ impl Boost {
         settings.polling_controls
             && (self.entries.values().any(|entry| entry.active)
                 || self.pending.is_some()
-                || settings
-                    .devices
-                    .values()
-                    .any(|d| d.fullscreen_boost_rate.is_some()))
+                || settings.devices.iter().any(|(k, d)| d.boost_registered(k)))
     }
     pub fn due(&self, now: Instant) -> bool {
         now >= self.next_sample
@@ -298,7 +295,7 @@ impl Boost {
                         && self.attempted.len() < 512
                         && settings.devices.iter().any(|(key, preferences)| {
                             !self.entries.contains_key(key)
-                                && preferences.fullscreen_boost_rate.is_some()
+                                && preferences.boost_registered(key)
                                 && !self.attempted.iter().any(|attempt| {
                                     settings.preference_key(attempt) == settings.preference_key(key)
                                 })
@@ -399,7 +396,9 @@ impl Boost {
                         && !self.entries.contains_key(&reading.key)
                         && settings
                             .device(&reading.key)
-                            .and_then(|p| p.fullscreen_boost_rate)
+                            .and_then(|p| {
+                                p.boost_for(&reading.source, reading.container.as_deref())
+                            })
                             .is_some()
                         && !self.attempted.iter().any(|attempt| {
                             settings.preference_key(attempt)
@@ -490,12 +489,37 @@ impl Boost {
             self.attempted.insert(key.into());
         }
     }
+    pub fn wired_handoff_owner(&self, wireless_key: &str) -> Option<&ConfigurationDevice> {
+        let entry = self.entries.get(wireless_key)?;
+        (entry.charging_wait == Some(ChargingWait::Seen)
+            && entry.active
+            && entry.target.connection_stamp.is_some())
+        .then_some(&entry.target.device)
+    }
     /// A manual selection on a validated wired alias also cancels any boost
     /// owned by its wireless connection. Aliases never authorize writes.
     pub fn manual_device(&mut self, device: &ConfigurationDevice) {
-        self.manual(&device.key);
-        if let Some(alias) = device.shared_preference_key()
+        let matches = |key: &str, state: &Self| {
+            let matches_entry = state.entries.get(key).is_none_or(|entry| {
+                entry.target.device.same_control_unit(device)
+                    || entry.charging_wait.is_some() && entry.target.device.charging_alias(device)
+            });
+            matches_entry
+                && state.pending.as_ref().is_none_or(|p| {
+                    p.request.target.device.key != key
+                        || p.request.target.device.same_control_unit(device)
+                        || state.entries.contains_key(key)
+                            && p.request.target.device.charging_alias(device)
+                })
+        };
+        if matches(&device.key, self) {
+            self.manual(&device.key);
+        }
+        if device.wired_mouse()
+            && let Some(alias) = device.shared_preference_key()
             && alias != device.key
+            && self.entries.contains_key(&alias)
+            && matches(&alias, self)
         {
             self.manual(&alias);
         }
@@ -591,13 +615,15 @@ impl Boost {
                     && !self.attempted.contains(&r.key)
                     && settings
                         .device(&r.key)
-                        .and_then(|p| p.fullscreen_boost_rate)
+                        .and_then(|p| p.boost_for(&r.source, r.container.as_deref()))
                         .is_some()
                     && hb_providers::controls::polling_menu_candidate(
                         &ConfigurationDevice::from_reading(r),
                     )
             })?;
-            let boost = settings.device(&r.key)?.fullscreen_boost_rate?;
+            let boost = settings
+                .device(&r.key)?
+                .boost_for(&r.source, r.container.as_deref())?;
             self.attempted.insert(r.key.clone());
             self.entries.insert(
                 r.key.clone(),
@@ -624,7 +650,12 @@ impl Boost {
         let action = match (fullscreen, entry.baseline) {
             (true, None) => ControlAction::Read,
             (true, Some(expected)) => {
-                if settings.device(&key).and_then(|p| p.fullscreen_boost_rate) != Some(entry.boost)
+                if settings.device(&key).and_then(|p| {
+                    p.boost_for(
+                        &entry.target.device.source,
+                        entry.target.device.container.as_deref(),
+                    )
+                }) != Some(entry.boost)
                 {
                     self.entries.remove(&key);
                     return None;
@@ -844,11 +875,9 @@ mod tests {
         let request = boost.next(&settings, 1, &readings).unwrap();
         complete(&mut boost, &request, 4000); // Already faster: no write.
         assert!(!boost.needs_inventory(&settings));
-        settings
-            .devices
-            .entry("another-mouse".into())
-            .or_default()
-            .fullscreen_boost_rate = Some(rate(2000));
+        let another = settings.device_mut("another-mouse");
+        another.fullscreen_boost_rate = Some(rate(2000));
+        another.boost_owner_container = Some("another-container".into());
         assert!(boost.needs_inventory(&settings));
     }
     #[test]
@@ -874,6 +903,7 @@ mod tests {
     }
     fn complete(b: &mut Boost, request: &ControlRequest, hz: u32) {
         b.complete(&ControlOutcome {
+            failure_target: None,
             request: request.request,
             key: request.target.device.key.clone(),
             observation: Some(PollingObservation {
@@ -943,6 +973,7 @@ mod tests {
                 polling_controls: true,
                 ..Default::default()
             };
+            crate::bind_test_mouse(&mut settings, &mut reading);
             settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(2000));
             let mut boost = Boost::new(now);
             settle(&mut boost, now, true);
@@ -978,6 +1009,7 @@ mod tests {
                 polling_controls: true,
                 ..Default::default()
             };
+            crate::bind_test_mouse(&mut settings, &mut reading);
             settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(2000));
             let mut boost = Boost::new(now);
             settle(&mut boost, now, true);
@@ -1037,6 +1069,7 @@ mod tests {
                 polling_controls: true,
                 ..Default::default()
             };
+            crate::bind_test_mouse(&mut settings, &mut reading);
             settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(2000));
             let mut boost = Boost::new(now);
             settle(&mut boost, now, true);
@@ -1455,6 +1488,7 @@ mod tests {
                     polling_controls: true,
                     ..Default::default()
                 };
+                crate::bind_test_mouse(&mut settings, &mut reading);
                 settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(4000));
                 let mut boost = Boost::new(now);
                 settle(&mut boost, now, true);
@@ -1642,6 +1676,7 @@ mod tests {
                     polling_controls: true,
                     ..Default::default()
                 };
+                crate::bind_test_mouse(&mut settings, &mut reading);
                 settings.device_mut(&reading.key).fullscreen_boost_rate = Some(rate(4000));
                 let mut boost = Boost::new(now);
                 settle(&mut boost, now, true);
@@ -1992,6 +2027,7 @@ mod tests {
         wired.via = "usb".into();
         wired.serial = Some("TESTUNIT1234".into());
         settings.link_reading(&wired);
+        crate::bind_test_mouse(&mut settings, &mut wired);
         let mut boost = Boost::new(now);
         settle(&mut boost, now, true);
         assert!(boost.ready(&settings, |source| {

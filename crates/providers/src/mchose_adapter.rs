@@ -99,6 +99,7 @@ pub(crate) fn execute(
         evidence: "MCHOSE A7 V2 Ultra+ reference protocol; hardware unverified locally".into(),
     });
     ControlOutcome {
+        failure_target: observation.is_none().then(|| Box::new(request.target.clone())),
         request: request.request,
         key: reading.key.clone(),
         observation,

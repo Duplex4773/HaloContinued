@@ -347,6 +347,16 @@ fn entry() -> Result<(), ProviderError> {
 }
 
 #[cfg(test)]
+fn bind_test_mouse(settings: &mut hb_core::Settings, mouse: &mut hb_core::Reading) {
+    let container = mouse
+        .container
+        .get_or_insert_with(|| "00112233445566778899aabbccddeeff".into());
+    let choices = settings.device_mut(&mouse.key);
+    choices.boost_owner_container = Some(container.clone());
+    choices.saver_owner_container = Some(container.clone());
+}
+
+#[cfg(test)]
 mod performance_fixture {
     /// Run the production monitoring/tray path with synthetic readings. This
     /// deliberately omits global instance/notification registration so a normal

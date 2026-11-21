@@ -376,14 +376,16 @@ impl HidProvider {
             channel.write(&[0x10, slot, 0x81, register, 0, 0, 0])?;
             let deadline = (c.clock.monotonic() + Duration::from_millis(600)).min(c.deadline);
             let mut answered = false;
-            let mut wait_ms = 5;
+            let mut wait = LogitechReplyWait::new();
             while c.active() && c.clock.monotonic() < deadline && !answered {
+                let mut received = false;
                 for channel in 0..2 {
                     let r = if channel == 0 {
                         long.read(64, Duration::ZERO)?
                     } else {
                         short.as_mut().unwrap().read(64, Duration::ZERO)?
                     };
+                    received |= !r.is_empty();
                     let Some(r) = hidpp_frame(&r, slot) else {
                         continue;
                     };
@@ -400,11 +402,7 @@ impl HidProvider {
                     }
                 }
                 if !answered {
-                    c.sleep(
-                        Duration::from_millis(wait_ms)
-                            .min(deadline.saturating_sub(c.clock.monotonic())),
-                    );
-                    wait_ms = (wait_ms * 2).min(40);
+                    wait.after_read(received, deadline, c);
                 }
             }
         }
@@ -414,12 +412,11 @@ impl HidProvider {
         &mut self,
         b: Battery,
         info: &HidInfo,
-        group: &str,
-        slot: u8,
+        slot_key: LogitechSlot,
         c: &PollContext<'_>,
         output: &mut BTreeMap<String, Reading>,
     ) {
-        let slot_key = format!("{:04x}:{group}:{slot}", info.product_id);
+        let ((_, group), slot) = &slot_key;
         let (name, kind, unit) = self
             .logitech_identity
             .get(&slot_key)
@@ -439,7 +436,7 @@ impl HidProvider {
                 }
             });
         let unit = (!unit.is_empty()).then_some(unit);
-        let (key, serial) = logitech_reading_identity(info, group, slot, unit);
+        let (key, serial) = logitech_reading_identity(info, group, *slot, unit);
         if let Some(old) = self.logitech_slots.insert(slot_key, key.clone())
             && old != key
         {
@@ -456,9 +453,7 @@ impl HidProvider {
             reading.charging = charging;
             reading.via = "wireless".into();
         }
-        self.last_observed.insert(key.clone(), c.clock.monotonic());
-        self.last.insert(key, reading.clone());
-        output.insert(reading.key.clone(), reading);
+        output.insert(key, reading);
     }
     fn poll_added115(
         &mut self,

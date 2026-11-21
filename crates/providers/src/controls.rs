@@ -361,6 +361,9 @@ impl DeviceController for HidDeviceController {
             .into(),
         });
         ControlOutcome {
+            failure_target: observation
+                .is_none()
+                .then(|| Box::new(request.target.clone())),
             request: request.request,
             key: reading.key.clone(),
             observation,

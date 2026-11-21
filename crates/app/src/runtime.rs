@@ -534,22 +534,30 @@ fn leave_quiet_mode<'a>(
         }
     }
 }
+#[derive(Default)]
+struct EventWindow {
+    hwnd: AtomicUsize,
+    posted: AtomicBool,
+}
 #[derive(Clone)]
 pub(super) struct Events {
     tx: Sender<Event>,
-    window: Arc<AtomicUsize>,
+    window: Arc<EventWindow>,
 }
 impl Events {
     fn wake(&self) {
-        let hwnd = self.window.load(Ordering::Acquire);
-        if hwnd != 0 {
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+        let hwnd = self.window.hwnd.load(Ordering::Acquire);
+        if hwnd != 0 && !self.window.posted.swap(true, Ordering::AcqRel) {
+            let result = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(windows::Win32::Foundation::HWND(hwnd as *mut _)),
                     windows::Win32::UI::WindowsAndMessaging::WM_APP + 7,
                     windows::Win32::Foundation::WPARAM(0),
                     windows::Win32::Foundation::LPARAM(0),
-                );
+                )
+            };
+            if result.is_err() {
+                self.window.posted.store(false, Ordering::Release);
             }
         }
     }
@@ -774,13 +782,12 @@ struct ControlPolicy {
     playstation_full_mode: bool,
     bluetooth: bool,
     disabled_providers: BTreeSet<String>,
-    automation: BTreeMap<
-        String,
-        (
-            Option<PollingRate>,
-            Option<hb_core::settings::LowBatteryMode>,
-        ),
-    >,
+    automation: BTreeMap<String, AutomationPolicy>,
+}
+#[derive(PartialEq, Eq)]
+struct AutomationPolicy {
+    boost: Option<(PollingRate, Box<str>)>,
+    saver: Option<(hb_core::settings::LowBatteryMode, Box<str>)>,
 }
 impl From<&Settings> for ControlPolicy {
     fn from(settings: &Settings) -> Self {
@@ -794,9 +801,34 @@ impl From<&Settings> for ControlPolicy {
                 .devices
                 .iter()
                 .filter_map(|(key, preference)| {
-                    let boost = preference.fullscreen_boost_rate;
-                    let saver = preference.low_battery_mode;
-                    (boost.is_some() || saver.is_some()).then(|| (key.clone(), (boost, saver)))
+                    let boost = preference
+                        .fullscreen_boost_rate
+                        .filter(|_| preference.boost_registered(key))
+                        .map(|r| {
+                            (
+                                r,
+                                preference
+                                    .boost_owner_container
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .into(),
+                            )
+                        });
+                    let saver = preference
+                        .low_battery_mode
+                        .filter(|_| preference.saver_registered(key))
+                        .map(|m| {
+                            (
+                                m,
+                                preference
+                                    .saver_owner_container
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .into(),
+                            )
+                        });
+                    (boost.is_some() || saver.is_some())
+                        .then(|| (key.clone(), AutomationPolicy { boost, saver }))
                 })
                 .collect(),
         }
@@ -1032,7 +1064,6 @@ pub struct Runtime {
     permission: Arc<ControlPermission>,
     sink: Events,
     cancel: Arc<AtomicBool>,
-    window: Arc<AtomicUsize>,
     configuration: Arc<ConfigurationWatch>,
 }
 impl Runtime {
@@ -1051,10 +1082,9 @@ impl Runtime {
             permission: permission.clone(),
             configuration: configuration.clone(),
         };
-        let window = Arc::new(AtomicUsize::new(0));
         let sink = Events {
             tx: events,
-            window: window.clone(),
+            window: Arc::default(),
         };
         let output = sink.clone();
         let thread = thread::Builder::new()
@@ -1069,22 +1099,20 @@ impl Runtime {
             permission,
             sink,
             cancel,
-            window,
             configuration,
         })
     }
     pub fn attach_window(&self, hwnd: usize) {
-        self.window.store(hwnd, Ordering::Release);
-        if hwnd != 0 && !self.events.is_empty() {
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(windows::Win32::Foundation::HWND(hwnd as *mut _)),
-                    windows::Win32::UI::WindowsAndMessaging::WM_APP + 7,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                );
-            }
+        self.sink.window.hwnd.store(hwnd, Ordering::Release);
+        self.begin_event_drain();
+        if !self.events.is_empty() {
+            self.sink.wake();
         }
+    }
+    /// Clear before receiving: a concurrent producer either joins this drain
+    /// or posts another wake after it has finished.
+    pub(super) fn begin_event_drain(&self) {
+        self.sink.window.posted.swap(false, Ordering::AcqRel);
     }
     pub(super) fn power_signals(&self) -> PowerSignals {
         PowerSignals {
@@ -1646,6 +1674,34 @@ fn probe_sleep_recovery(
     Ok(())
 }
 
+/// Limit journal supersession to the specific wireless unit that was observed
+/// handing off to the cable. The HID request still targets only the wired device.
+pub(crate) fn manual_handoff_owner(
+    device: &ConfigurationDevice,
+    sleep: bool,
+    saver: &crate::battery_saver::BatterySaver,
+    boost: &crate::boost::Boost,
+) -> Option<Box<ConfigurationDevice>> {
+    if !device.wired_mouse() {
+        return None;
+    }
+    let key = device.shared_preference_key()?;
+    let saver = saver.wired_handoff_owner(&key, sleep);
+    let boost = if sleep {
+        None
+    } else {
+        boost.wired_handoff_owner(&key)
+    };
+    if let (Some(a), Some(b)) = (saver, boost)
+        && !a.same_control_unit(b)
+    {
+        return None;
+    }
+    let owner = saver.or(boost)?;
+    (crate::recovery::strong_identity(owner) && owner.charging_alias(device))
+        .then(|| Box::new(owner.clone()))
+}
+
 fn polling_recovery_operation(
     request: &ControlRequest,
     boost: Option<&crate::boost::Guard>,
@@ -1656,6 +1712,7 @@ fn polling_recovery_operation(
     let desired = request.action.rate()?.hz();
     if manual_polling_change(request) {
         return Some(Operation::ManualBegin {
+            handoff: None,
             device: request.target.device.clone(),
             kind: SettingKind::Polling,
             desired,
@@ -1710,6 +1767,7 @@ fn sleep_recovery_operation(
             return Some(Operation::Blocked);
         }
         return Some(Operation::ManualBegin {
+            handoff: None,
             device: request.target.device.clone(),
             kind: SettingKind::Sleep,
             desired,
@@ -1764,6 +1822,7 @@ fn finish_polling_recovery(
         }
         Operation::ManualBegin {
             device,
+            handoff,
             kind,
             desired,
         } => {
@@ -1774,6 +1833,7 @@ fn finish_polling_recovery(
                 });
             if completed || outcome.failure.is_some() && !outcome.may_have_changed {
                 Some(Operation::ManualFinish {
+                    handoff: handoff.clone(),
                     device: device.clone(),
                     kind: *kind,
                     completed,
@@ -1831,6 +1891,7 @@ fn finish_sleep_recovery(
         }
         Operation::ManualBegin {
             device,
+            handoff,
             kind,
             desired,
         } => {
@@ -1841,6 +1902,7 @@ fn finish_sleep_recovery(
                     .is_some_and(|seconds| u32::from(seconds) == *desired);
             if completed || outcome.failure.is_some() && !outcome.may_have_changed {
                 Some(Operation::ManualFinish {
+                    handoff: handoff.clone(),
                     device: device.clone(),
                     kind: *kind,
                     completed,
@@ -3312,6 +3374,7 @@ fn simulate_control(
     target.generation = generation;
     target.connection_stamp = ConnectionStamp::new(1);
     ControlOutcome {
+        failure_target: None,
         request: request.request,
         key: target.device.key.clone(),
         observation: Some(PollingObservation {
@@ -3411,7 +3474,9 @@ fn validate_polling_completion(outcome: &mut ControlOutcome, generation: u64, pe
             .as_ref()
             .is_some_and(|o| o.target.generation != generation)
     {
-        outcome.observation = None;
+        if let Some(observation) = outcome.observation.take() {
+            outcome.failure_target = Some(Box::new(observation.target));
+        }
         outcome.failure =
             Some("Configuration permission or connection changed; refresh before retrying".into());
     }
@@ -4907,6 +4972,7 @@ fn run(
             Work::Command(Ok(Command::Sleep(request, epoch, visible))) => {
                 let saver_cancel = saver.cancel(request.request);
                 let manual_sleep_change = saver_cancel.is_none() && request.seconds.is_some();
+                let mut handoff = None;
                 if manual_sleep_change {
                     if recovery_pending && let Ok(mut journal) = recovery.try_lock() {
                         journal
@@ -4919,6 +4985,7 @@ fn run(
                         &engine.readings(),
                         clock.unix(),
                     );
+                    handoff = manual_handoff_owner(&request.target.device, true, &saver, &boost);
                     saver.manual(&request.target.device, true);
                 }
                 let allowed = epoch == permission.epoch.load(Ordering::Acquire)
@@ -4965,7 +5032,8 @@ fn run(
                         .restoring(request.request)
                         .zip(saver.recovery_choices(request.request));
                     let recovery_op =
-                        sleep_recovery_operation(&request, saver_cancel.is_some(), saver_info);
+                        sleep_recovery_operation(&request, saver_cancel.is_some(), saver_info)
+                            .map(|op| op.with_manual_handoff(handoff));
                     match jobs.try_send(WorkerJob::Sleep(
                         Box::new(request.clone()),
                         saver_cancel.unwrap_or_else(|| control_cancel.clone()),
@@ -5038,6 +5106,7 @@ fn run(
                 let automatic = request.request & crate::boost::REQUEST_BIT != 0;
                 let saver_cancel = saver.cancel(request.request);
                 let saver_request = request.request & crate::battery_saver::REQUEST_BIT != 0;
+                let mut handoff = None;
                 if manual_polling_change(&request) {
                     if recovery_pending && let Ok(mut journal) = recovery.try_lock() {
                         journal.suppress(
@@ -5055,6 +5124,7 @@ fn run(
                         &engine.readings(),
                         clock.unix(),
                     );
+                    handoff = manual_handoff_owner(&request.target.device, false, &saver, &boost);
                     saver.manual(&request.target.device, false);
                     boost.manual_device(&request.target.device);
                 }
@@ -5163,7 +5233,8 @@ fn run(
                         boost_guard.as_ref(),
                         saver_request,
                         saver_info,
-                    );
+                    )
+                    .map(|op| op.with_manual_handoff(handoff));
                     match jobs.try_send(WorkerJob::Polling(
                         Box::new(request.clone()),
                         saver_cancel
@@ -5762,6 +5833,7 @@ mod tests {
             polling_controls: true,
             ..Default::default()
         };
+        crate::bind_test_mouse(&mut settings, &mut reading);
         if let crate::recovery::Layer::SaverPolling(mode)
         | crate::recovery::Layer::SaverSleep(mode) = layer
         {
@@ -5888,6 +5960,7 @@ mod tests {
                 polling_controls: true,
                 ..Default::default()
             };
+            crate::bind_test_mouse(&mut settings, &mut reading);
             let preference = settings.device_mut(&reading.key);
             preference.low_battery_mode = Some(LowBatteryMode {
                 threshold: 20,
@@ -6192,6 +6265,7 @@ mod tests {
             polling_controls: true,
             ..Default::default()
         };
+        crate::bind_test_mouse(&mut settings, &mut reading);
         settings.device_mut(&reading.key).fullscreen_boost_rate = PollingRate::try_from(4000).ok();
         let mut boost = crate::boost::Boost::new(now);
         let mut saver = crate::battery_saver::BatterySaver::default();
@@ -6508,6 +6582,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(Operation::ManualBegin {
+                handoff: None,
                 device: record.device.clone(),
                 kind: SettingKind::Polling,
                 desired: 4000,
@@ -6517,6 +6592,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(Operation::ManualFinish {
+                handoff: None,
                 device: record.device.clone(),
                 kind: SettingKind::Polling,
                 completed: true,
@@ -6733,6 +6809,7 @@ mod tests {
             reading.serial = Some("TEST".into());
             reading.level = Some(10);
             reading.charging = Some(false);
+            reading.container = Some("RECOVERY-TEST".into());
             let mode = LowBatteryMode {
                 threshold: 20,
                 polling_rate: PollingRate::try_from(125).ok(),
@@ -6758,6 +6835,7 @@ mod tests {
                 polling_controls: true,
                 ..Default::default()
             };
+            crate::bind_test_mouse(&mut settings, &mut reading);
             settings.device_mut(&reading.key).low_battery_mode = Some(mode);
             let mut saver = crate::battery_saver::BatterySaver::default();
             let mut boost = crate::boost::Boost::new(Instant::now());
@@ -6802,7 +6880,7 @@ mod tests {
         let (events, _event_rx) = bounded(16);
         let sink = Events {
             tx: events,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let path = folder.path().to_owned();
         let worker = thread::spawn(move || crate::storage_worker::run(path, receiver, boot, sink));
@@ -6879,7 +6957,7 @@ mod tests {
             let (events, _event_rx) = bounded(16);
             let sink = Events {
                 tx: events,
-                window: Arc::new(AtomicUsize::new(0)),
+                window: Arc::default(),
             };
             let path = folder.path().to_owned();
             let worker =
@@ -6987,7 +7065,7 @@ mod tests {
             let (events, _event_rx) = bounded(16);
             let sink = Events {
                 tx: events,
-                window: Arc::new(AtomicUsize::new(0)),
+                window: Arc::default(),
             };
             let path = folder.path().to_owned();
             let worker =
@@ -7132,6 +7210,7 @@ mod tests {
             polling_controls: true,
             ..Default::default()
         };
+        crate::bind_test_mouse(&mut settings, &mut reading);
         let preferences = settings.device_mut(&reading.key);
         preferences.low_battery_mode = Some(LowBatteryMode {
             threshold: 20,
@@ -7350,6 +7429,7 @@ mod tests {
                     polling_controls: true,
                     ..Default::default()
                 };
+                crate::bind_test_mouse(&mut settings, &mut reading);
                 settings
                     .devices
                     .entry(reading.key.clone())
@@ -7704,7 +7784,7 @@ mod tests {
         let (tx, events) = bounded(1);
         let sink = Events {
             tx,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let (storage, statuses) = bounded(1);
         let mut engine = Engine::new(Settings::default(), Estimator::default());
@@ -7750,7 +7830,7 @@ mod tests {
         let (tx, events) = bounded(1);
         let sink = Events {
             tx,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let (storage, statuses) = bounded(1);
         let mut engine = Engine::new(Settings::default(), Estimator::default());
@@ -7809,7 +7889,7 @@ mod tests {
         let (tx, events) = bounded(8);
         let sink = Events {
             tx,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let (storage, statuses) = bounded(8);
         let mut engine = Engine::new(
@@ -7922,7 +8002,7 @@ mod tests {
         let (tx, events) = bounded(1);
         let sink = Events {
             tx,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let (storage, statuses) = bounded(1);
         let mut engine = Engine::new(
@@ -8200,10 +8280,9 @@ mod tests {
                 permission: Arc::new(ControlPermission::new(true)),
                 sink: Events {
                     tx,
-                    window: Arc::new(AtomicUsize::new(0)),
+                    window: Arc::default(),
                 },
                 cancel: Arc::new(AtomicBool::new(false)),
-                window: Arc::new(AtomicUsize::new(0)),
                 configuration,
             };
             // Native resize/show notifications can repeat the same visibility.
@@ -8341,7 +8420,7 @@ mod tests {
         let (tx, rx) = bounded(1);
         let events = Events {
             tx,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let mut diagnostics = BTreeMap::new();
         let mut dirty = update_diagnostics(&mut diagnostics, "test", vec!["ready".into()]);
@@ -8669,7 +8748,7 @@ mod tests {
         let (event_tx, events) = bounded(16);
         let sink = Events {
             tx: event_tx,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let folder = directory.path().to_path_buf();
         let worker = thread::spawn(move || crate::storage_worker::run(folder, rx, boot_tx, sink));
@@ -9998,10 +10077,9 @@ mod tests {
             permission: Arc::new(ControlPermission::new(true)),
             sink: Events {
                 tx: event_tx,
-                window: Arc::new(AtomicUsize::new(0)),
+                window: Arc::default(),
             },
             cancel: Arc::new(AtomicBool::new(false)),
-            window: Arc::new(AtomicUsize::new(0)),
         };
         assert!(
             runtime
@@ -10119,10 +10197,9 @@ mod tests {
             permission: permission.clone(),
             sink: Events {
                 tx: event_tx,
-                window: Arc::new(AtomicUsize::new(0)),
+                window: Arc::default(),
             },
             cancel: Arc::new(AtomicBool::new(false)),
-            window: Arc::new(AtomicUsize::new(0)),
         };
         runtime.power_signals().notify(true);
         runtime.power_signals().notify(false);
@@ -10150,6 +10227,98 @@ mod tests {
         assert_ne!(permission.epoch.load(Ordering::Acquire), stale);
     }
     #[test]
+    fn event_bursts_share_one_window_message_and_rearm_after_draining() {
+        use windows::{Win32::UI::WindowsAndMessaging::*, core::w};
+        let (commands, _) = bounded(1);
+        let (tx, events) = bounded(64);
+        let runtime = Runtime {
+            device_signals: DeviceSignals::channel().0,
+            configuration: Arc::default(),
+            commands,
+            events,
+            thread: None,
+            permission: Arc::new(ControlPermission::new(false)),
+            sink: Events {
+                tx,
+                window: Arc::default(),
+            },
+            cancel: Arc::default(),
+        };
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                None,
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let take = || {
+                PeekMessageW(
+                    &mut MSG::default(),
+                    Some(hwnd),
+                    WM_APP + 7,
+                    WM_APP + 7,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            runtime.sink.send(Event::Heartbeat(0)).unwrap();
+            runtime.attach_window(hwnd.0 as usize);
+            for i in 1..32 {
+                runtime.sink.try_send(Event::Heartbeat(i)).unwrap();
+            }
+            assert!(take());
+            assert!(!take());
+            runtime.begin_event_drain();
+            assert_eq!(runtime.events.try_iter().count(), 32);
+            runtime.sink.send(Event::Heartbeat(32)).unwrap();
+            assert!(take());
+            runtime.attach_window(0);
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
+    #[test]
+    fn rebinding_an_unchanged_automatic_setting_revokes_previous_permission() {
+        use hb_core::settings::LowBatteryMode;
+        for boost in [false, true] {
+            let key = "razer:00bf:SHARED";
+            let mut settings = Settings::default();
+            let p = settings.device_mut(key);
+            if boost {
+                p.fullscreen_boost_rate = PollingRate::try_from(4000).ok();
+            } else {
+                p.low_battery_mode = Some(LowBatteryMode {
+                    threshold: 20,
+                    sleep_seconds: Some(60),
+                    polling_rate: None,
+                });
+            }
+            let unbound = ControlPolicy::from(&settings);
+            assert!(unbound.automation.is_empty());
+            let bind = |s: &mut Settings, owner: &str| {
+                let p = s.device_mut(key);
+                if boost {
+                    p.boost_owner_container = Some(owner.into());
+                } else {
+                    p.saver_owner_container = Some(owner.into());
+                }
+            };
+            bind(&mut settings, "original");
+            let original = ControlPolicy::from(&settings);
+            assert!(original != unbound);
+            bind(&mut settings, "replacement");
+            assert!(ControlPolicy::from(&settings) != original);
+        }
+    }
+    #[test]
     fn full_queue_cannot_lose_configuration_revocation_or_revive_old_jobs() {
         let (commands, _rx) = bounded(1);
         commands.send(Command::Refresh).unwrap();
@@ -10164,10 +10333,9 @@ mod tests {
             permission: permission.clone(),
             sink: Events {
                 tx: event_tx,
-                window: Arc::new(AtomicUsize::new(0)),
+                window: Arc::default(),
             },
             cancel: Arc::new(AtomicBool::new(false)),
-            window: Arc::new(AtomicUsize::new(0)),
         };
         runtime.send(Command::Settings(Settings::default()));
         assert!(!permission.enabled.load(Ordering::Acquire));
@@ -10418,7 +10586,7 @@ mod tests {
         let (boot, ready) = bounded(1);
         let sink = Events {
             tx: events,
-            window: Arc::new(AtomicUsize::new(0)),
+            window: Arc::default(),
         };
         let worker = thread::spawn(move || crate::storage_worker::run(folder, rx, boot, sink));
         let _ = ready.recv_timeout(Duration::from_secs(5)).unwrap();

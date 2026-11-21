@@ -107,7 +107,9 @@ impl Record {
         rates.contains(&self.before) && rates.contains(&self.applied)
     }
     fn same_slot(&self, other: &Self) -> bool {
-        self.device.key == other.device.key && self.layer.slot() == other.layer.slot()
+        self.device.key == other.device.key
+            && self.device.same_control_unit(&other.device)
+            && self.layer.slot() == other.layer.slot()
     }
 }
 
@@ -163,15 +165,37 @@ pub enum Operation {
     },
     ManualBegin {
         device: ConfigurationDevice,
+        handoff: Option<Box<ConfigurationDevice>>,
         kind: SettingKind,
         desired: u32,
     },
     ManualFinish {
         device: ConfigurationDevice,
+        handoff: Option<Box<ConfigurationDevice>>,
         kind: SettingKind,
         completed: bool,
     },
     Blocked,
+}
+
+impl Operation {
+    pub fn with_manual_handoff(mut self, owner: Option<Box<ConfigurationDevice>>) -> Self {
+        if let Self::ManualBegin { handoff, .. } = &mut self {
+            *handoff = owner;
+        }
+        self
+    }
+}
+
+fn manual_matches(
+    record: &Record,
+    device: &ConfigurationDevice,
+    handoff: Option<&ConfigurationDevice>,
+    kind: SettingKind,
+) -> bool {
+    record.layer.kind() == kind
+        && (record.device.same_control_unit(device)
+            || handoff.is_some_and(|owner| record.device.same_control_unit(owner)))
 }
 
 impl Journal {
@@ -269,7 +293,7 @@ impl Journal {
     /// durably suspends the same setting before it may issue the user's SET.
     pub fn suppress(&mut self, device: &ConfigurationDevice, kind: SettingKind) {
         for slot in &mut self.slots {
-            if slot.record.layer.kind() == kind && same_unit(&slot.record.device, device) {
+            if slot.record.layer.kind() == kind && slot.record.device.same_control_unit(device) {
                 slot.pending = false;
             }
         }
@@ -278,7 +302,7 @@ impl Journal {
         for slot in &mut self.slots {
             if !slot.record.manual_pending
                 && slot.record.layer.kind() == kind
-                && same_unit(&slot.record.device, device)
+                && slot.record.device.same_control_unit(device)
             {
                 slot.pending = true;
             }
@@ -368,7 +392,7 @@ impl Journal {
                     || self.slots.iter().any(|s| {
                         s.record.manual_pending
                             && s.record.layer.kind() == record.layer.kind()
-                            && same_unit(&s.record.device, &record.device)
+                            && s.record.device.same_control_unit(&record.device)
                     })
                 {
                     return Err(ProviderError::new(
@@ -495,78 +519,52 @@ impl Journal {
                     .collect();
                 self.replace(next)
             }
-            Operation::ManualBegin { device, kind, .. } => {
-                if !self.slots.iter().any(|slot| {
-                    slot.record.layer.kind() == kind && same_unit(&slot.record.device, &device)
-                }) {
+            Operation::ManualBegin {
+                device,
+                handoff,
+                kind,
+                ..
+            } => {
+                let matches =
+                    |slot: &Slot| manual_matches(&slot.record, &device, handoff.as_deref(), kind);
+                if !self.slots.iter().any(matches) {
                     return Ok(());
                 }
                 let mut next = self.copy_slots();
-                let mut changed = false;
-                for slot in &mut next {
-                    if slot.record.layer.kind() == kind && same_unit(&slot.record.device, &device) {
-                        slot.rollback_manual = !slot.record.manual_pending;
-                        slot.record.manual_pending = true;
-                        slot.pending = false;
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    return Ok(());
+                for slot in next.iter_mut().filter(|s| matches(s)) {
+                    slot.rollback_manual = !slot.record.manual_pending;
+                    slot.record.manual_pending = true;
+                    slot.pending = false;
                 }
                 self.replace(next)
             }
             Operation::ManualFinish {
                 device,
+                handoff,
                 kind,
                 completed,
             } => {
-                if !self.slots.iter().any(|slot| {
-                    slot.record.layer.kind() == kind
-                        && same_unit(&slot.record.device, &device)
-                        && (completed || slot.rollback_manual)
-                }) {
+                let matches = |slot: &Slot| {
+                    (completed || slot.rollback_manual)
+                        && manual_matches(&slot.record, &device, handoff.as_deref(), kind)
+                };
+                if !self.slots.iter().any(matches) {
                     return Ok(());
                 }
                 let mut next = self.copy_slots();
-                let mut changed = false;
                 if completed {
-                    next.retain(|slot| {
-                        let matched = slot.record.layer.kind() == kind
-                            && same_unit(&slot.record.device, &device);
-                        changed |= matched;
-                        !matched
-                    });
+                    next.retain(|slot| !matches(slot));
                 } else {
-                    for slot in &mut next {
-                        if slot.record.layer.kind() == kind
-                            && same_unit(&slot.record.device, &device)
-                            && slot.rollback_manual
-                        {
-                            slot.record.manual_pending = false;
-                            slot.pending = true;
-                            slot.rollback_manual = false;
-                            changed = true;
-                        }
+                    for slot in next.iter_mut().filter(|s| matches(s)) {
+                        slot.record.manual_pending = false;
+                        slot.pending = true;
+                        slot.rollback_manual = false;
                     }
-                }
-                if !changed {
-                    return Ok(());
                 }
                 self.replace(next)
             }
         }
     }
-}
-
-fn same_unit(a: &ConfigurationDevice, b: &ConfigurationDevice) -> bool {
-    a.key == b.key
-        || a.serial
-            .as_deref()
-            .zip(b.serial.as_deref())
-            .is_some_and(|(a, b)| a.trim().eq_ignore_ascii_case(b.trim()))
-            && a.shared_preference_key()
-                .is_some_and(|key| b.shared_preference_key().as_ref() == Some(&key))
 }
 
 /// A changed native connection may be rebound only when the original hardware
@@ -662,6 +660,90 @@ mod tests {
             expected: record.applied,
             desired,
             actual,
+        }
+    }
+
+    #[test]
+    fn manual_changes_on_a_reused_serial_leave_the_other_units_journal_intact() {
+        for (layer, before, applied) in [
+            (Layer::BoostPolling, 1000, 4000),
+            (Layer::SaverSleep(choices()), 300, 60),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let original = record("SHARED", layer, before, applied);
+            let mut replacement = original.clone();
+            replacement.device.container = Some("112233445566778899AABBCCDDEEFF00".into());
+            replacement.stamp = ConnectionStamp::new(2).unwrap();
+            let mut journal = Journal::open(dir.path());
+            prepare(&mut journal, &original, true);
+            prepare(&mut journal, &replacement, true);
+            let mut journal = Journal::open(dir.path());
+            let kind = layer.kind();
+            journal.suppress(&replacement.device, kind);
+            assert!(journal.has_pending());
+            journal
+                .execute(Operation::ManualBegin {
+                    handoff: None,
+                    device: replacement.device.clone(),
+                    kind,
+                    desired: before,
+                })
+                .unwrap();
+            journal
+                .execute(Operation::ManualFinish {
+                    handoff: None,
+                    device: replacement.device,
+                    kind,
+                    completed: true,
+                })
+                .unwrap();
+            let mut journal = Journal::open(dir.path());
+            assert_eq!(journal.slots.len(), 1);
+            assert!(journal.has_pending());
+            journal.execute(restore(&original, before)).unwrap();
+        }
+    }
+    #[test]
+    fn wired_override_only_retires_the_proven_wireless_owners_record_after_restart() {
+        for layer in [Layer::BoostPolling, Layer::SaverSleep(choices())] {
+            let (before, applied) = if layer == Layer::BoostPolling {
+                (1000, 4000)
+            } else {
+                (300, 60)
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let original = record("SHARED", layer, before, applied);
+            let mut other = original.clone();
+            other.device.container = Some("112233445566778899AABBCCDDEEFF00".into());
+            let mut journal = Journal::open(dir.path());
+            for item in [&original, &other] {
+                prepare(&mut journal, item, true);
+            }
+            let mut cable = original.device.clone();
+            cable.key = "razer:00be:SHARED".into();
+            cable.container = Some("another-windows-container".into());
+            for handoff in [None, Some(Box::new(original.device.clone()))] {
+                let proven = handoff.is_some();
+                journal
+                    .execute(Operation::ManualBegin {
+                        handoff: handoff.clone(),
+                        device: cable.clone(),
+                        kind: layer.kind(),
+                        desired: before,
+                    })
+                    .unwrap();
+                journal
+                    .execute(Operation::ManualFinish {
+                        handoff,
+                        device: cable.clone(),
+                        kind: layer.kind(),
+                        completed: true,
+                    })
+                    .unwrap();
+                journal = Journal::open(dir.path());
+                assert_eq!(journal.slots.len(), if proven { 1 } else { 2 });
+            }
+            assert_eq!(journal.slots[0].record.device, other.device);
         }
     }
 
@@ -820,6 +902,7 @@ mod tests {
         wired.key = "razer:00be:TEST".into();
         journal
             .execute(Operation::ManualBegin {
+                handoff: None,
                 device: wired.clone(),
                 kind: SettingKind::Sleep,
                 desired: 300,
@@ -827,6 +910,7 @@ mod tests {
             .unwrap();
         journal
             .execute(Operation::ManualFinish {
+                handoff: None,
                 device: wired,
                 kind: SettingKind::Sleep,
                 completed: true,
@@ -904,6 +988,7 @@ mod tests {
             prepare(&mut journal, &item, true);
             journal
                 .execute(Operation::ManualBegin {
+                    handoff: None,
                     device: item.device.clone(),
                     kind: SettingKind::Sleep,
                     desired: 600,
@@ -916,6 +1001,7 @@ mod tests {
             assert!(restarted.execute(restore(&item, 300)).is_err());
             restarted
                 .execute(Operation::ManualFinish {
+                    handoff: None,
                     device: item.device.clone(),
                     kind: SettingKind::Sleep,
                     completed,
@@ -939,6 +1025,7 @@ mod tests {
         prepare(&mut journal, &item, true);
         journal
             .execute(Operation::ManualBegin {
+                handoff: None,
                 device: item.device.clone(),
                 kind: SettingKind::Sleep,
                 desired: 600,
@@ -946,6 +1033,7 @@ mod tests {
             .unwrap();
         journal
             .execute(Operation::ManualFinish {
+                handoff: None,
                 device: item.device,
                 kind: SettingKind::Sleep,
                 completed: false,
@@ -966,11 +1054,13 @@ mod tests {
         for operation in [
             Operation::FailedPrepare(other.clone()),
             Operation::ManualBegin {
+                handoff: None,
                 device: other.device.clone(),
                 kind: SettingKind::Sleep,
                 desired: 300,
             },
             Operation::ManualFinish {
+                handoff: None,
                 device: other.device,
                 kind: SettingKind::Sleep,
                 completed: true,

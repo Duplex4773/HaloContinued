@@ -247,6 +247,9 @@ pub(crate) fn execute(
         } else {format!("Onboard or unknown mode; effective polling rate unavailable; software-control rate {hz} Hz")},
     });
     ControlOutcome {
+        failure_target: observation
+            .is_none()
+            .then(|| Box::new(request.target.clone())),
         request: request.request,
         key: reading.key.clone(),
         observation,

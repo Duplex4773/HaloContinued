@@ -2,6 +2,7 @@
 //! drafts and validation. Card resources exist only while the dashboard is open.
 use super::*;
 use std::borrow::Cow;
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 
 const FIRST_CARD: u16 = 1000;
 const LAST_CARD: u16 = 32767;
@@ -189,7 +190,7 @@ impl State {
         let saved = self
             .settings
             .device(key)
-            .and_then(|p| p.fullscreen_boost_rate);
+            .and_then(|p| p.boost_for(&descriptor.source, descriptor.container.as_deref()));
         let observation = self
             .polling
             .observations
@@ -230,7 +231,11 @@ impl State {
                         MF_UNCHECKED
                     }
                     | if (rate.is_none() && saved.is_some())
-                        || (self.settings.polling_controls && descriptor.online())
+                        || (rate.is_some()
+                            && self.settings.polling_controls
+                            && descriptor.online()
+                            && (!descriptor.requires_polling_owner()
+                                || descriptor.polling_owner().is_some()))
                     {
                         MF_ENABLED
                     } else {
@@ -767,14 +772,6 @@ impl State {
         if self.controls.contains_key(&49) {
             self.set_control_text(48, "Fullscreen boost");
             self.set_control_text(49, if self.checked(49) { "On" } else { "Off" });
-            self.set_control_text(
-                465,
-                if self.checked(49) {
-                    "Restore your desktop rate after the game"
-                } else {
-                    "Use a higher rate in fullscreen games"
-                },
-            );
             self.overview_place(48, inside, y + 14, inner_width - 145, 22, true);
             self.overview_place(465, inside, y + 38, inner_width - 145, 22, true);
             self.overview_place(50, edge - 136, y + 17, 90, 280, true);
@@ -846,11 +843,22 @@ impl State {
                     },
                 );
                 self.overview_place(473, right - 177, y + 7, 115, 32, true);
-                let saved = self
-                    .current_device()
-                    .and_then(|(d, _)| self.settings.device(&d.key)?.low_battery_mode);
+                let device = current_device_state(
+                    &self.snapshot.devices,
+                    &self.configuration_devices,
+                    self.selected_device.as_deref(),
+                )
+                .map(|(d, _)| d);
+                let preference = device.and_then(|d| self.settings.device(d.key));
+                let saved = device.and_then(|d| preference?.saver_for(d.source, d.container));
+                let can_bind = self
+                    .controls
+                    .get(&440)
+                    .is_some_and(|h| unsafe { IsWindowEnabled(*h).as_bool() });
                 let summary = if !self.settings.polling_controls {
                     "Allow device settings changes in Settings.".to_owned()
+                } else if !can_bind {
+                    "Reconnect the mouse so Windows can identify it.".to_owned()
                 } else if let Some(saved) = saved.filter(|_| self.checked(440)) {
                     format!(
                         "Save power at {}% or below. Game boost takes priority.",
@@ -858,6 +866,10 @@ impl State {
                     )
                 } else if self.checked(440) {
                     "Choose settings, then select Save.".to_owned()
+                } else if preference.is_some_and(|p| {
+                    p.low_battery_mode.is_some() && p.saver_owner_container.is_none()
+                }) {
+                    "Turn Battery saver on again to confirm this mouse.".to_owned()
                 } else if self.sleep.saver_details {
                     "Turn on Battery saver to save these settings.".to_owned()
                 } else {
@@ -865,7 +877,7 @@ impl State {
                 };
                 self.set_control_text(466, &summary);
                 self.overview_place(466, x, y + 31, width - 186, 33, true);
-                self.enable_control(446, self.settings.polling_controls && self.checked(440));
+                self.enable_control(446, can_bind && self.checked(440));
                 if self.sleep.saver_details {
                     for (id, dx, dy, w, h) in [
                         (441, 0, 76, 200, 24),

@@ -967,10 +967,12 @@ impl Store {
             });
         }
         let since = total.saturating_sub(seconds.max(1)).max(0);
-        let buckets = limit.saturating_sub(2) / 2;
-        let mut extremes: Vec<Option<(Sample, Sample)>> = vec![None; buckets];
+        let slots = limit.saturating_sub(2);
+        let buckets = if slots == 2 { 1 } else { slots / 3 };
+        let mut extremes: Vec<Option<(Sample, Sample, Option<Sample>)>> = vec![None; buckets];
         let mut baseline: Option<Sample> = None;
         let mut first = None;
+        let mut flat_run = false;
         let mut last: Option<Sample> = None;
         let checkpoint = index.as_ref().and_then(|i| i.before(since).or(i.segment));
         self.stream_usage(
@@ -987,27 +989,41 @@ impl Store {
                         .replace(payload, reading, position, ordinal);
                     return;
                 }
-                let sample = last.get_or_insert_with(Sample::default);
-                sample.replace(payload, reading, position, ordinal);
                 if first.is_none() {
-                    first = Some(baseline.take().unwrap_or_else(|| sample.clone()));
+                    first = Some(baseline.take().unwrap_or_else(|| {
+                        let mut sample = Sample::default();
+                        sample.replace(payload, reading, position, ordinal);
+                        sample
+                    }));
                 }
                 if buckets > 0 {
                     let span = total.saturating_sub(since).max(1);
                     let bucket = ((position.saturating_sub(since) as i128 * buckets as i128)
                         / span as i128)
                         .min(buckets as i128 - 1) as usize;
-                    if let Some((low, high)) = &mut extremes[bucket] {
-                        if sample.level < low.level {
-                            low.replace(payload, reading, position, ordinal);
-                        }
-                        if sample.level > high.level {
-                            high.replace(payload, reading, position, ordinal);
-                        }
-                    } else {
-                        extremes[bucket] = Some((sample.clone(), sample.clone()));
+                    let (low, high, before_drop) = extremes[bucket].get_or_insert_with(|| {
+                        let mut sample = Sample::default();
+                        sample.replace(payload, reading, position, ordinal);
+                        (sample.clone(), sample, None)
+                    });
+                    if reading.level < low.level {
+                        low.replace(payload, reading, position, ordinal);
+                    }
+                    if reading.level > high.level {
+                        high.replace(payload, reading, position, ordinal);
+                    }
+                    if slots >= 3
+                        && flat_run
+                        && let Some(previous) = &last
+                        && previous.level > reading.level
+                        && before_drop.is_none()
+                    {
+                        *before_drop = Some(previous.clone());
                     }
                 }
+                flat_run = last.as_ref().is_some_and(|old| old.level == reading.level);
+                last.get_or_insert_with(Sample::default)
+                    .replace(payload, reading, position, ordinal);
             },
         )?;
         snapshot.commit().map_err(sql_error)?;
@@ -1015,8 +1031,9 @@ impl Store {
         if let Some(sample) = first {
             samples.push(sample);
         }
-        for (low, high) in extremes.into_iter().flatten() {
+        for (low, high, before_drop) in extremes.into_iter().flatten() {
             samples.extend([low, high]);
+            samples.extend(before_drop);
         }
         if let Some(sample) = last {
             samples.push(sample);
@@ -2372,6 +2389,26 @@ mod tests {
         assert_eq!(series.axis, hb_core::HistoryAxis::Usage);
         assert_eq!(series.samples.last().unwrap().reading.timestamp, 10480);
         assert_eq!(series.samples.last().unwrap().position, 180);
+    }
+    #[test]
+    fn dense_usage_preserves_the_last_confirmed_flat_sample_before_a_drop() {
+        let (_dir, mut store) = baseline_store();
+        for minute in 0..600 {
+            let mut reading = Reading::new("usage", "Mouse", "test", minute * 60);
+            reading.charging = Some(false);
+            reading.level = Some(if minute < 375 { 90 } else { 60 });
+            store.record(&reading).unwrap();
+        }
+        store.flush().unwrap();
+        let series = store.query_usage("usage", 599 * 60, 86400, 24).unwrap();
+        assert!(series.samples.len() <= 24);
+        assert_eq!(series.until, 599 * 60);
+        let drop = series
+            .samples
+            .windows(2)
+            .find(|pair| pair[0].reading.level == Some(90) && pair[1].reading.level == Some(60))
+            .unwrap();
+        assert_eq!((drop[0].position, drop[1].position), (374 * 60, 375 * 60));
     }
     #[test]
     fn usage_excludes_app_gaps_and_sampling_does_not_change_total_or_device_scope() {

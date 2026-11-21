@@ -1329,7 +1329,7 @@ fn charge_cycle_text(cycle: &ChargeCycle) -> String {
 /// Coalesced lifecycle and tray recovery messages, held without an allocation or a timer.
 /// Reposting while a native modal loop owns State would keep that loop busy.
 #[derive(Default)]
-struct DeferredDashboard(Cell<[Option<(u32, usize)>; 6]>);
+struct DeferredDashboard(Cell<[Option<(u32, usize)>; 7]>);
 impl DeferredDashboard {
     fn push(&self, message: u32, parameter: usize) {
         let mut messages = self.0.get();
@@ -1354,6 +1354,7 @@ mod deferred_dashboard_tests {
         let queue = DeferredDashboard::default();
         let (_, allocated) = crate::allocation_counter::measure(|| {
             for index in 0..1000 {
+                queue.push(WM_APP + 7, 0);
                 queue.push(WM_APP + 8, 0);
                 queue.push(WM_APP + 9, index);
                 queue.push(WM_APP + 11, index);
@@ -1367,6 +1368,7 @@ mod deferred_dashboard_tests {
         assert_eq!(
             queue.0.get(),
             [
+                Some((WM_APP + 7, 0)),
                 Some((WM_APP + 9, 999)),
                 Some((WM_APP + 11, 999)),
                 Some((WM_APP + 12, 0)),
@@ -2104,6 +2106,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 WM_DEVICECHANGE => Some((WM_DEVICECHANGE, WPARAM(DBT_DEVNODES_CHANGED as usize))),
                 WM_CLOSE => Some((WM_APP + 9, WPARAM(hwnd.0 as usize))),
                 m if explorer_restarted
+                    || m == WM_APP + 7
                     || m == WM_APP + 8
                     || m == WM_APP + 9
                     || m == WM_APP + 11
@@ -3735,8 +3738,11 @@ impl State {
             .snapshot
             .devices
             .get(self.selected)
-            .and_then(|d| self.settings.device(&d.reading.key))
-            .and_then(|p| p.fullscreen_boost_rate)
+            .and_then(|d| {
+                self.settings
+                    .device(&d.reading.key)?
+                    .boost_for(&d.reading.source, d.reading.container.as_deref())
+            })
             .filter(|_| self.settings.polling_controls);
         let _redraw = DashboardRedraw::new(self.dashboard.unwrap());
         self.render_insight_cards(boost);
@@ -4221,7 +4227,7 @@ impl State {
                 let configured = self.current_device().is_some_and(|(d, _)| {
                     self.settings
                         .device(&d.key)
-                        .is_some_and(|p| p.low_battery_mode.is_some())
+                        .is_some_and(|p| p.saver_for(&d.source, d.container.as_deref()).is_some())
                 });
                 if !self.checked(440) || configured {
                     self.save_battery_saver();
@@ -4261,10 +4267,10 @@ impl State {
                         None
                     };
                     if self.checked(49) && rate.is_none() {
-                        let enabled = self
-                            .settings
-                            .device(&device.key)
-                            .is_some_and(|p| p.fullscreen_boost_rate.is_some());
+                        let enabled = self.settings.device(&device.key).is_some_and(|p| {
+                            p.boost_for(&device.source, device.container.as_deref())
+                                .is_some()
+                        });
                         if let Some(control) = self.controls.get(&49) {
                             unsafe {
                                 send(
@@ -4282,7 +4288,9 @@ impl State {
                         );
                         return;
                     }
-                    self.settings.device_mut(&device.key).fullscreen_boost_rate = rate;
+                    if !self.save_boost_choice(&device, rate) {
+                        return;
+                    }
                     self.set_control_text(49, if rate.is_some() { "On" } else { "Off" });
                     self.set_control_text(
                         465,
@@ -4363,31 +4371,11 @@ impl State {
                             .to_string(),
                         )
                     };
-                    self.settings.set_device(
-                        &key,
-                        DevicePreferences {
-                            low_battery_mode: self
-                                .settings
-                                .device(&key)
-                                .and_then(|p| p.low_battery_mode),
-                            name: hb_core::settings::device_name(&name),
-                            hidden,
-                            icon,
-                            low,
-                            fullscreen_boost_rate: self
-                                .settings
-                                .device(&key)
-                                .and_then(|p| p.fullscreen_boost_rate),
-                            polling_owner_container: self
-                                .settings
-                                .device(&key)
-                                .and_then(|p| p.polling_owner_container.clone()),
-                            requested_polling_rate: self
-                                .settings
-                                .device(&key)
-                                .and_then(|p| p.requested_polling_rate),
-                        },
-                    );
+                    let preferences = self.settings.device_mut(&key);
+                    preferences.name = hb_core::settings::device_name(&name);
+                    preferences.hidden = hidden;
+                    preferences.icon = icon;
+                    preferences.low = low;
                     self.save();
                     self.error = "Device settings saved".into();
                     self.set_control_text(96, &device_alert_summary(&self.settings, &key));
@@ -4882,7 +4870,7 @@ impl State {
             observation.as_ref(),
             self.settings
                 .device(&reading.key)
-                .and_then(|p| p.fullscreen_boost_rate),
+                .and_then(|p| p.boost_for(&reading.source, reading.container.as_deref())),
         );
         let preferences = self.settings.device(&reading.key);
         let requested = preferences
@@ -4906,6 +4894,7 @@ impl State {
                 )
             )
         };
+        let can_bind = !reading.requires_polling_owner() || reading.polling_owner().is_some();
         let key = reading.key;
         let current = observation.as_ref().and_then(|o| o.rate);
         let summary = unavailable.clone().unwrap_or_else(|| {
@@ -4991,15 +4980,26 @@ impl State {
         if boost_supported {
             self.page_height = 920 - PAGE_TOP;
             self.heading(48, "Fullscreen boost", 20, 708, 750);
-            self.label(465, "", 20, 750, 380);
-            let saved = self
-                .settings
-                .device(&key)
-                .and_then(|p| p.fullscreen_boost_rate);
+            let preference = self.settings.device(&key);
+            let saved =
+                preference.and_then(|p| p.boost_for(&reading.source, reading.container.as_deref()));
+            let enabled = boost_draft.as_ref().map_or(saved.is_some(), |d| d.0) && can_bind;
+            let caption = if !can_bind {
+                "Reconnect the mouse so Windows can identify it."
+            } else if enabled {
+                "Restore your desktop rate after the game"
+            } else if preference.is_some_and(|p| {
+                p.fullscreen_boost_rate.is_some() && p.boost_owner_container.is_none()
+            }) {
+                "Turn boost on again to confirm this mouse."
+            } else {
+                "Use a higher rate in fullscreen games"
+            };
+            self.label(465, caption, 20, 750, 380);
             self.check(
                 49,
                 "Boost this mouse in fullscreen games",
-                boost_draft.as_ref().map_or(saved.is_some(), |d| d.0),
+                enabled,
                 20,
                 750,
                 750,
@@ -5019,8 +5019,11 @@ impl State {
                 .or_else(|| saved.and_then(|r| rates.iter().position(|v| *v == r)))
                 .unwrap_or(0);
             self.combo(50, &labels, selected, 20, 792, 230);
-            self.enable_control(49, !pending && (!rates.is_empty() || saved.is_some()));
-            self.enable_control(50, !pending && !rates.is_empty());
+            self.enable_control(
+                49,
+                can_bind && !pending && (!rates.is_empty() || saved.is_some()),
+            );
+            self.enable_control(50, can_bind && !pending && !rates.is_empty());
             self.control(52, w!("STATIC"),
                 "Uses Windows fullscreen gaming detection; some borderless games are missed.\r\nBoosts after 10 seconds; restores after 15 seconds back on the desktop.\r\nRestores after restart when possible. Anti-cheat compatibility isn't guaranteed.",
                 WINDOW_STYLE::default(), 20, 838, 750, 62);
@@ -5402,7 +5405,7 @@ impl State {
         let saved = self
             .settings
             .device(&device.key)
-            .and_then(|p| p.low_battery_mode);
+            .and_then(|p| p.saver_for(&device.source, device.container.as_deref()));
         let rates = self.battery_saver_rates(&device);
         let times: Vec<u16> = sleep
             .map(|m| m.choices().into_iter().filter(|s| *s != 0).collect())
@@ -5432,6 +5435,7 @@ impl State {
                 .unwrap_or_else(|| "Keep polling rate".into()),
             sleep_index,
         ));
+        let can_bind = !device.requires_polling_owner() || device.polling_owner().is_some();
         self.sleep.saver_key = Some(device.key);
         let y = self.page_height + PAGE_TOP + 12;
         self.page_height = y + 320 - PAGE_TOP;
@@ -5439,7 +5443,7 @@ impl State {
         self.check(
             440,
             "Save power when this mouse runs low",
-            values.0,
+            can_bind && values.0,
             20,
             y + 42,
             700,
@@ -5475,10 +5479,44 @@ impl State {
         self.button(446, "Save low-battery settings", 20, y + 180, 280);
         self.control(447, w!("STATIC"), "Gaming boost takes priority. Only lower rates and shorter sleep times are applied.\r\nPrevious settings return when possible after charging or 5% above the threshold.\r\nHalo can recover settings after a restart. Reconnect wirelessly if needed.", WINDOW_STYLE::default(), 20, y + 230, 750, 78);
         for id in [440, 442, 444, 445, 446] {
-            self.enable_control(id, self.settings.polling_controls);
+            self.enable_control(id, can_bind && self.settings.polling_controls);
         }
-        self.enable_control(444, self.settings.polling_controls && polling);
-        self.enable_control(445, self.settings.polling_controls && sleep.is_some());
+        self.enable_control(444, can_bind && self.settings.polling_controls && polling);
+        self.enable_control(
+            445,
+            can_bind && self.settings.polling_controls && sleep.is_some(),
+        );
+    }
+    fn can_save_automation(&mut self, device: &ConfigurationDevice) -> bool {
+        if device.requires_polling_owner() && device.polling_owner().is_none() {
+            self.set_control_text(
+                95,
+                "Reconnect the mouse so Windows can identify it before saving automatic settings.",
+            );
+            return false;
+        }
+        true
+    }
+    fn save_boost_choice(
+        &mut self,
+        device: &ConfigurationDevice,
+        rate: Option<PollingRate>,
+    ) -> bool {
+        if rate.is_some() && !self.can_save_automation(device) {
+            return false;
+        }
+        let preferences = self.settings.device_mut(&device.key);
+        if rate.is_none()
+            && preferences
+                .boost_for(&device.source, device.container.as_deref())
+                .is_none()
+        {
+            return false;
+        }
+        preferences.fullscreen_boost_rate = rate;
+        preferences.boost_owner_container =
+            rate.and_then(|_| device.polling_owner().map(str::to_owned));
+        true
     }
     fn save_battery_saver(&mut self) {
         let Some((device, Some(battery))) = self.current_device() else {
@@ -5524,7 +5562,20 @@ impl State {
         } else {
             None
         };
-        self.settings.device_mut(&device.key).low_battery_mode = choices;
+        if choices.is_some() && !self.can_save_automation(&device) {
+            return;
+        }
+        let preferences = self.settings.device_mut(&device.key);
+        if choices.is_none()
+            && preferences
+                .saver_for(&device.source, device.container.as_deref())
+                .is_none()
+        {
+            return;
+        }
+        preferences.low_battery_mode = choices;
+        preferences.saver_owner_container =
+            choices.and_then(|_| device.polling_owner().map(str::to_owned));
         self.save();
         self.error = "Low-battery settings saved".into();
         self.set_control_text(95, &self.error);
@@ -5641,7 +5692,12 @@ impl State {
     fn polling_outcome(&mut self, outcome: ControlOutcome) {
         // A queued readback can arrive after the inventory has already replaced
         // this key. It cannot confirm a rate or a status message for its new owner.
-        if let Some(observation) = &outcome.observation {
+        if let Some(target) = outcome
+            .observation
+            .as_ref()
+            .map(|o| &o.target)
+            .or(outcome.failure_target.as_deref())
+        {
             let current = self
                 .snapshot
                 .devices
@@ -5654,9 +5710,11 @@ impl State {
                         .find(|d| d.key == outcome.key)
                         .map(DeviceDescriptorRef::from)
                 });
-            if current.is_some_and(|device| {
-                !device.same_identity(DeviceDescriptorRef::from(&observation.target.device))
-            }) {
+            if target.generation < self.polling.generation.max(self.tray_polling.generation)
+                || current.is_some_and(|device| {
+                    !device.same_identity(DeviceDescriptorRef::from(&target.device))
+                })
+            {
                 if self
                     .polling_intents
                     .get(&outcome.key)
@@ -5929,6 +5987,7 @@ impl State {
         }
     }
     fn drain(&mut self) {
+        self.runtime.begin_event_drain();
         // A full command queue may have deferred the resume acknowledgement.
         // Existing events provide retry opportunities without another timer.
         self.runtime.retry_pending_resume();
@@ -6556,8 +6615,9 @@ impl State {
             } else if let Some((_, rate)) =
                 boost_choices.iter().find(|(id, _)| *id == chosen.0 as u16)
             {
-                if let Some(key) = key.as_deref() {
-                    self.settings.device_mut(key).fullscreen_boost_rate = *rate;
+                if let Some(device) = key.as_deref().and_then(|key| self.tray_polling_device(key))
+                    && self.save_boost_choice(&device, *rate)
+                {
                     self.save();
                     self.polling_controls();
                 }
@@ -8281,6 +8341,7 @@ mod popup_tests {
         let request = polling.begin(device.clone(), PollingIntent::Read).unwrap();
         let rate = PollingRate::try_from(1000).unwrap();
         let outcome = ControlOutcome {
+            failure_target: None,
             request: request.request,
             key: device.key.clone(),
             observation: Some(PollingObservation {
@@ -8870,6 +8931,7 @@ mod polling_tests {
     }
     fn outcome(request: u64, generation: u64, hz: Option<u32>) -> ControlOutcome {
         ControlOutcome {
+            failure_target: None,
             request,
             key: "mouse".into(),
             observation: Some(PollingObservation {
@@ -9399,6 +9461,7 @@ mod configuration_device_ui_tests {
             )
             .unwrap();
         let mut outcome = ControlOutcome {
+            failure_target: None,
             request: request.request,
             key: "mouse".into(),
             observation: Some(PollingObservation {
@@ -9696,6 +9759,7 @@ mod tooltip_polling_tests {
         (
             device,
             ControlOutcome {
+                failure_target: None,
                 request: 1,
                 key: reading.key,
                 observation: Some(observation),
@@ -10364,6 +10428,7 @@ mod dashboard_lifecycle_tests {
         sender.send(Event::Snapshot(replacement)).unwrap();
         sender
             .send(Event::Polling(Box::new(ControlOutcome {
+                failure_target: None,
                 request: crate::runtime::STARTUP_POLLING_REQUEST_BIT,
                 key: original_device.key.clone(),
                 previous: None,
@@ -10401,6 +10466,48 @@ mod dashboard_lifecycle_tests {
             state.history_queued.is_some(),
             "Replacement hardware needs a fresh history query"
         );
+        let key = original_device.key.clone();
+        let current = PollingObservation {
+            target: ControlTarget {
+                device: ConfigurationDevice::from_reading(&state.snapshot.devices[0].reading),
+                generation: state.polling.generation,
+                connection_stamp: None,
+            },
+            rate: 1000.try_into().ok(),
+            supported: vec![],
+            timestamp: 110,
+            evidence: String::new(),
+        };
+        state
+            .polling
+            .observations
+            .insert(key.clone(), current.clone());
+        state
+            .tray_polling
+            .observations
+            .insert(key.clone(), current.clone());
+        state.tooltip_rates.insert(key.clone(), current.clone());
+        for request in [
+            crate::runtime::STARTUP_POLLING_REQUEST_BIT,
+            crate::boost::REQUEST_BIT,
+            crate::battery_saver::REQUEST_BIT,
+        ] {
+            state.polling_outcome(ControlOutcome::failed(
+                &ControlRequest {
+                    target: ControlTarget {
+                        device: original_device.clone(),
+                        ..current.target.clone()
+                    },
+                    action: ControlAction::Read,
+                    request,
+                },
+                "Old connection unavailable",
+            ));
+            assert_eq!(state.tooltip_rates[&key].rate, current.rate);
+            assert_eq!(state.polling.observations[&key].rate, current.rate);
+            assert_eq!(state.tray_polling.observations[&key].rate, current.rate);
+            assert!(!state.tray_polling.status.contains_key(&key));
+        }
         state.history_outcome(old_request, Ok(original_chart));
         assert!(
             state.series.samples.is_empty(),
@@ -10469,6 +10576,7 @@ mod dashboard_lifecycle_tests {
             );
             reading.kind = "mouse".into();
             reading.via = "usb".into();
+            crate::bind_test_mouse(&mut state.settings, &mut reading);
             let mut device = ConfigurationDevice::from_reading(&reading);
             device.capability = PollingCapability::Unavailable("No polling controls".into());
             state.configuration_devices = vec![device];
@@ -11189,6 +11297,7 @@ mod dashboard_lifecycle_tests {
                 for (id, uncertain) in [(91, false), (92, true)] {
                     state.record_polling_intent(key, id, rejected, false);
                     state.polling_outcome(ControlOutcome {
+                        failure_target: None,
                         request: id,
                         key: key.into(),
                         observation: None,
@@ -11211,6 +11320,7 @@ mod dashboard_lifecycle_tests {
                     let mut verified = observed.clone();
                     verified.rate = PollingRate::try_from(4000).ok();
                     let mut reply = ControlOutcome {
+                        failure_target: None,
                         request,
                         key: key.into(),
                         observation: Some(verified.clone()),
@@ -11229,6 +11339,7 @@ mod dashboard_lifecycle_tests {
                     assert!(state.tooltip_rates.is_empty());
                 }
                 state.polling_outcome(ControlOutcome {
+                    failure_target: None,
                     request: startup | crate::runtime::STARTUP_POLLING_READ_BIT,
                     key: key.into(),
                     observation: Some(observed),
@@ -12540,6 +12651,7 @@ mod dashboard_lifecycle_tests {
                         );
                         mouse.via = "usb".into();
                         mouse.kind = "mouse".into();
+                        crate::bind_test_mouse(&mut state.settings, &mut mouse);
                         mouse.level = Some(62);
                         mouse.charging = Some(false);
                         let mut controller = Reading::new(
@@ -12668,6 +12780,12 @@ mod dashboard_lifecycle_tests {
                         let mut state = context.state.borrow_mut();
                         let saved = state.snapshot.devices[0].reading.clone();
                         state.snapshot.devices[0].reading.key = "razer:00bf:SYNTHETIC-SLEEP".into();
+                        state.snapshot.devices[0].reading.container =
+                            Some("test-sleep-mouse".into());
+                        state
+                            .settings
+                            .device_mut("razer:00bf:SYNTHETIC-SLEEP")
+                            .saver_owner_container = Some("test-sleep-mouse".into());
                         state.snapshot.devices[0].reading.source = "razer".into();
                         state.snapshot.devices[0].reading.via = "usb".into();
                         let device =
@@ -13282,6 +13400,7 @@ mod dashboard_lifecycle_tests {
             {
                 let mut state = context.state.borrow_mut();
                 state.snapshot.devices[0].reading.key = "razer:00bf:SCROLL-TEST".into();
+                state.snapshot.devices[0].reading.container = Some("test-scroll-mouse".into());
                 state.snapshot.devices[0].reading.source = "razer".into();
                 state.snapshot.devices[0].reading.via = "usb".into();
                 state.selected_device = Some("razer:00bf:SCROLL-TEST".into());
@@ -13371,6 +13490,11 @@ mod dashboard_lifecycle_tests {
                     );
                     // Exercise real sleep controls, in both themes, without touching hardware.
                     state.snapshot.devices[0].reading.key = "razer:00bf:SYNTHETIC-SLEEP".into();
+                    state.snapshot.devices[0].reading.container = Some("test-sleep-mouse".into());
+                    state
+                        .settings
+                        .device_mut("razer:00bf:SYNTHETIC-SLEEP")
+                        .saver_owner_container = Some("test-sleep-mouse".into());
                     state.snapshot.devices[0].reading.source = "razer".into();
                     state.snapshot.devices[0].reading.via = "usb".into();
                     state.selected_device = Some("razer:00bf:SYNTHETIC-SLEEP".into());
@@ -13819,6 +13943,7 @@ mod audit_restore_regressions {
             let mut target = request.target;
             target.generation = 4;
             let o = ControlOutcome {
+                failure_target: None,
                 request: request.request,
                 key: replacement.key.clone(),
                 previous: None,

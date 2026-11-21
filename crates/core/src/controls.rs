@@ -44,28 +44,47 @@ pub struct ConfigurationDevice {
 }
 impl ConfigurationDevice {
     pub fn polling_owner(&self) -> Option<&str> {
-        let container = self.container.as_deref()?.trim();
-        (self.requires_polling_owner()
-            && container.len() <= 256
-            && container
-                .bytes()
-                .any(|b| b.is_ascii_alphanumeric() && b != b'0')
-            && !["unknown", "none", "null", "n/a"]
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(container)))
-        .then_some(container)
+        self.requires_polling_owner()
+            .then(|| valid_owner(self.container.as_deref()))
+            .flatten()
     }
     pub fn requires_polling_owner(&self) -> bool {
         self.kind == "keyboard" || self.kind == "mouse" && self.source != "simulation"
     }
     pub fn owns_polling_choice(&self, saved_container: Option<&str>) -> bool {
         if self.requires_polling_owner() {
-            self.polling_owner()
-                .zip(saved_container)
-                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            owner_matches(self.container.as_deref(), saved_container)
         } else {
             saved_container.is_none()
         }
+    }
+    /// A manual choice may supersede another connection only for a known
+    /// wired/wireless pair. A different receiver with the same key is independent.
+    pub fn same_control_unit(&self, other: &Self) -> bool {
+        if self.kind != other.kind
+            || self.source != other.source
+            || self.via != other.via
+            || self.serial != other.serial
+            || !match (&self.container, &other.container) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            }
+        {
+            return false;
+        }
+        self.key == other.key
+            || self
+                .shared_preference_key()
+                .is_some_and(|key| other.shared_preference_key().as_ref() == Some(&key))
+    }
+    /// A cable and receiver usually have different Windows containers. Only
+    /// the live charging handoff may use this protocol-specific serial alias.
+    pub fn charging_alias(&self, other: &Self) -> bool {
+        self.wired_mouse() != other.wired_mouse()
+            && self
+                .shared_preference_key()
+                .is_some_and(|key| other.shared_preference_key().as_ref() == Some(&key))
     }
     /// A receiver also uses USB; only exact wired model IDs establish external power.
     pub fn wired_mouse(&self) -> bool {
@@ -108,6 +127,22 @@ impl ConfigurationDevice {
     }
 }
 
+pub(crate) fn valid_owner(container: Option<&str>) -> Option<&str> {
+    let value = container?.trim();
+    (value.len() <= 256
+        && value
+            .bytes()
+            .any(|b| b.is_ascii_alphanumeric() && b != b'0')
+        && !["unknown", "none", "null", "n/a"]
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(value)))
+    .then_some(value)
+}
+pub(crate) fn owner_matches(current: Option<&str>, saved: Option<&str>) -> bool {
+    valid_owner(current)
+        .zip(saved)
+        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+}
 impl Reading {
     pub fn wired_mouse(&self) -> bool {
         wired_mouse(&self.key, &self.kind, &self.source, &self.via)
@@ -257,6 +292,8 @@ pub struct PollingObservation {
 }
 #[derive(Clone, Debug)]
 pub struct ControlOutcome {
+    /// Retain the request's owner when there is no hardware readback.
+    pub failure_target: Option<Box<ControlTarget>>,
     pub request: u64,
     pub key: String,
     pub observation: Option<PollingObservation>,
@@ -269,6 +306,7 @@ impl ControlOutcome {
         Self {
             request: request.request,
             key: request.target.device.key.clone(),
+            failure_target: Some(Box::new(request.target.clone())),
             observation: None,
             previous: None,
             may_have_changed: false,

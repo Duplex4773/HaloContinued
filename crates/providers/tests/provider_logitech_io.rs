@@ -29,6 +29,67 @@ fn hidpp10_reads_charge_register_without_querying_feature_table() {
     hid.done();
 }
 #[test]
+fn queued_reports_on_a_busy_short_channel_do_not_hide_a_battery_reply() {
+    let mut ex = Exchange {
+        short: true,
+        ..Default::default()
+    };
+    let token = ex.start(1, 0, 1, &[]);
+    for response in [
+        vec![0x10, 1, 0x8f, 0, token, 1, 0],
+        vec![0x10, 1, 0x81, 0x0d, 73, 0, 0x50],
+    ] {
+        if response[2] == 0x81 {
+            ex.steps
+                .push(Step::Write(vec![0x10, 1, 0x81, 0x0d, 0, 0, 0]));
+        }
+        for _ in 0..20 {
+            ex.read(vec![]);
+            ex.read(vec![0x10, 2, 0x41, 0, 0, 0, 0]);
+        }
+        ex.read(vec![]);
+        ex.read(response);
+    }
+    ex.empty_slots();
+    let hid = FakeHid::new(receiver(0xc52b, "buffered", true), ex.steps);
+    let clock = FakeClock::default();
+    let rows = poll(&mut HidProvider::new("logitech"), &hid, &clock);
+    assert_eq!(rows[0].level, Some(73));
+    assert!(clock.monotonic() >= Duration::from_millis(10));
+    assert!(clock.monotonic() < Duration::from_millis(100));
+    hid.done();
+}
+
+#[test]
+fn short_only_receiver_is_a_recoverable_collection_error() {
+    let mut provider = HidProvider::new("logitech");
+    let mut short = receiver(0xc52b, "incomplete", true);
+    short.retain(|d| d.usage == 1);
+    let hid = FakeHid::new(short, vec![]);
+    assert!(
+        provider
+            .poll(
+                &hid,
+                &context(&FakeClock::default(), &AtomicBool::new(false))
+            )
+            .is_err()
+    );
+    assert!(hid.opened.lock().unwrap().is_empty());
+
+    let mut ex = Exchange {
+        short: true,
+        ..Default::default()
+    };
+    ex.mouse("Test mouse", [1, 2, 3, 4], 70);
+    let restored = FakeHid::new(receiver(0xc52b, "incomplete", true), ex.steps);
+    assert_eq!(
+        poll(&mut provider, &restored, &FakeClock::default())[0].level,
+        Some(70)
+    );
+    restored.done();
+}
+
+#[test]
 fn hidpp10_charge_error_falls_back_to_coarse_status_and_both_error_forms_are_immediate() {
     for error in [0x8f, 0xff] {
         let mut ex = Exchange {

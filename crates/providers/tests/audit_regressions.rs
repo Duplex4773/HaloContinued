@@ -59,6 +59,32 @@ fn g535_replacement_on_the_same_port_cannot_inherit_history() {
     }
 }
 #[test]
+fn silent_g535_only_reuses_a_reading_from_the_same_receiver() {
+    for (serial, same) in [("first-unit", true), ("second-unit", false), ("", false)] {
+        let mut provider = HidProvider::new("logitech");
+        let mut device = headset("fixed-port");
+        device.serial = "FIRST-UNIT".into();
+        let first = read(
+            &mut provider,
+            &FakeHid::new(vec![device.clone()], battery_steps()),
+        )
+        .unwrap();
+        device.serial = serial.into();
+        provider.invalidate();
+        let mut steps = battery_steps();
+        steps.pop();
+        steps.extend((0..12).map(|_| Step::Read(Ok(vec![]))));
+        let hid = FakeHid::new(vec![device], steps);
+        let rows = read(&mut provider, &hid).unwrap();
+        assert_eq!(rows.len(), usize::from(same));
+        if same {
+            assert_eq!(rows[0].key, first[0].key);
+            assert_eq!(rows[0].connection, Connection::Sleeping);
+        }
+        hid.done();
+    }
+}
+#[test]
 fn access_failure_is_not_successful_empty_discovery() {
     let device = headset("A");
     let hid = FakeHid::new(vec![device.clone()], vec![]).fail_open(device.path, "access denied");

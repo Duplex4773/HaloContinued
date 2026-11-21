@@ -4,6 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevicePreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saver_owner_container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boost_owner_container: Option<String>,
     pub low_battery_mode: Option<LowBatteryMode>,
     pub name: Option<String>,
     pub hidden: bool,
@@ -18,6 +22,36 @@ pub struct DevicePreferences {
     pub polling_owner_container: Option<String>,
     /// Opt-in target for Windows-reported exclusive fullscreen applications.
     pub fullscreen_boost_rate: Option<crate::PollingRate>,
+}
+
+impl DevicePreferences {
+    pub fn boost_for(&self, source: &str, container: Option<&str>) -> Option<crate::PollingRate> {
+        self.fullscreen_boost_rate.filter(|_| {
+            Self::owns_automation(source, container, self.boost_owner_container.as_deref())
+        })
+    }
+    pub fn saver_for(&self, source: &str, container: Option<&str>) -> Option<LowBatteryMode> {
+        self.low_battery_mode.filter(|_| {
+            Self::owns_automation(source, container, self.saver_owner_container.as_deref())
+        })
+    }
+    // The scheduler has the preference key before it has a live device. Only
+    // a bound preference (or the built-in simulator) should wake it.
+    pub fn boost_registered(&self, key: &str) -> bool {
+        self.fullscreen_boost_rate.is_some()
+            && Self::registered(key, self.boost_owner_container.as_deref())
+    }
+    pub fn saver_registered(&self, key: &str) -> bool {
+        self.low_battery_mode.is_some()
+            && Self::registered(key, self.saver_owner_container.as_deref())
+    }
+    fn registered(key: &str, owner: Option<&str>) -> bool {
+        owner.is_some() || key.starts_with("simulated:") || key.starts_with("simulation:")
+    }
+    fn owns_automation(source: &str, container: Option<&str>, saved: Option<&str>) -> bool {
+        source == "simulation" && saved.is_none()
+            || crate::controls::owner_matches(container, saved)
+    }
 }
 
 /// Opt-in automatic reductions; absent fields leave that hardware setting unchanged.
@@ -147,9 +181,17 @@ impl Settings {
                         .iter()
                         .filter_map(|(key, value)| {
                             let fields = value.as_object()?;
+                            let owner = |key| {
+                                crate::controls::valid_owner(
+                                    fields.get(key).and_then(serde_json::Value::as_str),
+                                )
+                                .map(str::to_owned)
+                            };
                             Some((
                                 key.clone(),
                                 DevicePreferences {
+                                    boost_owner_container: owner("boost_owner_container"),
+                                    saver_owner_container: owner("saver_owner_container"),
                                     low_battery_mode: fields
                                         .get("low_battery_mode")
                                         .and_then(|v| {

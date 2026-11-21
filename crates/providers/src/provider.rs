@@ -67,6 +67,39 @@ pub fn providers() -> Vec<Box<dyn BatteryProvider>> {
         .map(|(id, _)| Box::new(HidProvider::new(id)) as Box<dyn BatteryProvider>)
         .collect()
 }
+type LogitechReceiver = (u16, std::sync::Arc<str>);
+type LogitechSlot = (LogitechReceiver, u8);
+type LogitechGroups<'a> = BTreeMap<LogitechReceiver, BTreeMap<u8, &'a HidInfo>>;
+
+struct LogitechReplyWait {
+    wait_ms: u64,
+    buffered: u8,
+}
+impl LogitechReplyWait {
+    fn new() -> Self {
+        Self {
+            wait_ms: 5,
+            buffered: 0,
+        }
+    }
+    fn after_read(&mut self, received: bool, deadline: Duration, context: &PollContext<'_>) {
+        if received {
+            self.wait_ms = 5;
+            self.buffered += 1;
+            // Read queued reports immediately, but yield regularly on a noisy receiver.
+            if self.buffered < 8 {
+                return;
+            }
+        }
+        self.buffered = 0;
+        context.sleep(
+            Duration::from_millis(self.wait_ms)
+                .min(deadline.saturating_sub(context.clock.monotonic())),
+        );
+        self.wait_ms = (self.wait_ms * 2).min(40);
+    }
+}
+
 struct LogitechIdentity {
     name: String,
     kind: String,
@@ -103,9 +136,9 @@ pub struct HidProvider {
     first_seen: BTreeMap<String, Duration>,
     last_observed: BTreeMap<String, Duration>,
     stuck: BTreeMap<String, u8>,
-    logitech_identity: BTreeMap<String, LogitechIdentity>,
-    logitech_asleep: BTreeSet<String>,
-    logitech_slots: BTreeMap<String, String>,
+    logitech_identity: BTreeMap<LogitechSlot, LogitechIdentity>,
+    logitech_asleep: BTreeSet<LogitechSlot>,
+    logitech_slots: BTreeMap<LogitechSlot, String>,
     logitech_error: Option<u8>,
     logitech_timeout: u64,
     audeze_short_useless: BTreeSet<String>,
@@ -1577,8 +1610,9 @@ impl HidProvider {
         long.write(&packet)?;
         let deadline =
             (c.clock.monotonic() + Duration::from_millis(self.logitech_timeout)).min(c.deadline);
-        let mut wait_ms = 5;
+        let mut wait = LogitechReplyWait::new();
         while c.active() && c.clock.monotonic() < deadline {
+            let mut received = false;
             for channel in 0..2 {
                 let mut report = if channel == 0 {
                     long.read(64, Duration::ZERO)?
@@ -1587,6 +1621,7 @@ impl HidProvider {
                 } else {
                     continue;
                 };
+                received |= !report.is_empty();
                 let Some(r) = hidpp_frame(&report, slot) else {
                     continue;
                 };
@@ -1601,10 +1636,7 @@ impl HidProvider {
                     return Ok(Some(report));
                 }
             }
-            c.sleep(
-                Duration::from_millis(wait_ms).min(deadline.saturating_sub(c.clock.monotonic())),
-            );
-            wait_ms = (wait_ms * 2).min(40);
+            wait.after_read(received, deadline, c);
         }
         Ok(None)
     }
@@ -1664,7 +1696,7 @@ impl HidProvider {
             .logitech_request(long, short, c, slot, feature[0], 0, &[])?
             .and_then(|r| r.get(1..5)?.try_into().ok()))
     }
-    fn forget_logitech_slot(&mut self, slot_key: &str) {
+    fn forget_logitech_slot(&mut self, slot_key: &LogitechSlot) {
         self.logitech_identity.remove(slot_key);
         if let Some(old) = self.logitech_slots.remove(slot_key)
             && !self.logitech_slots.values().any(|key| key == &old)
@@ -1673,9 +1705,13 @@ impl HidProvider {
             self.last_observed.remove(&old);
         }
     }
-    fn logitech_access_failure(&mut self, pid: u16, group: &str, slots: impl Iterator<Item = u8>) {
+    fn logitech_access_failure(
+        &mut self,
+        receiver: &LogitechReceiver,
+        slots: impl Iterator<Item = u8>,
+    ) {
         for slot in slots {
-            let slot_key = format!("{pid:04x}:{group}:{slot}");
+            let slot_key = (receiver.clone(), slot);
             if let Some(reading) = self
                 .logitech_slots
                 .get(&slot_key)
@@ -1685,78 +1721,83 @@ impl HidProvider {
             }
         }
     }
+    fn retain_logitech_receivers(&mut self, groups: &LogitechGroups<'_>) {
+        self.logitech_identity
+            .retain(|(group, _), _| groups.contains_key(group));
+        self.logitech_asleep
+            .retain(|(group, _)| groups.contains_key(group));
+        self.logitech_slots
+            .retain(|(group, _), _| groups.contains_key(group));
+        self.last
+            .retain(|key, _| self.logitech_slots.values().any(|live| live == key));
+    }
     fn logitech_poll(
         &mut self,
         infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
     ) -> PollResult {
-        let mut groups: BTreeMap<(u16, String), BTreeMap<u8, &HidInfo>> = BTreeMap::new();
+        let mut groups = LogitechGroups::new();
         let mut headsets = BTreeMap::new();
         for d in infos {
-            let key = (d.product_id, receiver_key(d));
+            let key = || (d.product_id, std::sync::Arc::from(receiver_key(d)));
             if d.product_id == 0x0ac4 && (d.usage_page, d.usage) == (0xff43, 0x202) {
-                groups.entry(key).or_default().insert(3, d);
+                groups.entry(key()).or_default().insert(3, d);
             } else if d.usage_page == 0xff00 && [1, 2].contains(&d.usage) {
-                groups.entry(key).or_default().insert(d.usage as u8, d);
-            } else if DEVICES.iter().any(|known| {
-                known.provider == "logitech"
-                    && known.pid == d.product_id
-                    && known.variant == "headset"
-            }) && (d.usage_page, d.usage)
-                == if d.product_id == 0x0ac4 {
-                    (0x0c, 1)
-                } else {
-                    (0xff43, 0x202)
-                }
+                groups.entry(key()).or_default().insert(d.usage as u8, d);
+            } else if find_device("logitech", d.vendor_id, d.product_id)
+                .is_some_and(|known| known.variant == "headset")
+                && (d.usage_page, d.usage)
+                    == if d.product_id == 0x0ac4 {
+                        (0x0c, 1)
+                    } else {
+                        (0xff43, 0x202)
+                    }
             {
-                headsets.insert(key, d);
+                headsets.insert(key(), d);
             }
         }
         for (key, info) in headsets {
             groups.entry(key).or_default().entry(2).or_insert(info);
         }
-        let active_slots: BTreeSet<_> = groups
-            .keys()
-            .flat_map(|(pid, group)| {
-                [1, 2, 3, 4, 5, 6, 255]
-                    .into_iter()
-                    .map(move |slot| format!("{pid:04x}:{group}:{slot}"))
-            })
-            .collect();
-        self.logitech_identity
-            .retain(|slot, _| active_slots.contains(slot));
-        self.logitech_asleep
-            .retain(|slot| active_slots.contains(slot));
-        self.logitech_slots
-            .retain(|slot, _| active_slots.contains(slot));
-        self.last
-            .retain(|key, _| self.logitech_slots.values().any(|live| live == key));
+        self.retain_logitech_receivers(&groups);
         let mut failure = None;
         let mut completed_group = false;
         let mut found: BTreeMap<String, Reading> = BTreeMap::new();
-        for ((pid, group), paths) in &groups {
+        for (receiver, paths) in &groups {
+            let (pid, group) = receiver;
             if !c.active() {
                 break;
             }
             if let Some(info) = paths.get(&3) {
+                let slot_key = (receiver.clone(), 255);
+                let serial = info.serial.trim();
+                let current_serial = usable_identity_value(serial).then_some(serial);
+                let replaced = self
+                    .logitech_slots
+                    .get(&slot_key)
+                    .and_then(|key| self.last.get(key))
+                    .is_some_and(|old| match (old.serial.as_deref(), current_serial) {
+                        (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                        (None, None) => false,
+                        _ => true,
+                    });
+                if replaced || self.logitech_identity.contains_key(&slot_key) {
+                    self.forget_logitech_slot(&slot_key);
+                }
                 match hid
                     .open(info)
                     .and_then(|mut session| Self::query_g535(&mut *session, c))
                 {
                     Ok(Some(battery)) => {
-                        let slot_key = format!("{pid:04x}:{group}:255");
-                        if self.logitech_identity.contains_key(&slot_key) {
-                            self.forget_logitech_slot(&slot_key);
-                        }
-                        self.keep_logitech_register(battery, info, group, 255, c, &mut found)
+                        self.keep_logitech_register(battery, info, slot_key, c, &mut found)
                     }
                     Ok(None) => {
                         completed_group = true;
                         self.log("Logitech G535: no charge register reply");
                     }
                     Err(error) => {
-                        self.logitech_access_failure(*pid, group, 255..=255);
+                        self.logitech_access_failure(receiver, 255..=255);
                         self.log(format!("Logitech G535: {error}"));
                         failure = Some(error);
                     }
@@ -1764,13 +1805,16 @@ impl HidProvider {
                 continue;
             }
             let Some(long_info) = paths.get(&2) else {
-                self.logitech_access_failure(*pid, group, (1..=6).chain([255]));
+                let message = "Logitech receiver is missing its long HID collection";
+                self.log(message);
+                failure = Some(ProviderError::new(message));
+                self.logitech_access_failure(receiver, (1..=6).chain([255]));
                 continue;
             };
             let mut long = match hid.open(long_info) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.logitech_access_failure(*pid, group, (1..=6).chain([255]));
+                    self.logitech_access_failure(receiver, (1..=6).chain([255]));
                     self.log(format!("open: {e}"));
                     failure = Some(e);
                     continue;
@@ -1786,16 +1830,15 @@ impl HidProvider {
             });
             let short_inaccessible = paths.contains_key(&1) && short.is_none();
             self.counter = 0;
-            let receiver = DEVICES
-                .iter()
-                .any(|d| d.provider == "logitech" && d.pid == *pid && d.variant == "receiver")
+            let is_receiver = find_device("logitech", long_info.vendor_id, *pid)
+                .is_some_and(|d| d.variant == "receiver")
                 || long_info.product.to_lowercase().contains("receiver");
             let result: Result<(), ProviderError> = (|| {
-                for slot in if receiver { 1..=6 } else { 255..=255 } {
+                for slot in if is_receiver { 1..=6 } else { 255..=255 } {
                     if !c.active() {
                         break;
                     }
-                    let slot_key = format!("{pid:04x}:{group}:{slot}");
+                    let slot_key = (receiver.clone(), slot);
                     self.logitech_timeout = if self.logitech_asleep.contains(&slot_key) {
                         600
                     } else {
@@ -1809,7 +1852,13 @@ impl HidProvider {
                         }
                         self.log(format!("slot {slot}: HID++ 1.0; reading battery registers"));
                         if let Some(b) = self.logitech_registers(&mut *long, &mut short, c, slot)? {
-                            self.keep_logitech_register(b, long_info, group, slot, c, &mut found);
+                            self.keep_logitech_register(
+                                b,
+                                long_info,
+                                slot_key.clone(),
+                                c,
+                                &mut found,
+                            );
                         }
                         continue;
                     }
@@ -1827,7 +1876,7 @@ impl HidProvider {
                             }
                         } else {
                             if short_inaccessible {
-                                self.logitech_access_failure(*pid, group, std::iter::once(slot));
+                                self.logitech_access_failure(receiver, std::iter::once(slot));
                             }
                             self.log(format!("slot {slot}: no reply, device asleep"));
                             self.logitech_asleep.insert(slot_key);
@@ -1837,7 +1886,7 @@ impl HidProvider {
                     self.logitech_asleep.remove(&slot_key);
                     // A receiver can replace the occupant without an empty-slot report or
                     // a Windows device change. Only reuse a description for a proven unit.
-                    let observed = if !receiver
+                    let observed = if !is_receiver
                         && let Some(identity) = self.logitech_identity.get(&slot_key)
                         && identity.direct_verified
                     {
@@ -1855,7 +1904,7 @@ impl HidProvider {
                         && cached.unit == unit
                         && (unit != [0; 4] || cached.direct_verified)
                     {
-                        cached.direct_verified = !receiver;
+                        cached.direct_verified = !is_receiver;
                         (cached.name.clone(), cached.kind.clone())
                     } else {
                         if self.logitech_identity.contains_key(&slot_key) || unit != [0; 4] {
@@ -1864,7 +1913,7 @@ impl HidProvider {
                         let description =
                             self.logitech_description(&mut *long, &mut short, c, slot)?;
                         if unit != [0; 4]
-                            || (!receiver && observed.is_some() && !description.0.is_empty())
+                            || (!is_receiver && observed.is_some() && !description.0.is_empty())
                         {
                             self.logitech_identity.insert(
                                 slot_key.clone(),
@@ -1872,7 +1921,7 @@ impl HidProvider {
                                     name: description.0.clone(),
                                     kind: description.1.clone(),
                                     unit,
-                                    direct_verified: !receiver,
+                                    direct_verified: !is_receiver,
                                 },
                             );
                         }
@@ -1947,13 +1996,13 @@ impl HidProvider {
                     if !battery_found
                         && let Some(b) = self.logitech_registers(&mut *long, &mut short, c, slot)?
                     {
-                        self.keep_logitech_register(b, long_info, group, slot, c, &mut found);
+                        self.keep_logitech_register(b, long_info, slot_key.clone(), c, &mut found);
                     }
                 }
                 Ok(())
             })();
             if let Err(e) = result {
-                self.logitech_access_failure(*pid, group, (1..=6).chain([255]));
+                self.logitech_access_failure(receiver, (1..=6).chain([255]));
                 self.log(format!("channel error: {e}"));
                 failure = Some(e);
             } else if !short_inaccessible && c.active() {
@@ -3173,6 +3222,34 @@ mod allocation_tests {
         COUNT.with(|c| c.replace(None).unwrap())
     }
     #[test]
+    fn logitech_slot_bookkeeping_does_not_allocate_on_repeat_polls() {
+        let mut provider = HidProvider::new("logitech");
+        let receiver = (0x0ac4, std::sync::Arc::from("test-headset"));
+        let slot = (receiver.clone(), 255);
+        let groups = LogitechGroups::from([(receiver, BTreeMap::new())]);
+        let key = "test-headset";
+        provider.logitech_slots.insert(slot.clone(), key.into());
+        provider.logitech_asleep.insert(slot);
+        provider
+            .last
+            .insert(key.into(), Reading::new(key, "G535", "logitech", 0));
+        assert_eq!(
+            allocations(|| {
+                for _ in 0..100 {
+                    provider.retain_logitech_receivers(&groups);
+                }
+            }),
+            0
+        );
+        assert_eq!(provider.last.len(), 1);
+        provider.retain_logitech_receivers(&LogitechGroups::new());
+        assert!(
+            provider.last.is_empty()
+                && provider.logitech_slots.is_empty()
+                && provider.logitech_asleep.is_empty()
+        );
+    }
+    #[test]
     fn absent_devices_do_not_allocate_during_repeated_polling_of_expanded_registry() {
         use super::cache_test_support::{FakeClock, FakeHid, context};
         let mut providers = providers();
@@ -3550,8 +3627,9 @@ mod cache_retention_tests {
         let mut provider = HidProvider::new("logitech");
         for index in 0..1000 {
             let key = format!("invented-{index}");
+            let slot = ((0xc52b, std::sync::Arc::from(key.as_str())), 1);
             provider.logitech_identity.insert(
-                key.clone(),
+                slot.clone(),
                 LogitechIdentity {
                     name: "Invented".into(),
                     kind: "mouse".into(),
@@ -3559,8 +3637,8 @@ mod cache_retention_tests {
                     direct_verified: false,
                 },
             );
-            provider.logitech_asleep.insert(key.clone());
-            provider.logitech_slots.insert(key.clone(), key.clone());
+            provider.logitech_asleep.insert(slot.clone());
+            provider.logitech_slots.insert(slot, key.clone());
             provider
                 .last
                 .insert(key.clone(), Reading::new(&key, "Invented", "logitech", 0));

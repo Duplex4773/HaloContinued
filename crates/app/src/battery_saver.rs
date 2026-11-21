@@ -192,7 +192,7 @@ impl BatterySaver {
         let low = record.confirmed
             && settings
                 .device(&reading.key)
-                .and_then(|p| p.low_battery_mode)
+                .and_then(|p| p.saver_for(&reading.source, reading.container.as_deref()))
                 == Some(choices)
             && reading.charging != Some(true)
             && !reading.wired_mouse()
@@ -288,11 +288,7 @@ impl BatterySaver {
         }
     }
     pub fn wanted(&self, settings: &Settings) -> bool {
-        !self.entries.is_empty()
-            || settings
-                .devices
-                .values()
-                .any(|p| p.low_battery_mode.is_some())
+        !self.entries.is_empty() || settings.devices.iter().any(|(k, p)| p.saver_registered(k))
     }
     /// Cheap preflight: settled low-battery episodes need no inventory clones or Shell calls.
     #[cfg(test)]
@@ -339,19 +335,31 @@ impl BatterySaver {
         }
     }
     /// Manual changes take ownership of the affected setting for this low-battery episode.
+    pub fn wired_handoff_owner(
+        &self,
+        wireless_key: &str,
+        sleep: bool,
+    ) -> Option<&ConfigurationDevice> {
+        let entry = self.entries.get(wireless_key)?;
+        let (setting, stamp) = if sleep {
+            (entry.sleep, entry.sleep_stamp)
+        } else {
+            (entry.rate, entry.rate_stamp)
+        };
+        (entry.wired_transition == Some(WiredTransition::Seen)
+            && matches!(setting, Setting::Active { .. })
+            && stamp.is_some())
+        .then_some(&entry.target.device)
+    }
     pub fn manual(&mut self, device: &ConfigurationDevice, sleep: bool) {
         // The alias can only cancel automation. It never authorizes a write to
         // the other connection, and requires the validated model/serial pair.
-        let alias = device
-            .wired_mouse()
-            .then(|| device.shared_preference_key())
-            .flatten();
         let mut cancel = false;
         for entry in self.entries.values_mut() {
-            if entry.target.device.key == device.key
-                || alias.as_ref().is_some_and(|key| {
-                    entry.target.device.shared_preference_key().as_ref() == Some(key)
-                })
+            if entry.target.device.same_control_unit(device)
+                || device.wired_mouse()
+                    && entry.wired_transition.is_some()
+                    && entry.target.device.charging_alias(device)
             {
                 if sleep {
                     entry.sleep = Setting::Done;
@@ -585,7 +593,7 @@ impl BatterySaver {
             }
             let configured = settings
                 .device(&r.key)
-                .and_then(|p| p.low_battery_mode)
+                .and_then(|p| p.saver_for(&r.source, r.container.as_deref()))
                 .filter(LowBatteryMode::valid);
             if let Some(e) = self.entries.get_mut(&r.key) {
                 if !e.target.device.matches_reading(r) {
@@ -947,6 +955,7 @@ mod tests {
             polling_controls: true,
             ..Default::default()
         };
+        crate::bind_test_mouse(&mut s, &mut r);
         s.devices.entry(r.key.clone()).or_default().low_battery_mode = Some(LowBatteryMode {
             threshold: 20,
             polling_rate: Some(rate(125)),
@@ -962,6 +971,7 @@ mod tests {
     fn complete(b: &mut BatterySaver, a: &Action, value: u32) {
         match a {
             Action::Polling(r) => b.polling_complete(&ControlOutcome {
+                failure_target: None,
                 request: r.request,
                 key: r.target.device.key.clone(),
                 previous: None,
@@ -1158,6 +1168,7 @@ mod tests {
             panic!("polling read expected")
         };
         b.polling_complete(&ControlOutcome {
+            failure_target: None,
             request: request.request,
             key: request.target.device.key.clone(),
             previous: None,
@@ -1445,6 +1456,27 @@ mod tests {
         }
     }
     #[test]
+    fn manual_recovery_needs_an_observed_unambiguous_cable_handoff() {
+        for ambiguous in [false, true] {
+            let (mut saver, _, readings, boost) = paired_charging_fixture();
+            let wired = wired_reading(&readings[0], 101);
+            let device = ConfigurationDevice::from_reading(&wired);
+            let owner = ConfigurationDevice::from_reading(&readings[0]);
+            assert!(crate::runtime::manual_handoff_owner(&device, true, &saver, &boost).is_none());
+            let mut visible = vec![wired];
+            if ambiguous {
+                let mut other = visible[0].clone();
+                other.container = Some("different-cable".into());
+                visible.push(other);
+            }
+            saver.observe_provider("razer", &visible, 101);
+            for sleep in [false, true] {
+                let actual = crate::runtime::manual_handoff_owner(&device, sleep, &saver, &boost);
+                assert_eq!(actual.as_deref(), (!ambiguous).then_some(&owner));
+            }
+        }
+    }
+    #[test]
     fn manual_wired_sleep_change_wins_over_the_pending_wireless_restore() {
         let (mut saver, settings, mut readings, boost) = paired_charging_fixture();
         let wired = wired_reading(&readings[0], 101);
@@ -1483,6 +1515,7 @@ mod tests {
             boost.sample(now, Some(true));
             boost.sample(now + Duration::from_secs(10), Some(true));
             let outcome = |q: &ControlRequest, hz| ControlOutcome {
+                failure_target: None,
                 request: q.request,
                 key: q.target.device.key.clone(),
                 previous: Some(rate(125)),
@@ -1635,6 +1668,7 @@ mod tests {
                         match &apply {
                             Action::Polling(request) => {
                                 saver.polling_complete(&ControlOutcome {
+                                    failure_target: None,
                                     request: request.request,
                                     key: request.target.device.key.clone(),
                                     previous: Some(rate(1000)),
@@ -1823,6 +1857,7 @@ mod tests {
                     for value in [125, 4000] {
                         let request = boost.next(&settings, 1, &readings).unwrap();
                         assert!(boost.complete(&ControlOutcome {
+                            failure_target: None,
                             request: request.request,
                             key: request.target.device.key.clone(),
                             previous: Some(rate(125)),
@@ -1891,6 +1926,7 @@ mod tests {
             boost.sample(now, Some(true));
             boost.sample(now + Duration::from_secs(10), Some(true));
             let outcome = |q: &ControlRequest, hz| ControlOutcome {
+                failure_target: None,
                 request: q.request,
                 key: q.target.device.key.clone(),
                 previous: Some(rate(1000)),
@@ -1987,6 +2023,7 @@ mod tests {
         boost.sample(now, Some(true));
         boost.sample(now + Duration::from_secs(10), Some(true));
         let outcome = |q: &ControlRequest, hz| ControlOutcome {
+            failure_target: None,
             request: q.request,
             key: q.target.device.key.clone(),
             previous: Some(rate(125)),
@@ -2399,11 +2436,45 @@ mod tests {
         }
     }
     #[test]
+    fn unbound_legacy_preferences_do_not_wake_automation() {
+        let (saver, mut settings, readings, boost) = fixture();
+        let prefs = settings.device_mut(&readings[0].key);
+        prefs.fullscreen_boost_rate = Some(rate(4000));
+        prefs.boost_owner_container = None;
+        prefs.saver_owner_container = None;
+        assert!(!boost.wanted(&settings));
+        assert!(!saver.wanted(&settings));
+        let prefs = settings.device_mut(&readings[0].key);
+        prefs.saver_owner_container = readings[0].container.clone();
+        assert!(saver.wanted(&settings));
+        assert!(!boost.wanted(&settings));
+    }
+    #[test]
+    fn automation_never_starts_on_a_replacement_with_the_same_key_and_serial() {
+        let (mut saver, mut settings, mut readings, mut boost) = fixture();
+        readings[0].serial = Some("TEST".into());
+        settings.device_mut(&readings[0].key).fullscreen_boost_rate = Some(rate(4000));
+        let saved = Settings::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        let original = readings[0].container.clone();
+        let now = Instant::now();
+        boost.sample(now, Some(true));
+        boost.sample(now + Duration::from_secs(15), Some(true));
+        for container in [Some("112233445566778899AABBCCDDEEFF00".into()), None] {
+            readings[0].container = container;
+            assert!(!boost.ready(&saved, |_| &readings));
+            assert!(boost.next(&saved, 2, &readings).is_none());
+            assert!(saver.next(&saved, 2, &readings, 100, &boost).is_none());
+        }
+        readings[0].container = original;
+        assert!(saver.next(&saved, 3, &readings, 100, &boost).is_some());
+        assert!(boost.next(&saved, 3, &readings).is_some());
+    }
+    #[test]
     fn unreadable_collection_pauses_saver_until_matching_mouse_recovers() {
         let (mut saver, settings, mut readings, boost) = fixture();
         activate(&mut saver, &settings, &readings, &boost);
         let mut failed = Vec::new();
-        UnreadableCollection::record(&mut failed, &readings[0].key, &HidInfo::default());
+        UnreadableCollection::record_reading(&mut failed, &readings[0]);
         readings[0].connection = Connection::Stale;
         saver.observe_inventory("razer", &readings, 100, &failed);
         assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
@@ -2453,6 +2524,7 @@ mod tests {
         boost.sample(now + Duration::from_secs(10), Some(true));
         let read = boost.next(&s, 1, &r).unwrap();
         let outcome = |q: &ControlRequest, hz| ControlOutcome {
+            failure_target: None,
             request: q.request,
             key: q.target.device.key.clone(),
             previous: Some(rate(125)),
