@@ -247,7 +247,7 @@ fn render(
         && d.reading.level.is_some()
         && d.reading.precision == hb_core::Precision::Exact;
     let level = d.reading.level.unwrap_or(0) as f64 / 100.;
-    let color = if d.reading.charging == Some(true) {
+    let color = if d.reading.current_charging() == Some(true) {
         [75., 199., 133.]
     } else if d.reading.level.is_some_and(|l| l <= d.low_alert_at) {
         [232., 89., 84.]
@@ -384,7 +384,7 @@ fn render(
             }
         }
     }
-    if s.badges && d.reading.charging == Some(true) {
+    if s.badges && d.reading.current_charging() == Some(true) {
         for y in n * 3 / 4..n {
             for x in n * 3 / 4..n {
                 if x >= n * 7 / 8 || y >= n * 7 / 8 {

@@ -29,7 +29,8 @@ impl HidProvider {
                 .push(i);
         }
         let mut out = vec![];
-        let mut errors = vec![];
+        let mut failure = None;
+        let mut completed = false;
         for (key, (d, mut mine)) in groups {
             if !c.active() {
                 break;
@@ -44,8 +45,11 @@ impl HidProvider {
                         2
                     },
                     i.usage_page,
+                    i.path.as_str(),
                 )
             });
+            let identity = mine[0];
+            let mut open_error = None;
             let mut handles: Vec<(&HidInfo, Box<dyn HidSession>)> = mine
                 .into_iter()
                 .take(16)
@@ -57,27 +61,24 @@ impl HidProvider {
                         Ok(s) => Some((i, s)),
                         Err(e) => {
                             self.log(format!("open collection: {e}"));
-                            errors.push(e);
+                            open_error = Some(e);
                             None
                         }
                     }
                 })
                 .collect();
-            let result = if self.id == "logitech_centurion" {
-                match handles.first_mut() {
-                    Some((i, s)) => self.centurion_read(i, &mut **s, c),
-                    None => Ok(None),
-                }
-            } else {
-                self.split_headset_read(&key, &mut handles, c)
+            if !c.active() { break; }
+            let result = match handles.first_mut() {
+                None => open_error.map_or(Ok(None), Err),
+                Some((i, session)) if self.id == "logitech_centurion" => self.centurion_read(i, &mut **session, c),
+                _ => self.split_headset_read(&key, &mut handles, c, open_error),
             };
             match result {
                 Ok(Some(b)) => {
                     let mut r = Reading::new(key, d.name, self.id, c.clock.unix());
-                    if let Some((i, _)) = handles.first() {
-                        r.serial = (!i.serial.is_empty()).then(|| i.serial.clone());
-                        r.container = i.container.clone();
-                    }
+                    r.serial = (!identity.serial.is_empty()).then(|| identity.serial.clone());
+                    r.container.clone_from(&identity.container);
+                    completed = true;
                     r.kind = "headset".into();
                     r.via = "usb".into();
                     let charging = b.charging;
@@ -85,15 +86,16 @@ impl HidProvider {
                     r.charging = charging;
                     out.push(r);
                 }
-                Ok(None) => {}
+                Ok(None) => completed = true,
                 Err(e) => {
+                    UnreadableCollection::record(&mut self.unreadable, &key, identity);
                     self.log(format!("battery exchange: {e}"));
-                    errors.push(e);
+                    failure = Some(e);
                 }
             }
         }
-        if out.is_empty() && !errors.is_empty() {
-            return Err(errors.remove(0));
+        if !completed && let Some(error) = failure {
+            return Err(error);
         }
         Ok(out)
     }
@@ -133,6 +135,7 @@ impl HidProvider {
         key: &str,
         handles: &mut [(&HidInfo, Box<dyn HidSession>)],
         c: &PollContext<'_>,
+        mut collection_error: Option<ProviderError>,
     ) -> Result<Option<Battery>, ProviderError> {
         if handles.is_empty() {
             return Ok(None);
@@ -156,12 +159,19 @@ impl HidProvider {
                 let mut answered = false;
                 let mut readable = false;
                 while c.active() && c.clock.monotonic() < end && !answered {
-                    for (_, s) in handles.iter_mut() {
+                    for (info, s) in handles.iter_mut() {
                         if !c.active() {
                             break;
                         }
-                        let Ok(r) = s.read(64, Duration::ZERO) else {
+                        if info.input_length == Some(0) {
                             continue;
+                        }
+                        let r = match s.read(64, Duration::ZERO) {
+                            Ok(report) => report,
+                            Err(error) => {
+                                collection_error = Some(error);
+                                continue;
+                            }
                         };
                         readable = true;
                         if let Some((kind, value)) = p::hyperx3s(&r) {
@@ -188,7 +198,7 @@ impl HidProvider {
                     return Err(ProviderError::new("all input collections failed"));
                 }
                 if cmd == 6 && level.is_none() {
-                    return Ok(None);
+                    return collection_error.map_or(Ok(None), Err);
                 }
             }
             return Ok(level.and_then(|n| p::battery(n, charging)));
@@ -201,12 +211,19 @@ impl HidProvider {
         let mut power = None;
         let mut readable = false;
         while c.active() && c.clock.monotonic() < end && (level.is_none() || power.is_none()) {
-            for (_, s) in handles.iter_mut() {
+            for (info, s) in handles.iter_mut() {
                 if !c.active() {
                     break;
                 }
-                let Ok(r) = s.read(64, Duration::ZERO) else {
+                if info.input_length == Some(0) {
                     continue;
+                }
+                let r = match s.read(64, Duration::ZERO) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        collection_error = Some(error);
+                        continue;
+                    }
                 };
                 readable = true;
                 if let Some((battery, state)) = p::steelseries_elite(&r) {
@@ -233,6 +250,9 @@ impl HidProvider {
             return Err(ProviderError::new(
                 "no collection accepted status output report",
             ));
+        }
+        if level.is_none() && let Some(error) = collection_error {
+            return Err(error);
         }
         Ok(level.and_then(|n| p::battery(n, Some(charging || power == Some(2)))))
     }

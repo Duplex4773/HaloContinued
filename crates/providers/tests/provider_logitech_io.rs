@@ -38,7 +38,7 @@ fn hidpp10_charge_error_falls_back_to_coarse_status_and_both_error_forms_are_imm
         ex.error(1, 0, 1, &[], 1);
         ex.steps
             .push(Step::Write(vec![0x10, 1, 0x81, 0x0d, 0, 0, 0]));
-        ex.read(vec![0x10, 1, error, 0x81, 0x0d, 2]);
+        ex.read(vec![0x10, 1, error, 0x81, 0x0d, 2, 0]);
         ex.steps.push(Step::Write(vec![0x10, 1, 0x81, 7, 0, 0, 0]));
         ex.read(vec![0x10, 1, 0x81, 7, 3, 0x21, 0]);
         ex.empty_slots();
@@ -113,26 +113,33 @@ impl Exchange {
     }
     fn silent_ping(&mut self, slot: u8, millis: usize) {
         self.start(slot, 0, 1, &[]);
-        for _ in 0..millis / 5 {
+        // 5, 10, 20 ms, then at most one check of each channel per 40 ms.
+        for _ in 0..(3 + millis.saturating_sub(35).div_ceil(40)) {
             self.read(vec![]);
             if self.short {
                 self.read(vec![]);
             }
         }
     }
+    fn unit(&mut self, slot: u8, unit: [u8; 4]) {
+        self.answer(slot, 0, 0, &[0, 3], &[3]);
+        self.answer(slot, 3, 0, &[], &[0, unit[0], unit[1], unit[2], unit[3]]);
+    }
     fn identity(&mut self, slot: u8, name: &str, unit: [u8; 4]) {
+        self.unit(slot, unit);
+        self.description(slot, name);
+    }
+    fn description(&mut self, slot: u8, name: &str) {
         self.answer(slot, 0, 0, &[0, 5], &[2]);
         self.answer(slot, 2, 0, &[], &[name.len() as u8]);
         for (idx, chunk) in name.as_bytes().chunks(16).enumerate() {
             self.answer(slot, 2, 1, &[(idx * 16) as u8], chunk);
         }
         self.answer(slot, 2, 2, &[], &[3]);
-        self.answer(slot, 0, 0, &[0, 3], &[3]);
-        self.answer(slot, 3, 0, &[], &[0, unit[0], unit[1], unit[2], unit[3]]);
     }
     fn no_identity(&mut self, slot: u8) {
-        self.answer(slot, 0, 0, &[0, 5], &[0]);
         self.answer(slot, 0, 0, &[0, 3], &[0]);
+        self.answer(slot, 0, 0, &[0, 5], &[0]);
     }
     fn unified(&mut self, slot: u8, params: &[u8]) {
         self.answer(slot, 0, 0, &[0x10, 4], &[4]);
@@ -679,6 +686,10 @@ fn logitech_keys_are_stable_when_unrelated_receivers_arrive_and_leave() {
         infos.extend(receiver(0xc52b, "7&bbbb", false));
         let mut ex = Exchange::default();
         ex.answer(1, 0, 1, &[], &[2]);
+        ex.unit(1, unit);
+        if unit == [0; 4] {
+            ex.description(1, "First");
+        }
         ex.unified(1, &[77, 0, 0]);
         ex.empty_slots();
         ex.reset();
@@ -690,6 +701,10 @@ fn logitech_keys_are_stable_when_unrelated_receivers_arrive_and_leave() {
         both.done();
         let mut ex = Exchange::default();
         ex.answer(1, 0, 1, &[], &[2]);
+        ex.unit(1, unit);
+        if unit == [0; 4] {
+            ex.description(1, "First");
+        }
         ex.unified(1, &[78, 0, 0]);
         ex.empty_slots();
         let last = FakeHid::new(receiver(0xc52b, "7&aaaa", false), ex.steps);
@@ -906,4 +921,331 @@ fn definitive_empty_receiver_slot_forgets_unit_and_repair_reads_new_identity() {
     assert_eq!(new[0].level, Some(61));
     assert_ne!(new[0].key, old[0].key);
     second_hid.done();
+}
+
+#[test]
+fn occupied_slot_revalidates_the_unit_with_and_without_invalidation() {
+    for invalidate in [false, true] {
+        let mut ex = Exchange::default();
+        ex.mouse("First", [1; 4], 76);
+        ex.reset();
+        ex.answer(1, 0, 1, &[], &[2]);
+        ex.identity(1, "Second", [2; 4]);
+        for feature in [0x1004u16, 0x1000, 0x1001, 0x1f20] {
+            ex.answer(1, 0, 0, &feature.to_be_bytes(), &[0]);
+        }
+        ex.empty_slots();
+        ex.reset();
+        ex.answer(1, 0, 1, &[], &[2]);
+        ex.unit(1, [2; 4]);
+        ex.unified(1, &[31, 0, 0]);
+        ex.empty_slots();
+        ex.reset();
+        ex.answer(1, 0, 1, &[], &[2]);
+        ex.error(1, 0, 0, &[0, 3], 9);
+        ex.empty_slots();
+        let hid = FakeHid::new(receiver(0xc539, "receiver", false), ex.steps);
+        let clock = FakeClock::default();
+        let mut provider = HidProvider::new("logitech");
+        let first = poll(&mut provider, &hid, &clock);
+        if invalidate {
+            provider.invalidate();
+        }
+        // Identifying the replacement retires the old unit even when the
+        // replacement has no battery reading until the following poll.
+        assert!(poll(&mut provider, &hid, &clock).is_empty());
+        let second = poll(&mut provider, &hid, &clock);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].key, second[0].key);
+        assert_eq!(second[0].name, "Second");
+        assert_eq!(second[0].level, Some(31));
+        let uncertain = poll(&mut provider, &hid, &clock);
+        assert_eq!(uncertain.len(), 1);
+        assert_eq!(uncertain[0].key, second[0].key);
+        assert_eq!(uncertain[0].connection, Connection::Sleeping);
+        hid.done();
+    }
+}
+#[test]
+fn matching_tokens_cannot_make_truncated_or_foreign_hidpp_reports_valid() {
+    let mut ex = Exchange::default();
+    ex.answer(1, 0, 1, &[], &[2]);
+    ex.identity(1, "Mouse", [1; 4]);
+    ex.answer(1, 0, 0, &[0x10, 4], &[4]);
+    let token = ex.start(1, 4, 1, &[]);
+    let mut foreign = Exchange::packet(1, 4, token, &[2]);
+    foreign[0] = 0x12;
+    ex.read(foreign);
+    ex.read(vec![0x11, 1, 4, token, 3]);
+    ex.read(vec![0x10, 1, 4, token, 4, 0]);
+    ex.read(vec![0x10, 1, 4, token, 42, 0, 1]);
+    ex.empty_slots();
+    let hid = FakeHid::new(receiver(0xc539, "receiver", false), ex.steps);
+    let rows = poll(
+        &mut HidProvider::new("logitech"),
+        &hid,
+        &FakeClock::default(),
+    );
+    assert_eq!((rows[0].level, rows[0].charging), (Some(42), Some(true)));
+    hid.done();
+}
+
+#[test]
+fn direct_endpoint_keeps_confirmed_unit_when_readback_fails_after_reconnect() {
+    let mut ex = Exchange::default();
+    ex.answer(255, 0, 1, &[], &[2]);
+    ex.identity(255, "First", [1; 4]);
+    ex.unified(255, &[70, 0, 0]);
+    ex.reset();
+    ex.answer(255, 0, 1, &[], &[2]);
+    ex.error(255, 0, 0, &[0, 3], 9);
+    ex.reset();
+    ex.answer(255, 0, 1, &[], &[2]);
+    ex.identity(255, "Second", [2; 4]);
+    ex.unified(255, &[40, 0, 0]);
+    let hid = FakeHid::new(vec![collection(0xc08b, "direct", 2)], ex.steps);
+    let mut provider = HidProvider::new("logitech");
+    let clock = FakeClock::default();
+    let first = poll(&mut provider, &hid, &clock);
+    provider.invalidate();
+    let stale = poll(&mut provider, &hid, &clock);
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].key, first[0].key);
+    assert_eq!(stale[0].connection, Connection::Sleeping);
+    let second = poll(&mut provider, &hid, &clock);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].name, "Second");
+    assert_ne!(second[0].key, first[0].key);
+    hid.done();
+}
+
+#[test]
+fn direct_usb_description_without_a_unit_feature_is_cached_until_reconnect() {
+    let mut provider = HidProvider::new("logitech");
+    let clock = FakeClock::default();
+    for (name, requests, reconnect) in [
+        ("First", 8, false),
+        ("First", 3, false),
+        ("First", 3, false),
+        ("Second", 8, true),
+    ] {
+        let mut ex = Exchange::default();
+        if reconnect {
+            provider.invalidate();
+        }
+        ex.answer(255, 0, 1, &[], &[2]);
+        if requests == 8 {
+            ex.answer(255, 0, 0, &[0, 3], &[0]);
+            ex.description(255, name);
+        }
+        ex.unified(255, &[70, 0, 0]);
+        assert_eq!(
+            ex.steps
+                .iter()
+                .filter(|s| matches!(s, Step::Write(_)))
+                .count(),
+            requests
+        );
+        let hid = FakeHid::new(vec![collection(0xc08b, "usb", 2)], ex.steps);
+        let rows = poll(&mut provider, &hid, &clock);
+        assert_eq!((rows[0].name.as_str(), rows[0].level), (name, Some(70)));
+        hid.done();
+    }
+}
+
+#[test]
+fn silent_receiver_limits_read_attempts_and_preserves_deadlines() {
+    let clock = FakeClock::default();
+    let cancel = AtomicBool::new(false);
+    let mut provider = HidProvider::new("logitech");
+    for (timeout, expected_reads) in [(2000, 636), (600, 216)] {
+        let mut ex = Exchange {
+            short: true,
+            ..Default::default()
+        };
+        for slot in 1..=6 {
+            ex.silent_ping(slot, timeout);
+        }
+        assert_eq!(
+            ex.steps
+                .iter()
+                .filter(|s| matches!(s, Step::ReadSized(..)))
+                .count(),
+            expected_reads
+        );
+        let hid = FakeHid::new(receiver(0xc539, "receiver", true), ex.steps);
+        let start = clock.monotonic();
+        let ctx = PollContext {
+            deadline: start + Duration::from_secs(25),
+            ..context(&clock, &cancel)
+        };
+        assert!(provider.poll(&hid, &ctx).unwrap().is_empty());
+        assert_eq!(
+            clock.monotonic() - start,
+            Duration::from_millis(6 * timeout as u64)
+        );
+        hid.done();
+    }
+}
+
+#[test]
+fn inaccessible_receiver_remains_stale_while_its_peer_is_online() {
+    let c = FakeClock::default();
+    let mut provider = HidProvider::new("logitech");
+    let mut a = receiver(0xc539, "a", false);
+    let b = receiver(0xc539, "b", false)[0].clone();
+    a.push(b.clone());
+    let mut e = Engine::new(Settings::default(), Estimator::default());
+    for t in [0, 60, 301, 361, 421, 481] {
+        c.0.store(t * 1000, Ordering::Relaxed);
+        let mut ex = Exchange::default();
+        if t == 0 {
+            ex.mouse("First", [1; 4], 62);
+            ex.reset();
+            ex.mouse("Second", [2; 4], 45);
+        } else if t >= 421 {
+            ex.error(1, 0, 1, &[], 8);
+            ex.empty_slots();
+        } else {
+            ex.answer(1, 0, 1, &[], &[2]);
+            ex.unit(1, [1; 4]);
+            ex.unified(1, &[62, 0, 0]);
+            ex.empty_slots();
+        }
+        let mut h = FakeHid::new(a.clone(), ex.steps);
+        if t > 0 {
+            h = h.fail_open(b.path.clone(), "temporarily inaccessible");
+        }
+        let mut rows = provider.poll(&h, &context(&c, &AtomicBool::new(false)));
+        UnreadableCollection::preserve(
+            provider.unreadable_collections(),
+            e.provider_readings("logitech"),
+            &mut rows,
+        );
+        e.apply("logitech", rows, t as f64, false);
+        let readings = e.readings();
+        assert_eq!(readings.len(), if t >= 481 { 1 } else { 2 });
+        assert_eq!(
+            readings.iter().any(|r| r.name == "First" && r.online()),
+            t < 421
+        );
+        assert!(readings.iter().any(|r| r.name == "Second"
+            && r.connection
+                == if t == 0 {
+                    Connection::Online
+                } else {
+                    Connection::Stale
+                }));
+        assert_eq!(provider.unreadable_collections().len(), usize::from(t > 0));
+        h.done();
+    }
+}
+
+#[test]
+fn g535_register_only_collection_does_not_inherit_an_old_unit() {
+    let clock = FakeClock::default();
+    let mut p = HidProvider::new("logitech");
+    let mut consumer = info(0x046d, 0x0ac4, 0x0c);
+    consumer.usage = 1;
+    consumer.container = Some("fixed-port".into());
+    let mut ex = Exchange::default();
+    ex.answer(255, 0, 1, &[], &[2]);
+    ex.identity(255, "Original", [1; 4]);
+    ex.adc(255, &[0x0f, 0x7b, 1], false);
+    let h = FakeHid::new(vec![consumer.clone()], ex.steps);
+    let one = poll(&mut p, &h, &clock);
+    h.done();
+    p.invalidate();
+    let mut vendor = consumer.clone();
+    vendor.path = "vendor-new".into();
+    vendor.usage_page = 0xff43;
+    vendor.usage = 0x202;
+    vendor.serial = "physically-different".into();
+    let h = FakeHid::new(
+        vec![vendor],
+        vec![
+            Step::Read(Ok(vec![])),
+            Step::Write(hb_providers::protocols::padded(&[0x11, 0xff, 5, 0x0d], 20)),
+            Step::Read(Ok(vec![0x10, 0xff, 5, 0x0d, 0x0f, 0xe5, 1])),
+        ],
+    );
+    let two = poll(&mut p, &h, &clock);
+    h.done();
+    assert_eq!(two.len(), 1);
+    assert_ne!(two[0].key, one[0].key);
+    assert_eq!(two[0].serial.as_deref(), Some("PHYSICALLY-DIFFERENT"));
+    assert_eq!(two[0].level, Some(85));
+}
+
+#[test]
+fn razer_mice_with_the_same_serial_keep_separate_receivers_and_levels() {
+    let mut first = razer_device(0x007b, "SHARED", "a");
+    first.container = Some("container-a".into());
+    let second = HidInfo {
+        path: "b".into(),
+        container: Some("container-b".into()),
+        ..first.clone()
+    };
+    let mut steps = razer_success(0xff, 128, 0);
+    steps.extend(razer_success(0xff, 64, 0));
+    let hid = FakeHid::new(vec![second.clone(), first], steps);
+    let clock = FakeClock::default();
+    let marked = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let make_provider = || {
+        let marked = std::sync::Arc::clone(&marked);
+        HidProvider::new("razer").with_razer_collision_markers(move |key, shared| {
+            let mut marked = marked.lock().unwrap();
+            if shared {
+                marked.insert(key.to_owned());
+            }
+            Ok(marked.contains(key))
+        })
+    };
+    let mut provider = make_provider();
+    let rows = provider
+        .poll(&hid, &context(&clock, &AtomicBool::new(false)))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0].key, rows[1].key);
+    assert_ne!(rows[0].level, rows[1].level);
+    let expected = &rows
+        .iter()
+        .find(|r| r.container == second.container)
+        .unwrap()
+        .key;
+    hid.done();
+    let hid = FakeHid::new(vec![second.clone()], razer_success(0xff, 64, 0));
+    let rows = provider
+        .poll(&hid, &context(&clock, &AtomicBool::new(false)))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0].key, expected);
+    hid.done();
+    drop(provider);
+    let hid = FakeHid::new(vec![second], razer_success(0xff, 64, 0));
+    assert_eq!(&poll(&mut make_provider(), &hid, &clock)[0].key, expected);
+    hid.done();
+}
+
+#[test]
+fn silent_registers_back_off_on_both_channels_and_keep_the_original_deadline() {
+    let mut ex = Exchange {
+        short: true,
+        ..Default::default()
+    };
+    ex.error(1, 0, 1, &[], 1);
+    for register in [0x0d, 7] {
+        ex.steps
+            .push(Step::Write(vec![0x10, 1, 0x81, register, 0, 0, 0]));
+        for _ in 0..18 {
+            ex.read(vec![]);
+            ex.read(vec![]);
+        }
+    }
+    ex.empty_slots();
+    let h = FakeHid::new(receiver(0xc52b, "register", true), ex.steps);
+    let clock = FakeClock::default();
+    assert!(poll(&mut HidProvider::new("logitech"), &h, &clock).is_empty());
+    assert_eq!(clock.monotonic(), Duration::from_millis(1200));
+    h.done();
 }

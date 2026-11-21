@@ -65,6 +65,13 @@ try {
     Assert-True ($relative -in $expected -or $relative -match '^licenses[\\/][^\\/]+$') "Unexpected package file: $relative"
   }
   foreach ($file in $expected) { Assert-True (Test-Path -LiteralPath (Join-Path $payload $file)) "Missing package file: $file" }
+  $guide = Get-Content -Raw -LiteralPath (Join-Path $payload 'README.md')
+  foreach ($match in [regex]::Matches($guide, '\]\((?<target>[^)]+)\)')) {
+    $target = $match.Groups['target'].Value.Split('#')[0]
+    if ($target -and $target -notmatch '^https?://') {
+      Assert-True (Test-Path -LiteralPath (Join-Path $payload $target)) "Missing portable README target: $target"
+    }
+  }
   $packVersion = $version + '-installer-test-' + $id
   $packOutput = Join-Path $repo "dist/HaloContinued-$packVersion-windows-x64"
   [IO.Directory]::CreateDirectory((Join-Path $packOutput 'licenses')) | Out-Null

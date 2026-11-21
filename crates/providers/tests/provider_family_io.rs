@@ -41,6 +41,94 @@ fn classic(pid: u16) -> HidInfo {
     device("steelseries", pid, page, usage, iface, "classic")
 }
 #[test]
+fn partial_headset_failures_preserve_only_the_known_inaccessible_unit() {
+    let clock = FakeClock::default();
+    let cancel = AtomicBool::new(false);
+    let mut provider = HidProvider::new("steelseries");
+    let mut engine = Engine::new(Settings::default(), Estimator::default());
+    let mut first = classic(0x12b3);
+    first.serial = "UNIT-A".into();
+    let mut second = first.clone();
+    second.path = "other-headset".into();
+    second.serial = "UNIT-B".into();
+    second.container = Some("container-b".into());
+    let reply = |level| [Step::Write(vec![6, 0x12]), rd(&[6, 0x12, 0, level])];
+    let initial = FakeHid::new(
+        vec![first.clone(), second.clone()],
+        [reply(90), reply(80)].concat(),
+    );
+    let id = provider.id();
+    engine.apply(
+        id,
+        provider.poll(&initial, &context(&clock, &cancel)),
+        0.0,
+        false,
+    );
+    initial.done();
+    let old = engine
+        .provider_readings(id)
+        .iter()
+        .find(|r| r.serial == Some(second.serial.clone()))
+        .unwrap()
+        .clone();
+    for _ in 0..3 {
+        clock.sleep(Duration::from_secs(240));
+        let partial = FakeHid::new(vec![first.clone(), second.clone()], reply(70).to_vec())
+            .fail_open(&second.path, "device busy");
+        let mut result = provider.poll(&partial, &context(&clock, &cancel));
+        UnreadableCollection::preserve(
+            provider.unreadable_collections(),
+            engine.provider_readings(id),
+            &mut result,
+        );
+        engine.apply(id, result, 0.0, false);
+        let rows = engine.provider_readings(id);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.online() && r.level == Some(70)));
+        let stale = rows.iter().find(|r| r.key == old.key).unwrap();
+        assert_eq!(
+            (stale.connection.clone(), stale.timestamp, stale.level),
+            (Connection::Stale, old.timestamp, Some(80))
+        );
+        assert_eq!(stale.current_charging(), None);
+        partial.done();
+    }
+    // A different container with the same serial cannot inherit the old level.
+    second.container = Some("replacement".into());
+    let changed = FakeHid::new(vec![first.clone(), second.clone()], reply(65).to_vec())
+        .fail_open(&second.path, "device busy");
+    let mut result = provider.poll(&changed, &context(&clock, &cancel));
+    UnreadableCollection::preserve(
+        provider.unreadable_collections(),
+        engine.provider_readings(id),
+        &mut result,
+    );
+    assert_eq!(result.unwrap().len(), 1);
+    let recovered = FakeHid::new(vec![first.clone(), second], [reply(60), reply(35)].concat());
+    engine.apply(
+        id,
+        provider.poll(&recovered, &context(&clock, &cancel)),
+        1.0,
+        false,
+    );
+    assert!(provider.unreadable_collections().is_empty());
+    assert!(engine.provider_readings(id).iter().any(|r| r.online()
+        && r.container.as_deref() == Some("replacement")
+        && r.level == Some(35)));
+    for _ in 0..2 {
+        let removed = FakeHid::new(vec![first.clone()], reply(60).to_vec());
+        let mut result = provider.poll(&removed, &context(&clock, &cancel));
+        UnreadableCollection::preserve(
+            provider.unreadable_collections(),
+            engine.provider_readings(id),
+            &mut result,
+        );
+        engine.apply(id, result, 2.0, false);
+    }
+    assert_eq!(engine.provider_readings(id).len(), 1);
+}
+
+#[test]
 fn steel_classic_arctis1_and_arctis9_exact_transactions_names_and_gate() {
     for (pid, request, reply, level, charging, name) in [
         (

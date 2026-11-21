@@ -200,6 +200,18 @@ fn quiet_disabled_delivers_during_game() {
     assert_eq!(apply(&mut e, Some(15), Some(false), true).len(), 1);
 }
 #[test]
+fn undelivered_low_rearms_on_a_one_percent_bounce() {
+    let mut e = engine();
+    assert!(apply(&mut e, Some(20), Some(false), true).is_empty());
+    assert!(apply(&mut e, Some(21), Some(false), false).is_empty());
+    assert!(!e.has_held_notifications());
+    let notes = apply(&mut e, Some(19), Some(false), false);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].text.contains("19%"));
+    assert!(apply(&mut e, Some(18), Some(false), false).is_empty());
+}
+
+#[test]
 fn held_low_drops_on_charge_recovery_hidden_or_threshold_off() {
     for change in 0..4 {
         let mut e = engine();
@@ -209,7 +221,7 @@ fn held_low_drops_on_charge_recovery_hidden_or_threshold_off() {
                 apply(&mut e, Some(16), Some(true), true);
             }
             1 => {
-                apply(&mut e, Some(21), Some(false), true);
+                apply(&mut e, Some(26), Some(false), true);
             }
             2 => e.settings.devices.entry("one".into()).or_default().hidden = true,
             _ => e.settings.devices.entry("one".into()).or_default().low = Some(0),

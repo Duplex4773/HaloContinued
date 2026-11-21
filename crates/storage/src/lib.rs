@@ -1,4 +1,5 @@
 //! Bounded, batched history storage; configuration never shares upstream's folder.
+mod calendar;
 mod schema;
 mod usage_index;
 #[cfg(test)]
@@ -159,6 +160,30 @@ mod portable_tests {
         fs::write(&blocked, []).unwrap();
         assert!(!writable_directory(&blocked));
     }
+}
+/// Empty, immutable markers remember only confirmed serial collisions. Creation is
+/// atomic across processes. The device ID itself never becomes a filesystem path.
+pub fn razer_collision_marker(dir: &Path, key: &str, shared: bool) -> Result<bool, ProviderError> {
+    let folder = dir.join("receiver-identities");
+    let marker = folder.join(format!("{:032x}", hb_core::stable_guid(key)));
+    if !shared {
+        return marker.try_exists().map_err(Into::into);
+    }
+    fs::create_dir_all(&folder)?;
+    match fs::File::create_new(marker) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn remember_qualified_receiver(folder: &Path, key: &str) -> Result<(), ProviderError> {
+    if key.starts_with("razer:")
+        && let Some((base, _)) = key.split_once(":physical:")
+    {
+        razer_collision_marker(folder, base, true)?;
+    }
+    Ok(())
 }
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ProviderError> {
     if let Some(parent) = path.parent() {
@@ -360,7 +385,7 @@ impl Serialize for StatusDevices<'_> {
                 key: &d.reading.key,
                 name: &d.name,
                 level: d.reading.level,
-                charging: d.reading.charging.unwrap_or(false),
+                charging: d.reading.current_charging() == Some(true),
                 online: matches!(
                     d.reading.connection,
                     hb_core::Connection::Online | hb_core::Connection::ConnectedLastKnown
@@ -430,8 +455,84 @@ pub struct Store {
     #[cfg(test)]
     usage_rows: std::cell::Cell<usize>,
 }
-const INSIGHTS_WITH_ACTIVITY: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,(SELECT CASE WHEN e.rate=m.polling_rate THEN e.kind END FROM polling_events e WHERE e.device=r.device AND e.session=m.session AND e.ts<=r.ts ORDER BY e.ts DESC,e.rowid DESC LIMIT 1) FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts";
-const INSIGHTS_WITH_ACTIVITY_SEQUENCED: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,(SELECT CASE WHEN e.rate=m.polling_rate THEN e.kind END FROM polling_events e WHERE e.device=r.device AND e.session=m.session AND e.ts<=r.ts ORDER BY e.ts DESC,e.rowid DESC LIMIT 1) FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts AND m.sequence=r.sequence WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts,r.sequence";
+const INSIGHTS_WITH_ACTIVITY: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,
+    CASE WHEN e.rate=m.polling_rate THEN e.kind END,e.ts,r.rowid
+    FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts
+    LEFT JOIN polling_events e ON e.rowid=(
+        SELECT p.rowid FROM polling_events p WHERE p.device=r.device AND p.session=m.session
+        AND p.ts<=r.ts ORDER BY p.ts DESC,p.rowid DESC LIMIT 1)
+    WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts,r.rowid";
+const INSIGHTS_WITH_ACTIVITY_SEQUENCED: &str = "SELECT r.ts,r.payload,m.polling_rate,m.session,
+    CASE WHEN e.rate=m.polling_rate THEN e.kind END,e.ts,r.sequence
+    FROM readings r LEFT JOIN usage_metadata m ON m.device=r.device AND m.ts=r.ts AND m.sequence=r.sequence
+    LEFT JOIN polling_events e ON e.rowid=(
+        SELECT p.rowid FROM polling_events p WHERE p.device=r.device AND p.session=m.session
+        AND p.ts<=r.ts ORDER BY p.ts DESC,p.rowid DESC LIMIT 1)
+    WHERE r.device=?1 AND r.ts BETWEEN ?2 AND ?3 ORDER BY r.ts,r.sequence";
+
+// Event and reading sequences are independent. A boundary-second event needs a
+// session witnessed on the new side, without the same session on the old side.
+struct ActivityBoundary {
+    timestamp: i64,
+    ordinal: i64,
+    checked_session: Option<(u64, bool)>,
+}
+impl ActivityBoundary {
+    fn accepts(
+        &mut self,
+        store: &Store,
+        key: &str,
+        until: i64,
+        event: i64,
+        session: Option<u64>,
+    ) -> Result<bool, ProviderError> {
+        if event != self.timestamp {
+            return Ok(event > self.timestamp);
+        }
+        let Some(session) = session.filter(|_| store.has_usage_metadata) else {
+            return Ok(false);
+        };
+        if let Some((cached, accepted)) = self.checked_session
+            && cached == session
+        {
+            return Ok(accepted);
+        }
+        let sql = if store.sequenced {
+            "SELECT EXISTS(SELECT 1 FROM usage_metadata WHERE device=?1 AND ts BETWEEN ?2 AND ?3
+                AND (ts>?2 OR sequence>=?5) AND session=?4)
+             AND NOT EXISTS(SELECT 1 FROM usage_metadata WHERE device=?1 AND ts BETWEEN ?6 AND ?2
+                AND (ts<?2 OR sequence<?5) AND session=?4)"
+        } else {
+            // Legacy tables allow only one reading per device and second.
+            "SELECT EXISTS(SELECT 1 FROM usage_metadata WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND session=?4)
+             AND NOT EXISTS(SELECT 1 FROM usage_metadata WHERE device=?1 AND ts>=?5 AND ts<?2 AND session=?4)"
+        };
+        let mut q = store.db.prepare_cached(sql).map_err(sql_error)?;
+        let session_text = session.to_string();
+        let retained = until.saturating_sub(30 * 86400);
+        let accepted = if store.sequenced {
+            q.query_row(
+                params![
+                    key,
+                    self.timestamp,
+                    until,
+                    session_text,
+                    self.ordinal,
+                    retained
+                ],
+                |r| r.get(0),
+            )
+        } else {
+            q.query_row(
+                params![key, self.timestamp, until, session_text, retained],
+                |r| r.get(0),
+            )
+        }
+        .map_err(sql_error)?;
+        self.checked_session = Some((session, accepted));
+        Ok(accepted)
+    }
+}
 impl Store {
     pub fn open(path: &Path) -> Result<Self, ProviderError> {
         if let Some(parent) = path.parent() {
@@ -475,6 +576,22 @@ impl Store {
             #[cfg(test)]
             usage_rows: Default::default(),
         })
+    }
+    /// Older builds recorded collision-qualified keys in history before markers existed.
+    /// Seek once per distinct Razer key using the device index, skipping its samples.
+    pub fn restore_receiver_markers(&self, folder: &Path) -> Result<(), ProviderError> {
+        use rusqlite::OptionalExtension;
+        let mut next = self.db.prepare("SELECT device FROM readings WHERE device > ?1 AND device < 'razer;' ORDER BY device LIMIT 1").map_err(sql_error)?;
+        let mut cursor = String::from("razer:");
+        while let Some(key) = next
+            .query_row([&cursor], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(sql_error)?
+        {
+            remember_qualified_receiver(folder, &key)?;
+            cursor = key;
+        }
+        Ok(())
     }
     pub fn prune(&mut self, now: i64) -> Result<(), ProviderError> {
         self.prune_inner(now, true)
@@ -533,7 +650,10 @@ impl Store {
         if !current() {
             return Ok(None);
         }
-        let sql = if self.has_usage_metadata && self.has_polling_events {
+        let snapshot = self.db.unchecked_transaction().map_err(sql_error)?;
+        let linked_events = self.has_usage_metadata && self.has_polling_events;
+        let mut boundary = None;
+        let sql = if linked_events {
             if self.sequenced {
                 INSIGHTS_WITH_ACTIVITY_SEQUENCED
             } else {
@@ -604,7 +724,7 @@ impl Store {
             // Activity classification is optional; damaged event text must not
             // discard independently valid battery/rate evidence.
             let activity_text = row.get_ref(4).map_err(sql_error)?.as_str().ok();
-            let activity = match activity_text {
+            let mut activity = match activity_text {
                 Some("boost") => Some(PollingActivityKind::Boost),
                 Some("restore") => Some(PollingActivityKind::Restore),
                 Some("manual") => Some(PollingActivityKind::Manual),
@@ -612,6 +732,23 @@ impl Store {
                 Some("saver_restore") => Some(PollingActivityKind::SaverRestore),
                 _ => None,
             };
+            if self.has_polling_events && builder.replaces_device(&reading) {
+                boundary = Some(ActivityBoundary {
+                    timestamp,
+                    ordinal: if linked_events {
+                        row.get(6).map_err(sql_error)?
+                    } else {
+                        0
+                    },
+                    checked_session: None,
+                });
+            }
+            if activity.is_some()
+                && let Some(boundary) = &mut boundary
+                && !boundary.accepts(self, key, until, row.get(5).map_err(sql_error)?, session)?
+            {
+                activity = None;
+            }
             builder.push_with_activity(
                 UsageObservation {
                     reading,
@@ -628,14 +765,8 @@ impl Store {
             // Replay retained context before the seven-day reporting window:
             // saver may already be active at its boundary. Only recent changes
             // contribute to the activity counts below.
-            // A reused identity cuts context at its physical replacement.
-            // At its first timestamp, both units can have saved an event: require
-            // matching session evidence within the new unit's retained period.
-            let sql = if self.has_usage_metadata && identity_since.is_some() {
-                "SELECT kind,rate,previous_rate,ts FROM polling_events e WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND (ts>?2 OR EXISTS(SELECT 1 FROM usage_metadata m WHERE m.device=e.device AND m.ts BETWEEN ?2 AND ?3 AND m.session=e.session)) ORDER BY ts,rowid"
-            } else {
-                "SELECT kind,rate,previous_rate,ts FROM polling_events WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid"
-            };
+            let sql = "SELECT kind,rate,previous_rate,ts,session FROM polling_events
+                WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid";
             let mut query = self.db.prepare(sql).map_err(sql_error)?;
             let mut rows = query
                 .query(params![key, activity_since, until])
@@ -662,6 +793,15 @@ impl Store {
                 };
                 if previous.is_some_and(|hz| PollingRate::try_from(hz).is_err()) {
                     continue;
+                }
+                let timestamp: i64 = row.get(3).map_err(sql_error)?;
+                if let Some(boundary) = &mut boundary
+                    && timestamp == boundary.timestamp
+                {
+                    let session = row_text(row, 4).ok().and_then(|s| s.parse().ok());
+                    if !boundary.accepts(self, key, until, timestamp, session)? {
+                        continue;
+                    }
                 }
                 // Follow confirmed ownership in event order. A boost can start
                 // above Battery saver's temporary rate; that is not the user's
@@ -696,9 +836,7 @@ impl Store {
                 // Same-rate confirmations can transfer ownership from an
                 // automatic boost to a manual choice. Keep those events for
                 // interval classification, but do not count a hardware change.
-                if previous == Some(rate)
-                    || row.get::<_, i64>(3).map_err(sql_error)? < result.recent.since
-                {
+                if previous == Some(rate) || timestamp < result.recent.since {
                     continue;
                 }
                 match kind {
@@ -713,6 +851,7 @@ impl Store {
                 }
             }
         }
+        snapshot.commit().map_err(sql_error)?;
         Ok(current().then_some(result))
     }
     /// Successful readback only; no device access and no inferred historical events.
@@ -774,98 +913,20 @@ impl Store {
         until: i64,
         max_points: usize,
     ) -> Result<Vec<Reading>, ProviderError> {
-        let limit = max_points.clamp(2, 4096);
-        let retained_since = until.saturating_sub(30 * 86400);
-        let sql = if self.sequenced {
-            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND (SELECT ts FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC LIMIT 1) IS NOT NULL ORDER BY ts DESC,sequence DESC"
+        self.calendar_interval(
+            key,
+            since.max(until.saturating_sub(30 * 86400)),
+            until,
+            max_points.clamp(2, 4096),
+            true,
+        )
+    }
+    fn history_row_sql(&self) -> &'static str {
+        if self.sequenced {
+            "SELECT ts,payload FROM readings WHERE device=?1 AND ts=?2 AND sequence=?3"
         } else {
-            "SELECT ts,payload FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND (SELECT ts FROM readings WHERE device=?1 AND ts>=?2 AND ts<?3 AND level BETWEEN 0 AND 100 ORDER BY ts DESC LIMIT 1) IS NOT NULL ORDER BY ts DESC,rowid DESC"
-        };
-        let mut query = self.db.prepare(sql).map_err(sql_error)?;
-        let mut baseline = None;
-        let mut identity = None;
-        let mut rows = query
-            .query(params![key, retained_since, since.min(until)])
-            .map_err(sql_error)?;
-        while let Some(row) = rows.next().map_err(sql_error)? {
-            let Some(reading) = history_reading(row, key).map_err(sql_error)? else {
-                continue;
-            };
-            if identity
-                .as_ref()
-                .is_some_and(|latest: &Reading| !latest.same_battery_identity(&reading))
-            {
-                break;
-            }
-            if reading.level.is_some() {
-                baseline = Some(reading);
-                break;
-            }
-            if identity.is_none() {
-                identity = Some(reading);
-            }
+            "SELECT ts,payload FROM readings WHERE device=?1 AND ts=?2 AND rowid=?3"
         }
-        let mut interval =
-            self.query(key, since, until, limit - usize::from(baseline.is_some()))?;
-        // Downsampling keeps the endpoints. Start the visible trace again when
-        // a receiver slot belongs to a different battery; retain the raw rows.
-        if let Some(latest) = interval.last() {
-            if let Some(previous) = interval
-                .iter()
-                .rposition(|r| !latest.same_battery_identity(r))
-            {
-                let first_hint = &interval[previous + 1];
-                let mut start = first_hint.timestamp;
-                let mut find = self.db.prepare(
-                    "SELECT ts,payload FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC"
-                ).map_err(sql_error)?;
-                let mut rows = find
-                    .query(params![
-                        key,
-                        interval[previous].timestamp,
-                        first_hint.timestamp
-                    ])
-                    .map_err(sql_error)?;
-                while let Some(row) = rows.next().map_err(sql_error)? {
-                    let Some(r) = history_reading(row, key).map_err(sql_error)? else {
-                        continue;
-                    };
-                    if !latest.same_battery_identity(&r) {
-                        break;
-                    }
-                    start = r.timestamp;
-                }
-                interval = self.query(key, start, until, limit)?;
-                // Different devices can occupy the slot within the same second.
-                if let Some(last) = interval.last()
-                    && let Some(i) = interval
-                        .iter()
-                        .rposition(|r| !last.same_battery_identity(r))
-                {
-                    interval.drain(..=i);
-                }
-                return Ok(interval);
-            }
-            if baseline
-                .as_ref()
-                .is_some_and(|r| !latest.same_battery_identity(r))
-            {
-                baseline = None;
-            }
-        }
-        let Some(baseline) = baseline else {
-            return Ok(interval);
-        };
-        // The raw query reserves at least two endpoints. With a two-point chart,
-        // retain the latest interval observation alongside the predecessor.
-        if interval.len() > limit - 1 {
-            interval = interval.into_iter().rev().take(limit - 1).collect();
-            interval.reverse();
-        }
-        let mut out = Vec::with_capacity(interval.len() + 1);
-        out.push(baseline);
-        out.extend(interval);
-        Ok(out)
     }
     /// Active-use history, summed from raw retained rows before display sampling.
     pub fn query_usage(
@@ -880,75 +941,38 @@ impl Store {
         // Bounds, cache revision and both scans must see the same history flush.
         let snapshot = self.db.unchecked_transaction().map_err(sql_error)?;
         let limit = max_points.clamp(2, 4096);
-        let bounds_sql = if self.sequenced {
-            "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1)"
-        } else {
-            "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1)"
-        };
-        let bounds: Option<(i64, i64, i64, i64)> = self
-            .db
-            .query_row(
-                bounds_sql,
-                params![key, until.saturating_sub(30 * 86400), until],
-                |r| match r.get::<_, Option<i64>>(0)? {
-                    Some(first) => Ok(Some((first, r.get(1)?, r.get(2)?, r.get(3)?))),
-                    None => Ok(None),
-                },
-            )
-            .map_err(sql_error)?;
-        // Interior writes invalidate the index. Tail appends and retention reuse its overlap.
-        // Check other connections here, but do not invalidate for unrelated
-        // estimator checkpoints or polling-activity writes on this connection.
-        let revision = self
-            .db
-            .pragma_query_value(None, "data_version", |r| r.get(0))
-            .map_err(sql_error)?;
-        let mut index = self.usage_index.borrow_mut();
-        if !index
-            .as_ref()
-            .is_some_and(|i| i.key == key && i.bounds == bounds && i.revision == revision)
-        {
-            // Take ownership before any cancellable scan. A partial update
-            // must never become the cache for a later request.
-            let mut previous = index
-                .take()
-                .filter(|i| i.key == key && i.revision == revision);
-            if let Some(i) = previous.as_mut()
-                && !self.rebase_usage_index(i, key, bounds)?
-            {
-                previous = None;
-            }
-            let mut fresh =
-                previous.unwrap_or_else(|| usage_index::UsageIndex::new(key, None, revision));
-            let tail = fresh
-                .bounds
-                .map(|(_, _, timestamp, row)| usage_index::Checkpoint {
-                    timestamp,
-                    row,
-                    position: fresh.total,
-                });
-            fresh.total = self.stream_usage(key, until, tail, |_, r, position, row| {
-                if r.level.is_some_and(|level| level <= 100)
-                    && !tail.is_some_and(|old| (r.timestamp, row) == (old.timestamp, old.row))
-                {
-                    fresh.push(usage_index::Checkpoint {
-                        timestamp: r.timestamp,
-                        row,
-                        position,
-                    });
-                }
-            })?;
-            fresh.bounds = bounds;
-            *index = Some(fresh);
-        }
+        self.index_history(key, until.saturating_sub(30 * 86400), until)?;
+        let index = self.usage_index.borrow();
         let total = index.as_ref().map_or(0, |i| i.total);
+        if total == 0 {
+            let sql = self.history_row_sql();
+            let mut query = self.db.prepare(sql).map_err(sql_error)?;
+            let mut samples = Vec::new();
+            if let Some(index) = index.as_ref() {
+                for (ts, row) in index.zero_rows(limit >= 4) {
+                    if let Some(reading) = query
+                        .query_row(params![key, ts, row], |r| history_reading(r, key))
+                        .map_err(sql_error)?
+                    {
+                        samples.push(hb_core::HistorySample {
+                            reading,
+                            position: 0,
+                        });
+                    }
+                }
+            }
+            return Ok(HistorySeries {
+                samples,
+                ..Default::default()
+            });
+        }
         let since = total.saturating_sub(seconds.max(1)).max(0);
         let buckets = limit.saturating_sub(2) / 2;
         let mut extremes: Vec<Option<(Sample, Sample)>> = vec![None; buckets];
         let mut baseline: Option<Sample> = None;
         let mut first = None;
         let mut last: Option<Sample> = None;
-        let checkpoint = index.as_ref().and_then(|i| i.before(since));
+        let checkpoint = index.as_ref().and_then(|i| i.before(since).or(i.segment));
         self.stream_usage(
             key,
             until,
@@ -1011,6 +1035,75 @@ impl Store {
             until: total,
         })
     }
+    /// Build the selected device's bounded index in the caller's read transaction.
+    fn index_history(&self, key: &str, since: i64, until: i64) -> Result<(), ProviderError> {
+        let bounds_sql = if self.sequenced {
+            "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,sequence LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1),(SELECT sequence FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,sequence DESC LIMIT 1)"
+        } else {
+            "SELECT (SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT ts FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1)"
+        };
+        let bounds: Option<(i64, i64, i64, i64)> = self
+            .db
+            .query_row(bounds_sql, params![key, since, until], |r| {
+                match r.get::<_, Option<i64>>(0)? {
+                    Some(first) => Ok(Some((first, r.get(1)?, r.get(2)?, r.get(3)?))),
+                    None => Ok(None),
+                }
+            })
+            .map_err(sql_error)?;
+        // Interior writes invalidate the index. Tail appends and retention reuse its overlap.
+        // Check other connections here, but do not invalidate for unrelated
+        // estimator checkpoints or polling-activity writes on this connection.
+        let revision = self
+            .db
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .map_err(sql_error)?;
+        let mut index = self.usage_index.borrow_mut();
+        if !index
+            .as_ref()
+            .is_some_and(|i| i.key == key && i.bounds == bounds && i.revision == revision)
+        {
+            // Take ownership before any cancellable scan. A partial update
+            // must never become the cache for a later request.
+            let mut previous = index
+                .take()
+                .filter(|i| i.key == key && i.revision == revision);
+            if let Some(i) = previous.as_mut()
+                && !self.rebase_usage_index(i, key, bounds)?
+            {
+                previous = None;
+            }
+            let mut fresh =
+                previous.unwrap_or_else(|| usage_index::UsageIndex::new(key, None, revision));
+            let tail = fresh
+                .bounds
+                .map(|(_, _, timestamp, row)| usage_index::Checkpoint {
+                    timestamp,
+                    row,
+                    position: fresh.total,
+                });
+            let scan_start = tail.or_else(|| {
+                bounds.map(|(timestamp, row, _, _)| usage_index::Checkpoint {
+                    timestamp,
+                    row,
+                    position: 0,
+                })
+            });
+            if let Some(start) = scan_start {
+                let mut origin = 0;
+                let total = self.stream_usage(key, until, Some(start), |_, r, position, row| {
+                    if !tail.is_some_and(|old| (r.timestamp, row) == (old.timestamp, old.row)) {
+                        fresh.observe(r, row, position, &mut origin);
+                    }
+                })?;
+                fresh.total = total - origin;
+            }
+            fresh.bounds = bounds;
+            *index = Some(fresh);
+        }
+        Ok(())
+    }
+
     /// Reuse the overlap of two forward-moving windows. When the retention
     /// boundary moves, only replay the short prefix up to a surviving checkpoint.
     fn rebase_usage_index(
@@ -1037,13 +1130,30 @@ impl Store {
         if (first, ordinal) == previous_first {
             return Ok(true);
         }
-        let Some(anchor) = index.first_retained(first, ordinal) else {
-            return Ok(false);
-        };
+        if index
+            .segment
+            .is_some_and(|s| (first, ordinal) <= (s.timestamp, s.row))
+        {
+            return Ok(true);
+        }
         let start = usage_index::Checkpoint {
             timestamp: first,
             row: ordinal,
             position: 0,
+        };
+        if index.total == 0 {
+            let sql = self.history_row_sql();
+            let first_level = self
+                .db
+                .query_row(sql, params![key, first, ordinal], |r| {
+                    history_reading(r, key)
+                })
+                .map_err(sql_error)?
+                .and_then(|r| r.level);
+            return Ok(index.trim_zero(start, first_level));
+        }
+        let Some(anchor) = index.first_retained(first, ordinal) else {
+            return Ok(false);
         };
         let mut offset = None;
         self.stream_usage(key, anchor.timestamp, Some(start), |_, r, position, row| {
@@ -1052,7 +1162,11 @@ impl Store {
             }
         })?;
         if let Some(offset) = offset {
+            if index.total == offset {
+                return Ok(false);
+            }
             index.rebase(first, ordinal, offset);
+            index.segment = Some(start);
             return Ok(true);
         }
         Ok(false)
@@ -1184,7 +1298,7 @@ impl Store {
         // A damaged checkpoint must not allocate an arbitrarily large JSON
         // tree at startup. Keep the original row for recovery; history is intact.
         let now = hb_core::Clock::unix(&hb_core::SystemClock::default());
-        self.db
+        let mut estimator = self.db
             .query_row(
                 "SELECT CASE WHEN octet_length(payload) <= ?1 THEN payload END FROM state WHERE key='estimator'",
                 [Self::MAX_CHECKPOINT_BYTES as i64],
@@ -1196,7 +1310,10 @@ impl Store {
                     let damaged = || rusqlite::Error::InvalidQuery;
                     if !payload.trim_start().starts_with('{') { return Err(damaged()); }
                     let estimator = match serde_json::from_str::<Estimator>(payload) {
-                        Ok(mut estimator) => { estimator.validate(now); estimator }
+                        Ok(mut estimator) => {
+                            if !estimator.validate(now) { return Err(damaged()); }
+                            estimator
+                        }
                         Err(_) => {
                             let value: serde_json::Value = serde_json::from_str(payload).map_err(|_| damaged())?;
                             if !value.get("devices").is_some_and(|v| v.is_object()) { return Err(damaged()); }
@@ -1210,7 +1327,39 @@ impl Store {
             )
             .optional()
             .map(|state| state.unwrap_or_default())
-            .map_err(sql_error)
+            .map_err(sql_error)?;
+        // Upgrade a legacy fit only if its checkpoint second identifies one unit.
+        for (key, fit) in estimator
+            .devices
+            .iter_mut()
+            .filter(|(_, fit)| fit.needs_identity())
+        {
+            let mut query = self
+                .db
+                .prepare_cached("SELECT ts,payload FROM readings WHERE device=?1 AND ts=?2")
+                .map_err(sql_error)?;
+            let mut rows = query.query(params![key, fit.seen]).map_err(sql_error)?;
+            let mut owner: Option<Reading> = None;
+            while let Some(row) = rows.next().map_err(sql_error)? {
+                match history_reading(row, key).map_err(sql_error)? {
+                    Some(r)
+                        if owner
+                            .as_ref()
+                            .is_none_or(|old| old.same_battery_identity(&r)) =>
+                    {
+                        owner = Some(r)
+                    }
+                    _ => {
+                        owner = None;
+                        break;
+                    }
+                }
+            }
+            if let Some(owner) = owner {
+                fit.bind_identity(&owner);
+            }
+        }
+        Ok(estimator)
     }
     pub fn save_estimator(&mut self, estimator: &Estimator) -> Result<(), ProviderError> {
         self.write_estimator(
@@ -1254,79 +1403,7 @@ impl HistoryStore for Store {
         until: i64,
         max_points: usize,
     ) -> Result<Vec<Reading>, ProviderError> {
-        let limit = max_points.clamp(2, 4096);
-        let count: i64 = self
-            .db
-            .query_row(
-                "SELECT count(*) FROM (SELECT 1 FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 LIMIT ?4)",
-                params![key, since, until, limit as i64 + 1],
-                |r| r.get(0),
-            )
-            .map_err(sql_error)?;
-        let mut out = Vec::with_capacity(limit.min(count as usize));
-        if count > limit as i64 && limit < 5 {
-            let mut query = self
-                .db
-                .prepare("SELECT ts,payload FROM readings WHERE device=?1 AND rowid=?2")
-                .map_err(sql_error)?;
-            let bounds = self
-                .db
-                .query_row(
-                    "SELECT (SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid LIMIT 1),(SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts DESC,rowid DESC LIMIT 1)",
-                    params![key, since, until],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )
-                .map_err(sql_error)?;
-            // With a tiny chart budget, prioritize an observed unknown gap
-            // between the endpoints over an extra known-level representative.
-            let gap: Option<i64> = if limit >= 3 {
-                self.db.query_row(
-                    "SELECT (SELECT rowid FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 AND level IS NULL AND rowid NOT IN (?4,?5) ORDER BY ts,rowid LIMIT 1)",
-                    params![key, since, until, bounds.0, bounds.1], |r| r.get(0),
-                ).map_err(sql_error)?
-            } else {
-                None
-            };
-            for ts in [Some(bounds.0), gap, Some(bounds.1)].into_iter().flatten() {
-                let reading = query
-                    .query_row(params![key, ts], |r| history_reading(r, key))
-                    .map_err(sql_error)?;
-                if let Some(r) = reading {
-                    out.push(r);
-                }
-            }
-        } else if count <= limit as i64 {
-            let mut query=self.db.prepare("SELECT ts,payload FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts,rowid").map_err(sql_error)?;
-            for row in query
-                .query_map(params![key, since, until], |r| history_reading(r, key))
-                .map_err(sql_error)?
-            {
-                if let Some(r) = row.map_err(sql_error)? {
-                    out.push(r);
-                }
-            }
-        } else {
-            // Reserve real interval endpoints, then up to low/high/unknown
-            // representatives per bucket. Flat plateaus still span their real
-            // timestamps; deterministic representatives avoid SQLite's arbitrary
-            // GROUP BY payload selection.
-            let buckets = ((limit - 2) / 3).max(1) as i64;
-            let span = (i128::from(until) - i128::from(since)).max(0) + 1;
-            let width = ((span + i128::from(buckets) - 1) / i128::from(buckets))
-                .clamp(1, i128::from(i64::MAX)) as i64;
-            let mut query=self.db.prepare("WITH selected AS (SELECT rowid AS id,ts,level,min((ts-?2)/?4,(?5-2)/3-1) AS bucket FROM readings WHERE device=?1 AND ts BETWEEN ?2 AND ?3), extremes AS (SELECT bucket,min(level) AS lo,max(level) AS hi FROM selected GROUP BY bucket), representatives AS (SELECT s.bucket,s.level,min(s.ts) AS ts FROM selected s JOIN extremes e ON s.bucket=e.bucket WHERE s.level=e.lo OR s.level=e.hi OR s.level IS NULL GROUP BY s.bucket,s.level), ids AS (SELECT min(s.id) AS id FROM selected s JOIN representatives p ON s.bucket=p.bucket AND s.level IS p.level AND s.ts=p.ts GROUP BY s.bucket,s.level UNION SELECT id FROM (SELECT id FROM selected ORDER BY ts,id LIMIT 1) UNION SELECT id FROM (SELECT id FROM selected ORDER BY ts DESC,id DESC LIMIT 1)) SELECT ts,payload FROM readings WHERE device=?1 AND rowid IN (SELECT id FROM ids) ORDER BY ts,rowid LIMIT ?5").map_err(sql_error)?;
-            for row in query
-                .query_map(params![key, since, until, width, limit as i64], |r| {
-                    history_reading(r, key)
-                })
-                .map_err(sql_error)?
-            {
-                if let Some(r) = row.map_err(sql_error)? {
-                    out.push(r);
-                }
-            }
-        }
-        Ok(out)
+        self.calendar_interval(key, since, until, max_points.clamp(2, 4096), false)
     }
     fn flush(&mut self) -> Result<(), ProviderError> {
         if self.pending.is_empty() {
@@ -1377,7 +1454,7 @@ impl HistoryStore for Store {
                 sample.reading.key == index.key
                     && index
                         .bounds
-                        .is_some_and(|(_, _, tail, _)| sample.reading.timestamp <= tail)
+                        .is_some_and(|(_, _, tail, _)| sample.reading.timestamp < tail)
             })
         }) {
             *index = None;
@@ -1454,6 +1531,17 @@ mod tests {
         store.save_estimator(&Estimator::default()).unwrap();
     }
 
+    #[test]
+    fn existing_qualified_history_restores_only_its_own_receiver_marker() {
+        let (dir, mut store) = baseline_store();
+        let key = "razer:00bf:SAME";
+        assert!(!razer_collision_marker(dir.path(), key, false).unwrap());
+        seed(&mut store, "razer:00bf:SAME:physical:UNIT-A", 100, Some(48));
+        seed(&mut store, "razer:00bf:OTHER", 100, Some(80));
+        store.restore_receiver_markers(dir.path()).unwrap();
+        assert!(razer_collision_marker(dir.path(), key, false).unwrap());
+        assert!(!razer_collision_marker(dir.path(), "razer:00bf:OTHER", false).unwrap());
+    }
     #[test]
     fn dpi_backups_retain_original_axes_and_profile_bytes_and_report_save_failure() {
         use hb_core::{DpiBackup, DpiState, DpiValue};
@@ -2095,6 +2183,88 @@ mod tests {
         );
     }
     #[test]
+    fn dense_calendar_keeps_the_last_confirmed_plateau_before_discharge() {
+        let (_dir, mut db) = baseline_store();
+        for minute in 0..=120 {
+            let mut r = Reading::new("mouse", "Mouse", "test", minute * 60);
+            r.level = Some(if minute < 120 { 90 } else { 60 });
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        let rows = db.query_with_baseline("mouse", 0, 24 * 3600, 20).unwrap();
+        assert!(rows.len() <= 20);
+        assert!(
+            rows.iter()
+                .any(|r| r.timestamp == 119 * 60 && r.level == Some(90))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.timestamp == 120 * 60 && r.level == Some(60))
+        );
+    }
+    #[test]
+    fn dense_calendar_keeps_the_sleep_marker_and_first_waking_reading() {
+        let (_dir, mut db) = baseline_store();
+        for minute in 0..1500 {
+            if (302..780).contains(&minute) {
+                continue;
+            }
+            let mut r = Reading::new("mouse", "Mouse", "test", minute * 60);
+            r.level = Some(if minute < 780 { 75 } else { 72 });
+            if minute == 301 {
+                r.connection = hb_core::Connection::Sleeping;
+            }
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        let rows = db.query_with_baseline("mouse", 0, 1500 * 60, 80).unwrap();
+        assert!(rows.len() <= 80);
+        for minute in [300, 301, 780] {
+            assert!(rows.iter().any(|r| r.timestamp == minute * 60));
+        }
+        assert!(
+            db.usage_index.borrow().is_none(),
+            "Calendar does not build the active-use index"
+        );
+    }
+
+    #[test]
+    fn calendar_keeps_two_sleep_wake_pairs_in_the_same_chart_bucket() {
+        let (_dir, mut db) = baseline_store();
+        for minute in 0..1800 {
+            let mut r = Reading::new("mouse", "Mouse", "test", minute * 60);
+            r.level = Some(if minute < 305 {
+                90
+            } else if minute < 365 {
+                80
+            } else {
+                70
+            });
+            if (301..305).contains(&minute) || (361..365).contains(&minute) {
+                r.connection = hb_core::Connection::Sleeping;
+            }
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        let rows = db.query_with_baseline("mouse", 0, 30 * 86400, 800).unwrap();
+        assert!(rows.len() <= 800);
+        for (minute, awake, level) in [
+            (301, false, 90),
+            (305, true, 80),
+            (361, false, 80),
+            (365, true, 70),
+        ] {
+            assert!(rows.iter().any(|r| r.timestamp == minute * 60
+                && r.online() == awake
+                && r.level == Some(level)));
+        }
+        assert!(
+            rows.windows(2)
+                .all(|pair| pair[0].timestamp < pair[1].timestamp)
+        );
+    }
+
+    #[test]
     fn downsampling_a_shared_slot_keeps_the_replacement_batterys_measurements() {
         let (_dir, mut db) = baseline_store();
         let mut r = Reading::new("slot", "Mouse", "test", 0);
@@ -2495,6 +2665,99 @@ mod tests {
 mod usage_index_tests {
     use super::*;
     #[test]
+    fn reused_slot_starts_both_charts_again_before_sampling_even_in_the_same_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Store::open(&dir.path().join("history.db")).unwrap();
+        let mut r = Reading::new("slot", "Mouse", "test", 0);
+        r.serial = Some("unit-a".into());
+        r.charging = Some(false);
+        r.level = Some(60);
+        for minute in 0..100 {
+            r.timestamp = minute * 60;
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        assert_eq!(
+            db.query_usage("slot", r.timestamp, 3600, 5).unwrap().until,
+            99 * 60
+        );
+        r.serial = Some("unit-b".into());
+        r.level = Some(40);
+        db.record(&r).unwrap();
+        r.serial = Some("unit-a".into());
+        r.level = None;
+        db.record(&r).unwrap();
+        db.flush().unwrap();
+        assert!(
+            db.query_with_baseline("slot", r.timestamp + 1, r.timestamp + 2, 5)
+                .unwrap()
+                .is_empty()
+        );
+        for minute in 100..200 {
+            r.timestamp = minute * 60;
+            r.level = Some(60);
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        for width in [2, 5, 80] {
+            let active = db.query_usage("slot", r.timestamp, 86400, width).unwrap();
+            assert_eq!(active.until, 99 * 60);
+            assert_eq!(active.samples[0].reading.timestamp, 100 * 60);
+            let calendar = db
+                .query_with_baseline("slot", 0, r.timestamp, width)
+                .unwrap();
+            assert_eq!((calendar[0].timestamp, calendar[0].level), (99 * 60, None));
+        }
+        assert_eq!(db.query("slot", 0, r.timestamp, 4096).unwrap().len(), 202);
+    }
+
+    #[test]
+    fn zero_usage_and_same_second_appends_reuse_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Store::open(&dir.path().join("history.db")).unwrap();
+        let mut r = Reading::new("headset", "Headset", "bluetooth", 0);
+        for minute in 0..1500 {
+            r.timestamp = minute * 60;
+            r.level = Some((minute % 101) as u8);
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        db.query_usage("headset", r.timestamp, 86400, 800).unwrap();
+        for (width, expected) in [(2, 2), (3, 2), (800, 3)] {
+            db.usage_rows.set(0);
+            let series = db
+                .query_usage("headset", r.timestamp, 86400, width)
+                .unwrap();
+            assert_eq!(series.until, 0);
+            assert_eq!(series.samples.len(), expected);
+            assert_eq!(db.usage_rows.get(), 0);
+        }
+        r.level = Some(99);
+        db.record(&r).unwrap();
+        db.flush().unwrap();
+        db.usage_rows.set(0);
+        let series = db.query_usage("headset", r.timestamp, 86400, 7).unwrap();
+        assert_eq!(series.samples.last().unwrap().reading.level, Some(99));
+        assert!(db.usage_rows.get() <= 2);
+        // A flat, connected headset can accumulate an entire retention window
+        // without declaring a charging state. Aging out a sample stays cheap.
+        r.key = "flat".into();
+        r.level = Some(80);
+        for minute in 0..1500 {
+            r.timestamp = minute * 60;
+            db.record(&r).unwrap();
+        }
+        db.flush().unwrap();
+        let cutoff = 30 * 86400;
+        db.query_usage("flat", cutoff, 86400, 800).unwrap();
+        db.usage_rows.set(0);
+        let rolled = db.query_usage("flat", cutoff + 60, 86400, 800).unwrap();
+        assert_eq!(rolled.samples.first().unwrap().reading.timestamp, 60);
+        assert_eq!(rolled.samples.last().unwrap().reading.timestamp, 1499 * 60);
+        assert!(db.usage_rows.get() <= 2);
+    }
+
+    #[test]
     fn append_and_rolling_retention_match_a_cold_query_with_bounded_replay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.db");
@@ -2689,10 +2952,63 @@ mod usage_index_tests {
 mod persistence_boundaries {
     use super::*;
     #[test]
+    fn restarted_estimates_require_the_same_unit_and_migrate_proven_legacy_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Store::open(&dir.path().join("history.db")).unwrap();
+        let now = hb_core::Clock::unix(&hb_core::SystemClock::default());
+        let mut r = Reading::new("slot", "Mouse", "test", now - 3600);
+        r.serial = Some("unit-a".into());
+        r.charging = Some(false);
+        let mut estimator = Estimator::default();
+        for minute in 0..=60 {
+            r.timestamp = now - 3600 + minute * 60;
+            r.level = Some(100 - (minute / 5) as u8);
+            db.record(&r).unwrap();
+            estimator.record(&r, (minute * 60) as f64);
+        }
+        db.flush().unwrap();
+        let mut checkpoint = serde_json::to_value(&estimator).unwrap();
+        for legacy in [false, true] {
+            if legacy {
+                checkpoint["devices"]["slot"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("identity");
+            }
+            db.db
+                .execute(
+                    "INSERT OR REPLACE INTO state VALUES('estimator',?1)",
+                    [checkpoint.to_string()],
+                )
+                .unwrap();
+            let mut same = db.try_load_estimator().unwrap();
+            same.record(&r, 1.);
+            assert!(same.seconds_left("slot", r.level).is_some());
+            let mut other = db.try_load_estimator().unwrap();
+            let mut replaced = r.clone();
+            replaced.serial = Some("unit-b".into());
+            other.record(&replaced, 1.);
+            assert!(other.seconds_left("slot", r.level).is_none());
+        }
+        r.serial = Some("unit-b".into());
+        db.record(&r).unwrap();
+        db.flush().unwrap();
+        let mut ambiguous = db.try_load_estimator().unwrap();
+        ambiguous.record(&r, 1.);
+        assert!(ambiguous.seconds_left("slot", r.level).is_none());
+    }
+
+    #[test]
     fn invalid_checkpoint_is_preserved_for_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Store::open(&dir.path().join("history.db")).unwrap();
-        for broken in [r#"{"devices":{"unit":"#, "[]", "{}"] {
+        for broken in [
+            r#"{"devices":{"unit":"#,
+            "[]",
+            "{}",
+            r#"{"devices":{"unit":{"usage":-1,"samples":[],"seen":0}}}"#,
+            r#"{"devices":{"unit":{"usage":100,"samples":[[0,60],[100,70]],"seen":0}}}"#,
+        ] {
             db.db
                 .execute(
                     "INSERT OR REPLACE INTO state VALUES('estimator',?1)",

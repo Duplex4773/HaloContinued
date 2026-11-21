@@ -129,6 +129,44 @@ fn enabled_sounds_add_no_allocations_for_healthy_battery_polls() {
 }
 
 #[test]
+fn one_low_battery_does_not_allocate_sound_aliases_on_ordinary_polls() {
+    let run = |low_sound| {
+        let mut engine = Engine::new(
+            Settings {
+                low_sound,
+                ..Default::default()
+            },
+            Estimator::default(),
+        );
+        let samples = |t| {
+            (0..8)
+                .map(|i| {
+                    let mut r = reading(&format!("device-{i}"), t, if i == 0 { 5 } else { 80 });
+                    r.container = Some(format!("receiver-{i}"));
+                    r.serial = Some(format!("valid-unit-{i}"));
+                    r
+                })
+                .collect::<Vec<_>>()
+        };
+        engine.apply("test", Ok(samples(0)), 0., false);
+        assert_eq!(engine.take_low_battery_sound().is_some(), low_sound);
+        let updates: Vec<_> = (1..=100).map(samples).collect();
+        measure(|| {
+            for (i, rows) in updates.into_iter().enumerate() {
+                engine.apply("test", Ok(rows), (i + 1) as f64, false);
+                assert!(engine.take_low_battery_sound().is_none());
+            }
+        })
+        .1
+    };
+    let disabled = run(false);
+    let enabled = run(true);
+    println!("100 refreshes, eight devices, one low: disabled={disabled:?}, enabled={enabled:?}");
+    assert_eq!(enabled.calls, disabled.calls);
+    assert_eq!(enabled.bytes, disabled.bytes);
+}
+
+#[test]
 fn established_wired_wireless_preference_links_allocate_nothing() {
     let mut wireless = reading("razer:00bf:UNIT1234", 0, 80);
     wireless.kind = "mouse".into();

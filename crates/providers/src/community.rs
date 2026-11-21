@@ -271,6 +271,7 @@ impl Community {
         infos: &[&HidInfo],
         hid: &dyn HidTransport,
         c: &PollContext<'_>,
+        unreadable: &mut Vec<hb_core::UnreadableCollection>,
     ) -> PollResult {
         self.diagnostics.clear();
         if !c.active() {
@@ -428,6 +429,8 @@ impl Community {
             } else {
                 4
             };
+            let failed_before = unreadable.len();
+            let mut answered = false;
             let mut found = None;
             for (index, i) in mine.iter().take(attempts).enumerate() {
                 if !c.active() {
@@ -449,6 +452,7 @@ impl Community {
                     }
                     Ok(None) => {
                         successful = true;
+                        answered = true;
                         if known && protocol(&d) == "ajazz-ak820" && mine.len() > 1 && c.active() {
                             // Try the other eligible collection at the next scheduled poll.
                             self.hints.get_mut(&endpoint).unwrap().path = None;
@@ -456,6 +460,7 @@ impl Community {
                     }
                     Err(e) => {
                         self.log(format!("{}: {}", d.name, e));
+                        hb_core::UnreadableCollection::record(unreadable, &k, i);
                         failures.push(e);
                         // The next poll can try the other eligible collections.
                         // Keep the passive and BlackShark probing limits intact.
@@ -464,6 +469,9 @@ impl Community {
                         }
                     }
                 }
+            }
+            if answered || found.is_some() {
+                unreadable.truncate(failed_before);
             }
             if !c.active() {
                 break;

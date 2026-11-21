@@ -43,6 +43,30 @@ pub struct ConfigurationDevice {
     pub capability: PollingCapability,
 }
 impl ConfigurationDevice {
+    pub fn polling_owner(&self) -> Option<&str> {
+        let container = self.container.as_deref()?.trim();
+        (self.requires_polling_owner()
+            && container.len() <= 256
+            && container
+                .bytes()
+                .any(|b| b.is_ascii_alphanumeric() && b != b'0')
+            && !["unknown", "none", "null", "n/a"]
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(container)))
+        .then_some(container)
+    }
+    pub fn requires_polling_owner(&self) -> bool {
+        self.kind == "keyboard" || self.kind == "mouse" && self.source != "simulation"
+    }
+    pub fn owns_polling_choice(&self, saved_container: Option<&str>) -> bool {
+        if self.requires_polling_owner() {
+            self.polling_owner()
+                .zip(saved_container)
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        } else {
+            saved_container.is_none()
+        }
+    }
     /// A receiver also uses USB; only exact wired model IDs establish external power.
     pub fn wired_mouse(&self) -> bool {
         wired_mouse(&self.key, &self.kind, &self.source, &self.via)

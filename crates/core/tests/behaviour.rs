@@ -77,6 +77,42 @@ fn delayed_retry_cannot_replace_a_new_low_battery_episode() {
 }
 
 #[test]
+fn cached_bluetooth_link_checks_preserve_quiet_delivery_and_sound_cooldowns() {
+    let mut e = engine();
+    e.settings.bluetooth = true;
+    e.settings.quiet_fullscreen = true;
+    e.settings.low_sound = true;
+    e.settings.notify = true;
+    let mut r = reading(7, false, 100);
+    r.source = "bluetooth".into();
+    r.key = "bluetooth:headset".into();
+    assert!(
+        e.apply("bluetooth", Ok(vec![r.clone()]), 0., true)
+            .is_empty()
+    );
+    assert_eq!(e.take_low_battery_sound(), Some(7));
+    assert_eq!(
+        e.apply("bluetooth", Ok(vec![r.clone()]), 2., false).len(),
+        1
+    );
+    assert_eq!(e.take_low_battery_sound(), None);
+    assert!(e.apply("bluetooth", Ok(vec![r]), 300., false).is_empty());
+    assert_eq!(e.take_low_battery_sound(), Some(7));
+}
+#[test]
+fn unavailable_tooltips_keep_the_level_without_claiming_current_charging() {
+    let mut engine = engine();
+    engine.apply("razer", Ok(vec![reading(72, true, 100)]), 0., false);
+    assert!(engine.snapshot(100).devices[0].text.contains(" · charging"));
+    engine.apply("razer", Err(ProviderError::new("unavailable")), 60., false);
+    let view = &engine.snapshot(160).devices[0];
+    assert!(view.text.contains("72% (last known)"));
+    assert!(!view.text.contains(" · charging"));
+    assert_eq!(view.reading.current_charging(), None);
+    assert_eq!(view.reading.charging, Some(true));
+}
+
+#[test]
 fn reused_keys_do_not_inherit_another_units_alerts_or_sound_cooldown() {
     let mut e = engine();
     e.settings.low_sound = true;

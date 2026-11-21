@@ -25,7 +25,7 @@ fn polling_is_opt_in_and_saved_intent_is_validated_independently() {
     assert!(!Settings::default().polling_controls);
     let settings = Settings::from_value(serde_json::json!({
         "polling_controls": true, "devices": {
-            "a": {"requested_polling_rate": 8000},
+            "a": {"requested_polling_rate": 8000, "polling_keyboard_container": "physical-keyboard"},
             "b": {"requested_polling_rate": 7999, "low": 15}
         }
     }))
@@ -34,6 +34,11 @@ fn polling_is_opt_in_and_saved_intent_is_validated_independently() {
     assert_eq!(
         settings.devices["a"].requested_polling_rate.unwrap().hz(),
         8000
+    );
+    let roundtrip = Settings::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+    assert_eq!(
+        roundtrip.devices["a"].polling_owner_container.as_deref(),
+        Some("physical-keyboard")
     );
     assert!(settings.devices["b"].requested_polling_rate.is_none());
     assert_eq!(settings.devices["b"].low, Some(15));

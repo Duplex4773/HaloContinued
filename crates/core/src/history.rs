@@ -3,9 +3,28 @@ use crate::{PollingRate, Precision, Reading, usage_gap_seconds};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+// A receiver slot can be reused. Keep the physical owner with its learned fit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BatteryIdentity {
+    source: String,
+    kind: String,
+    serial: Option<String>,
+    container: Option<String>,
+}
+impl BatteryIdentity {
+    fn matches(&self, r: &Reading) -> bool {
+        self.source == r.source
+            && self.kind == r.kind
+            && self.serial == r.serial
+            && self.container == r.container
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Discharge {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<BatteryIdentity>,
     pub usage: f64,
     /// Relative discharge coordinates. After an unobserved boundary the levels
     /// are rebased, preserving measured drops without counting boundary loss.
@@ -19,6 +38,23 @@ pub struct Discharge {
     #[serde(skip)]
     observed_level: Option<u8>,
 }
+impl Discharge {
+    fn expired(&self, now: i64) -> bool {
+        self.seen > 0 && now.saturating_sub(self.seen) >= 60 * 86400
+    }
+    pub fn needs_identity(&self) -> bool {
+        self.identity.is_none()
+    }
+    pub fn bind_identity(&mut self, r: &Reading) {
+        self.identity = Some(BatteryIdentity {
+            source: r.source.clone(),
+            kind: r.kind.clone(),
+            serial: r.serial.clone(),
+            container: r.container.clone(),
+        });
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Estimator {
     pub devices: BTreeMap<String, Discharge>,
@@ -59,7 +95,9 @@ impl Estimator {
         estimator.validate(now);
         estimator
     }
-    pub fn validate(&mut self, now: i64) {
+    /// Return false if corruption leaves no usable fit. Expiration alone is normal.
+    pub fn validate(&mut self, now: i64) -> bool {
+        let mut damaged = false;
         self.devices.retain(|_, d| {
             d.last = None;
             d.observed_level = None;
@@ -67,8 +105,8 @@ impl Estimator {
                 || d.usage < 0.0
                 || d.seen < 0
                 || d.seen > now.saturating_add(300)
-                || (d.seen > 0 && now.saturating_sub(d.seen) >= 60 * 86400)
             {
+                damaged = true;
                 return false;
             }
             if d.samples.iter().any(|(time, level)| {
@@ -78,6 +116,10 @@ impl Estimator {
                 .windows(2)
                 .any(|pair| pair[0].0 >= pair[1].0 || pair[0].1 <= pair[1].1)
             {
+                damaged = true;
+                return false;
+            }
+            if d.expired(now) {
                 return false;
             }
             if d.samples.len() > 400 {
@@ -85,8 +127,20 @@ impl Estimator {
             }
             true
         });
+        !damaged || !self.devices.is_empty()
+    }
+    /// Expire absent devices during normal maintenance without pausing live fits.
+    pub fn prune_expired(&mut self, now: i64) -> bool {
+        let previous = self.devices.len();
+        self.devices.retain(|_, d| !d.expired(now));
+        self.devices.len() != previous
     }
     pub fn record(&mut self, r: &Reading, monotonic: f64) {
+        if self.devices.get(&r.key).is_some_and(|d| {
+            d.expired(r.timestamp) || !d.identity.as_ref().is_some_and(|id| id.matches(r))
+        }) {
+            self.devices.remove(&r.key);
+        }
         let Some(level) = r.level.filter(|l| *l <= 100) else {
             self.pause(&r.key);
             return;
@@ -108,12 +162,9 @@ impl Estimator {
         } else if r.charging == Some(false) {
             // A new entry exists only to learn discharge. Sleeping, charging
             // and unknown-power devices have no fit or baseline to retain.
-            Self::record_sample(
-                self.devices.entry(r.key.clone()).or_default(),
-                r,
-                monotonic,
-                level,
-            );
+            let d = self.devices.entry(r.key.clone()).or_default();
+            d.bind_identity(r);
+            Self::record_sample(d, r, monotonic, level);
         }
     }
     fn record_sample(d: &mut Discharge, r: &Reading, monotonic: f64, level: u8) {
@@ -134,6 +185,7 @@ impl Estimator {
         d.observed_level = (r.charging == Some(false)).then_some(level);
         if r.charging == Some(true) {
             *d = Discharge {
+                identity: d.identity.take(),
                 seen: r.timestamp,
                 ..Default::default()
             };

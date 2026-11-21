@@ -410,7 +410,17 @@ impl BatterySaver {
             }
         }
     }
+    #[cfg(test)]
     pub fn observe_provider(&mut self, provider: &str, readings: &[Reading], now: i64) {
+        self.observe_inventory(provider, readings, now, &[]);
+    }
+    pub fn observe_inventory(
+        &mut self,
+        provider: &str,
+        readings: &[Reading],
+        now: i64,
+        unreadable: &[UnreadableCollection],
+    ) {
         for entry in self.entries.values_mut() {
             if entry.target.device.source != provider {
                 continue;
@@ -420,7 +430,8 @@ impl BatterySaver {
             for r in readings {
                 if r.key == entry.target.device.key {
                     if entry.target.device.matches_reading(r) {
-                        present |= r.connection != Connection::Stale;
+                        present |= r.connection != Connection::Stale
+                            || UnreadableCollection::matches(unreadable, r);
                         online |= r.online()
                             && r.timestamp <= now
                             && now.saturating_sub(r.timestamp) <= 120;
@@ -2387,6 +2398,26 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn unreadable_collection_pauses_saver_until_matching_mouse_recovers() {
+        let (mut saver, settings, mut readings, boost) = fixture();
+        activate(&mut saver, &settings, &readings, &boost);
+        let mut failed = Vec::new();
+        UnreadableCollection::record(&mut failed, &readings[0].key, &HidInfo::default());
+        readings[0].connection = Connection::Stale;
+        saver.observe_inventory("razer", &readings, 100, &failed);
+        assert!(saver.next(&settings, 1, &readings, 100, &boost).is_none());
+        readings[0].connection = Connection::Online;
+        readings[0].level = Some(26);
+        saver.observe_inventory("razer", &readings, 100, &[]);
+        let restore = saver.next(&settings, 1, &readings, 100, &boost).unwrap();
+        assert!(matches!(&restore, Action::Polling(r) if r.action.rate() == Some(rate(1000))));
+        complete(&mut saver, &restore, 1000);
+        assert!(
+            matches!(saver.next(&settings, 1, &readings, 100, &boost), Some(Action::Sleep(r)) if r.seconds.is_some())
+        );
+    }
+
     #[test]
     fn missing_connection_evidence_and_observed_disconnect_discard_originals() {
         for disconnected in [false, true] {

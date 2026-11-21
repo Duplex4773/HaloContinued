@@ -29,8 +29,8 @@ fn empty_history_message(series: &HistorySeries) -> &'static str {
 }
 
 /// Trend anchors, with explicit holds across unavailable readings and charge
-/// jumps. Repeated percentages need no extra vertices. Remember their timestamps
-/// nevertheless, so a later sleeping interval starts at the last observation.
+/// jumps. Emit only the ends of a flat run so smoothing cannot move a later
+/// drop ahead of a confirmed battery reading.
 /// No history or estimator data is modified by this display-only iterator.
 fn history_trace(
     points: &[HistorySample],
@@ -40,6 +40,7 @@ fn history_trace(
     let mut samples = points.iter();
     let mut previous: Option<HistoryVertex> = None;
     let mut pending = None;
+    let mut plateau_end = None;
     let mut held = false;
     let mut finished = until < since;
     std::iter::from_fn(move || {
@@ -75,6 +76,7 @@ fn history_trace(
             if let Some(p) = previous {
                 if held || !p.measured || !point.measured || level > p.level {
                     held = false;
+                    plateau_end = None;
                     pending = Some(point);
                     return Some(HistoryVertex {
                         timestamp,
@@ -84,7 +86,12 @@ fn history_trace(
                 }
                 previous = Some(point);
                 if level == p.level {
+                    plateau_end = Some(point);
                     continue;
+                }
+                if let Some(end) = plateau_end.take() {
+                    pending = Some(point);
+                    return Some(end);
                 }
                 return Some(point);
             }
@@ -562,23 +569,23 @@ mod tests {
     }
 
     #[test]
-    fn repeated_percentages_do_not_make_stairs_or_change_input_readings() {
+    fn long_plateaus_keep_their_last_observation_before_a_smoothed_drop() {
         let rows: Vec<_> = (0..=100)
             .map(|i| sample(i * 60, Some(90 - (i / 10) as u8), Connection::Online))
             .collect();
         let saved = rows.clone();
         let trace = calendar_trace(&rows, 0, 6060);
         assert_eq!(rows, saved);
-        assert_eq!(trace.len(), 12); // Eleven distinct levels and the held tail.
-        for (i, point) in trace[..11].iter().enumerate() {
-            assert_eq!(point.timestamp, i as i64 * 600);
-            assert_eq!(point.level, 90 - i as u8);
-            assert!(point.measured);
+        assert_eq!(trace.len(), 22); // Two endpoints for each completed flat run.
+        for (i, pair) in trace[..20].as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(
+                (pair[0].timestamp, pair[1].timestamp),
+                (i as i64 * 600, i as i64 * 600 + 540)
+            );
+            assert_eq!((pair[0].level, pair[1].level), (90 - i as u8, 90 - i as u8));
         }
-        assert_eq!(
-            (trace[11].timestamp, trace[11].level, trace[11].measured),
-            (6060, 80, false)
-        );
+        assert_eq!((trace[20].timestamp, trace[20].level), (6000, 80));
+        assert_eq!((trace[21].timestamp, trace[21].measured), (6060, false));
     }
 
     #[test]

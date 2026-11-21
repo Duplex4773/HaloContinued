@@ -105,6 +105,10 @@ impl Reading {
     pub fn online(&self) -> bool {
         self.connection == Connection::Online
     }
+    /// Current power state is known only from an available observation.
+    pub fn current_charging(&self) -> Option<bool> {
+        self.charging.filter(|_| self.online())
+    }
     /// Name changes preserve evidence. Transport changes are separate interval
     /// boundaries; a changed unit/container must never inherit a battery fit.
     pub fn same_battery_identity(&self, other: &Self) -> bool {
@@ -252,10 +256,84 @@ impl PollContext<'_> {
         }
     }
 }
+/// Identity of an enumerated control collection that could not be read this poll.
+#[derive(PartialEq, Eq)]
+pub struct UnreadableCollection {
+    pub key: String,
+    serial: Option<String>,
+    container: Option<String>,
+}
+impl UnreadableCollection {
+    pub fn record(failures: &mut Vec<Self>, key: &str, info: &HidInfo) {
+        Self::record_identity(
+            failures,
+            key,
+            (!info.serial.is_empty()).then_some(info.serial.as_str()),
+            info.container.as_deref(),
+        );
+    }
+    pub fn record_reading(failures: &mut Vec<Self>, reading: &Reading) {
+        Self::record_identity(
+            failures,
+            &reading.key,
+            reading.serial.as_deref(),
+            reading.container.as_deref(),
+        );
+    }
+    fn record_identity(
+        failures: &mut Vec<Self>,
+        key: &str,
+        serial: Option<&str>,
+        container: Option<&str>,
+    ) {
+        if !failures.iter().any(|f| {
+            f.key == key && f.serial.as_deref() == serial && f.container.as_deref() == container
+        }) {
+            failures.push(Self {
+                key: key.to_owned(),
+                serial: serial.map(str::to_owned),
+                container: container.map(str::to_owned),
+            });
+        }
+    }
+    pub fn matches(failures: &[Self], reading: &Reading) -> bool {
+        let mut present = false;
+        for f in failures.iter().filter(|f| f.key == reading.key) {
+            if f.serial != reading.serial || f.container != reading.container {
+                return false;
+            }
+            present = true;
+        }
+        present
+    }
+    /// Preserve only formerly observed rows. Read failures never discover a
+    /// device, override a real response, or manufacture fresh battery evidence.
+    pub fn preserve(failures: &[Self], previous: &[Reading], result: &mut PollResult) {
+        if failures.is_empty() {
+            return;
+        }
+        if let Ok(reported) = result {
+            for old in previous {
+                if Self::matches(failures, old) && !reported.iter().any(|r| r.key == old.key) {
+                    let mut stale = old.clone();
+                    stale.connection = Connection::Stale;
+                    stale.charging = None;
+                    stale.charging_inferred = false;
+                    reported.push(stale);
+                }
+            }
+        }
+    }
+}
 pub trait BatteryProvider: Send {
     fn id(&self) -> &'static str;
     fn poll(&mut self, hid: &dyn HidTransport, context: &PollContext<'_>) -> PollResult;
-    fn diagnostics(&self) -> Vec<String>;
+    fn diagnostics(&self) -> &[String] {
+        &[]
+    }
+    fn unreadable_collections(&self) -> &[UnreadableCollection] {
+        &[]
+    }
     /// Ordered, unique vendor IDs whose HID collections this provider accesses.
     fn hid_vendors(&self) -> &[u16] {
         &[]
@@ -264,6 +342,11 @@ pub trait BatteryProvider: Send {
     fn refresh_properties(&mut self) {}
     /// Real connection events invalidate provider-specific connection caches.
     fn invalidate(&mut self) {}
+    /// Release resources when monitoring stops. Ordinary topology notifications
+    /// may retain verified observations for the next discovery.
+    fn deactivate(&mut self) {
+        self.invalidate();
+    }
     /// Additional scheduled retries (for delayed Windows battery properties).
     fn next_poll_delay(&self) -> Option<Duration> {
         None

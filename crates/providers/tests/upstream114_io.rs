@@ -483,3 +483,115 @@ fn centurion_ack_without_headset_answer_is_offline_and_keeps_discovery_cache() {
     );
     h.done();
 }
+
+#[test]
+fn split_headsets_keep_independent_keys_and_scoped_failures_across_reconnect() {
+    let a = device(0x1038, 0x2244, 0xffc0, "a");
+    let a = HidInfo {
+        serial: "SHARED".into(),
+        container: Some("receiver-a".into()),
+        ..a
+    };
+    let b = HidInfo {
+        path: "b".into(),
+        container: Some("receiver-b".into()),
+        ..a.clone()
+    };
+    let exchange = |level, power| {
+        [
+            Step::Write(p::padded(&[1, 0xb0], 64)),
+            Step::Read(Ok(direct_elite(level, power, 8))),
+        ]
+    };
+    let clock = FakeClock::default();
+    let mut provider = HidProvider::new("steelseries_elite");
+    let hid = FakeHid::new(
+        vec![b.clone(), a.clone()],
+        exchange(55, 0).into_iter().chain(exchange(71, 0)).collect(),
+    );
+    let previous = poll(&mut provider, &hid, &clock);
+    assert_eq!(previous.len(), 2);
+    assert_eq!(
+        (previous[0].level, previous[0].container.as_deref()),
+        (Some(55), Some("receiver-a"))
+    );
+    assert_eq!(
+        (previous[1].level, previous[1].container.as_deref()),
+        (Some(71), Some("receiver-b"))
+    );
+    assert_ne!(previous[0].key, previous[1].key);
+    hid.done();
+    for power in [0, 1] {
+        let hid = FakeHid::new(vec![a.clone(), b.clone()], exchange(53, power).to_vec())
+            .fail_open("b", "busy");
+        let mut result = Ok(poll(&mut provider, &hid, &clock));
+        UnreadableCollection::preserve(provider.unreadable_collections(), &previous, &mut result);
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), if power == 0 { 2 } else { 1 });
+        let retained = rows.iter().find(|r| r.key == previous[1].key).unwrap();
+        assert_eq!(retained.connection, Connection::Stale);
+        assert_eq!(retained.level, Some(71));
+        assert_eq!(retained.charging, None);
+        hid.done();
+    }
+    provider.invalidate();
+    let hid = FakeHid::new(vec![b], exchange(68, 0).to_vec());
+    let rows = poll(&mut provider, &hid, &clock);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, previous[1].key);
+    assert!(provider.unreadable_collections().is_empty());
+    hid.done();
+}
+
+#[test]
+fn split_headset_input_access_failure_preserves_last_reading() {
+    for read_failure in [false, true] {
+        let a = device(0x03f0, 0x02cc, 0xff00, "output");
+        let b = device(0x03f0, 0x02cc, 0xff01, "input");
+        let mut pvd = HidProvider::new("hyperx_cloud3s");
+        let c = FakeClock::default();
+        let mut e = Engine::new(Settings::default(), Estimator::default());
+        for t in 0..3 {
+            let req = Step::Write(p::padded(&[0xc, 2, 3, 1, 0, 6], 64));
+            let mut steps = vec![req];
+            if t == 0 {
+                steps.extend([
+                    read(&[]),
+                    read(&[0xc, 0, 0, 0, 0, 6, 62]),
+                    Step::Write(p::padded(&[0xc, 2, 3, 1, 0, 0x48], 64)),
+                    read(&[]),
+                    read(&[0xd, 0, 0, 0, 10, 2, 0]),
+                ]);
+            } else {
+                for _ in 0..100 {
+                    steps.push(read(&[]));
+                    if read_failure {
+                        steps.push(Step::Read(Err("input unavailable")));
+                    }
+                }
+            }
+            let mut h = FakeHid::new(vec![a.clone(), b.clone()], steps);
+            if t > 0 && !read_failure {
+                h = h.fail_open("input", "exclusive");
+            }
+            let mut result = pvd.poll(&h, &context(&c, &AtomicBool::new(false)));
+            UnreadableCollection::preserve(
+                pvd.unreadable_collections(),
+                e.provider_readings(pvd.id()),
+                &mut result,
+            );
+            e.apply(pvd.id(), result, t as f64 * 60., false);
+            assert_eq!(pvd.unreadable_collections().len(), usize::from(t > 0));
+            assert_eq!(e.readings().len(), 1);
+            assert_eq!(
+                e.readings()[0].connection,
+                if t == 0 {
+                    Connection::Online
+                } else {
+                    Connection::Stale
+                }
+            );
+            h.done();
+        }
+    }
+}

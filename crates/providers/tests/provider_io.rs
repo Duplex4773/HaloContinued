@@ -382,12 +382,12 @@ fn hidpp_pair(feature: u8, token: u8, params: &[u8], reply: &[u8]) -> Vec<Step> 
 #[test]
 fn logitech_matches_tokens_reads_identity_and_reuses_complete_identity() {
     let mut steps = hidpp_pair(0, 0x1b, &[], &[2]);
-    steps.extend(hidpp_pair(0, 0x0c, &[0, 5], &[2]));
-    steps.extend(hidpp_pair(2, 0x0d, &[], &[5]));
-    steps.extend(hidpp_pair(2, 0x1e, &[0], b"Mouse"));
-    steps.extend(hidpp_pair(2, 0x2f, &[], &[3]));
-    steps.extend(hidpp_pair(0, 0x0a, &[0, 3], &[3]));
-    steps.extend(hidpp_pair(3, 0x0b, &[], &[0, 0xde, 0xad, 0xbe, 0xef]));
+    steps.extend(hidpp_pair(0, 0x0c, &[0, 3], &[3]));
+    steps.extend(hidpp_pair(3, 0x0d, &[], &[0, 0xde, 0xad, 0xbe, 0xef]));
+    steps.extend(hidpp_pair(0, 0x0e, &[0, 5], &[2]));
+    steps.extend(hidpp_pair(2, 0x0f, &[], &[5]));
+    steps.extend(hidpp_pair(2, 0x1a, &[0], b"Mouse"));
+    steps.extend(hidpp_pair(2, 0x2b, &[], &[3]));
     steps.extend(hidpp_pair(0, 0x0c, &[0x10, 4], &[4]));
     steps.push(Step::Write(hidpp_packet(4, 0x1d, &[])));
     steps.push(Step::Read(Ok(hidpp_packet(4, 0x1c, &[99, 0, 0]))));

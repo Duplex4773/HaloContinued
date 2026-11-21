@@ -80,9 +80,11 @@ pub(super) struct TimingIdentity {
 }
 impl TimingIdentity {
     pub fn matches(&self, reading: &TimingReading<'_>) -> bool {
+        self.via == reading.via && self.same_battery(reading)
+    }
+    pub fn same_battery(&self, reading: &TimingReading<'_>) -> bool {
         self.kind == reading.kind
             && self.source == reading.source
-            && self.via == reading.via
             && self.serial.as_deref() == reading.serial.as_deref()
             && self.container.as_deref() == reading.container.as_deref()
     }

@@ -183,7 +183,17 @@ impl Boost {
             pending.guard.cancel.store(true, Ordering::Release);
         }
     }
+    #[cfg(test)]
     pub fn observe_provider(&mut self, provider: &str, readings: &[Reading], now: i64) {
+        self.observe_inventory(provider, readings, now, &[]);
+    }
+    pub fn observe_inventory(
+        &mut self,
+        provider: &str,
+        readings: &[Reading],
+        now: i64,
+        unreadable: &[UnreadableCollection],
+    ) {
         let pending_key = self
             .pending
             .as_ref()
@@ -198,7 +208,8 @@ impl Boost {
             for reading in readings {
                 if reading.key == e.target.device.key {
                     if e.target.device.matches_reading(reading) {
-                        present |= reading.connection != Connection::Stale;
+                        present |= reading.connection != Connection::Stale
+                            || UnreadableCollection::matches(unreadable, reading);
                         online |= reading.online()
                             && reading.timestamp <= now
                             && now.saturating_sub(reading.timestamp) <= 120;
@@ -1374,6 +1385,9 @@ mod tests {
         complete(&mut b, &apply, 2000);
         // Runtime does not report a failed provider poll as confirmed discovery.
         readings[0].connection = Connection::Stale;
+        let mut failed = Vec::new();
+        UnreadableCollection::record(&mut failed, &readings[0].key, &HidInfo::default());
+        b.observe_inventory("simulation", &readings, 0, &failed);
         settle(&mut b, now + Duration::from_secs(30), false);
         assert!(b.next(&settings, 2, &readings).is_none());
         assert!(b.owns(&readings[0].key));

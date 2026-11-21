@@ -32,6 +32,10 @@ try {
   # Ship the same consumer README as the repository, retaining the upstream license name.
   $guide = Get-Content -LiteralPath (Join-Path $repo 'README.md') -Raw
   $guide = $guide.Replace('](LICENSE)', '](LICENSE-HaloBattery.txt)')
+  $source = "https://github.com/Duplex4773/HaloContinued/blob/v$numericVersion/"
+  foreach ($file in @('CHANGELOG.md', 'crates/providers/reviewed-devices.json')) {
+    $guide = $guide.Replace("]($file", "]($source$file")
+  }
   $guide | Set-Content -LiteralPath (Join-Path $output 'README.md') -Encoding utf8
   # The consumer README includes protocol credits; packaging needs no docs tree.
   $notices = Join-Path $output 'licenses'

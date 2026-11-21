@@ -53,6 +53,22 @@ fn application_data_directory(args: &[String]) -> hb_storage::DataDirectory {
     let executable = std::env::current_exe().ok();
     hb_storage::resolve_data_directory(executable.as_deref(), explicit)
 }
+fn hid_providers(dir: &std::path::Path) -> Vec<Box<dyn BatteryProvider>> {
+    hb_providers::provider::FAMILIES
+        .iter()
+        .map(|&(id, _)| {
+            let mut provider = hb_providers::HidProvider::new(id);
+            if id == "razer" {
+                let folder = dir.to_owned();
+                provider = provider.with_razer_collision_markers(move |key, shared| {
+                    hb_storage::razer_collision_marker(&folder, key, shared)
+                });
+            }
+            Box::new(provider) as Box<dyn BatteryProvider>
+        })
+        .collect()
+}
+
 fn main() {
     if let Err(e) = entry() {
         if std::env::args().any(|a| a == "--probe" || a == "--polling-probe") {
@@ -173,7 +189,7 @@ fn entry() -> Result<(), ProviderError> {
             .as_ref()
             .is_some_and(|key| devices.iter().any(|d| &d.key == key));
         if kind != "keyboard" && !selected_keyboard && selected_provider != "corsair" {
-            let mut provider = hb_providers::providers()
+            let mut provider = hid_providers(&dir)
                 .into_iter()
                 .find(|p| p.id() == selected_provider)
                 .ok_or_else(|| ProviderError::new("Provider unavailable"))?;
@@ -232,7 +248,7 @@ fn entry() -> Result<(), ProviderError> {
         let hid = hb_windows::WindowsHid::new()?;
         let clock = SystemClock::default();
         let cancel = AtomicBool::new(false);
-        let mut providers = hb_providers::providers();
+        let mut providers = hid_providers(&dir);
         if let Some(jbl) = providers.iter_mut().find(|provider| provider.id() == "jbl") {
             *jbl = Box::new(hb_providers::provider::HidProvider::new("jbl").with_probe_listen());
         }

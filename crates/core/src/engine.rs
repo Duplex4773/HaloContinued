@@ -47,7 +47,7 @@ pub struct Engine {
     alerts: BTreeMap<String, AlertState>,
     held: BTreeMap<(String, NotificationKind), Notification>,
     errors: BTreeMap<String, String>,
-    sound_at: BTreeMap<String, f64>,
+    sound_at: SoundCooldowns,
     pending_sound: Option<u8>,
     notification_sequence: u64,
     suspended: bool,
@@ -63,7 +63,7 @@ impl Engine {
             alerts: BTreeMap::new(),
             held: BTreeMap::new(),
             errors: BTreeMap::new(),
-            sound_at: BTreeMap::new(),
+            sound_at: SoundCooldowns::default(),
             pending_sound: None,
             notification_sequence: 0,
             suspended: false,
@@ -173,12 +173,12 @@ impl Engine {
         for r in self.by_provider.values().flatten() {
             if self.settings.low_for(&r.key) != settings.low_for(&r.key) {
                 for identity in related_sound_identities(r, &self.by_provider, &self.settings) {
-                    self.sound_at.remove(&identity);
+                    self.sound_at.remove(identity);
                 }
             }
         }
         if !settings.low_sound {
-            self.sound_at.clear();
+            self.sound_at.entries.clear();
             self.pending_sound = None;
         }
         self.settings = settings;
@@ -204,7 +204,7 @@ impl Engine {
             &mut self.alerts,
             &mut self.misses,
             &mut self.held,
-            &mut self.sound_at,
+            Some(&mut self.sound_at),
         );
     }
     /// One coalesced sound per completed poll, separate from toast quiet mode.
@@ -256,19 +256,30 @@ impl Engine {
             self.by_provider.remove(provider);
             return if quiet { Vec::new() } else { self.flush_held() };
         }
+        if provider == "bluetooth" && fresh == self.provider_readings(provider) {
+            if !self.misses.is_empty() {
+                for reading in &fresh {
+                    self.misses.remove(&reading.key);
+                }
+            }
+            return self.evaluate_alerts(provider, fresh.len(), monotonic, quiet, false, false);
+        }
+        let mut inventory_changed = false;
         for r in &mut fresh {
-            if self
+            let old = self
                 .by_provider
                 .get(provider)
-                .and_then(|previous| previous.iter().find(|old| old.key == r.key))
-                .is_some_and(|old| !old.same_battery_identity(r))
-            {
+                .and_then(|previous| previous.iter().find(|old| old.key == r.key));
+            let replaced = old.is_some_and(|old| !old.same_battery_identity(r));
+            inventory_changed |= old.is_none_or(|old| old.via != r.via) || replaced;
+            if replaced {
                 self.estimator.devices.remove(&r.key);
                 self.alerts.remove(&r.key);
                 self.held.retain(|(key, _), _| key != &r.key);
                 // The reused key belongs to a different unit. Shared hardware
                 // cooldowns may still belong to another live connection alias.
                 self.sound_at
+                    .entries
                     .retain(|identity, _| identity.strip_prefix("key:") != Some(r.key.as_str()));
             }
             self.settings.link_reading(r);
@@ -305,7 +316,27 @@ impl Engine {
         }
         drop(seen);
         fresh.extend(cached_readings);
+        inventory_changed |= self.provider_readings(provider).len() != fresh.len();
         self.by_provider.insert(provider.into(), fresh);
+        self.evaluate_alerts(
+            provider,
+            fresh_count,
+            monotonic,
+            quiet,
+            true,
+            inventory_changed,
+        )
+    }
+
+    fn evaluate_alerts(
+        &mut self,
+        provider: &str,
+        fresh_count: usize,
+        monotonic: f64,
+        quiet: bool,
+        record: bool,
+        inventory_changed: bool,
+    ) -> Vec<Notification> {
         let readings = resolved_readings(&self.by_provider, &self.settings);
         clean_states_with(
             &self.by_provider,
@@ -314,7 +345,7 @@ impl Engine {
             &mut self.alerts,
             &mut self.misses,
             &mut self.held,
-            &mut self.sound_at,
+            inventory_changed.then_some(&mut self.sound_at),
         );
         let mut notifications = Vec::new();
         for r in readings {
@@ -327,7 +358,7 @@ impl Engine {
                     .iter()
                     .any(|o| o.key == r.key && o.source == r.source)
             });
-            if fresh_here {
+            if record && fresh_here {
                 self.estimator.record(r, monotonic);
             }
             let low = self.settings.low_for(&r.key);
@@ -342,25 +373,24 @@ impl Engine {
                 if low == 0 || level > low || r.charging == Some(true) {
                     // With no active cooldown there is nothing to clear. Avoid
                     // constructing identity/alias strings on every healthy poll.
-                    if !self.sound_at.is_empty() {
+                    if !self.sound_at.entries.is_empty() {
                         for identity in
                             related_sound_identities(r, &self.by_provider, &self.settings)
                         {
-                            self.sound_at.remove(&identity);
+                            self.sound_at.remove(identity);
                         }
                     }
                 } else {
-                    let mut identities = sound_identities(r);
+                    let mut identities = sound_identities(r, &self.by_provider);
                     if conflicting_serial_containers(r, &self.by_provider, &self.settings)
                         && let Some(serial) = identities[1].take()
                     {
-                        self.sound_at.remove(&serial);
+                        self.sound_at.remove(serial);
                     }
                     let last = identities
                         .iter()
                         .flatten()
-                        .filter_map(|id| self.sound_at.get(id))
-                        .copied()
+                        .filter_map(|id| self.sound_at.get(*id))
                         .max_by(f64::total_cmp);
                     if monotonic.is_finite() && last.is_none_or(|last| monotonic >= last + 300.0) {
                         for identity in identities.into_iter().flatten() {
@@ -453,12 +483,13 @@ impl Engine {
         }
         let readings = enabled_readings(&self.by_provider, &self.settings);
         let settings = &self.settings;
-        let alerts = &self.alerts;
+        let alerts = &mut self.alerts;
         let mut ready = Vec::new();
         self.held.retain(|_, n| {
-            if !alerts
-                .get(&n.key)
-                .is_some_and(|alert| alert.generation == n.generation)
+            let Some(alert) = alerts.get_mut(&n.key) else {
+                return false;
+            };
+            if alert.generation != n.generation
                 || !settings.notify
                 || (n.kind == NotificationKind::Full && !settings.full_alert)
                 || settings.device(&n.key).is_some_and(|d| d.hidden)
@@ -472,12 +503,15 @@ impl Engine {
             let Some(r) = selected else {
                 return false;
             };
-            if n.kind == NotificationKind::Low
-                && (settings.low_for(&r.key) == 0
-                    || r.charging == Some(true)
-                    || r.level.is_some_and(|v| v > settings.low_for(&r.key)))
-            {
-                return false;
+            if n.kind == NotificationKind::Low {
+                let low = settings.low_for(&r.key);
+                if low == 0
+                    || alert.threshold != Some(low)
+                    || !alert.low
+                    || r.current_charging() == Some(true)
+                {
+                    return false;
+                }
             }
             if n.kind == NotificationKind::Full && r.level.is_some_and(|level| level < 100) {
                 return false;
@@ -486,6 +520,15 @@ impl Engine {
             // pending alert until fresh data permits delivery or invalidates it.
             if !r.online() || r.level.is_none() || r.source == "shield" && r.charging.is_none() {
                 return true;
+            }
+            if n.kind == NotificationKind::Low
+                && r.level.is_some_and(|v| v > settings.low_for(&r.key))
+            {
+                // This popup has never reached the user. Retire and rearm it
+                // on a fresh bounce above the threshold. Delivered alerts keep
+                // their normal five-point hysteresis.
+                alert.low = false;
+                return false;
             }
             let name = settings
                 .device(&r.key)
@@ -573,7 +616,7 @@ impl Engine {
                     if !r.online() && (r.level.is_some() || r.approx.is_some()) {
                         text.push_str(" (last known)");
                     }
-                    if r.charging == Some(true) {
+                    if r.current_charging() == Some(true) {
                         text.push_str(" · charging");
                     }
                     if !r.online() {
@@ -609,7 +652,7 @@ fn clean_states_with(
     alerts: &mut BTreeMap<String, AlertState>,
     misses: &mut BTreeMap<String, u8>,
     held: &mut BTreeMap<(String, NotificationKind), Notification>,
-    sound_at: &mut BTreeMap<String, f64>,
+    sound_at: Option<&mut SoundCooldowns>,
 ) {
     let connected: BTreeSet<_> = readings
         .iter()
@@ -625,26 +668,30 @@ fn clean_states_with(
         .collect();
     misses.retain(|key, _| known.contains(key.as_str()));
     held.retain(|(key, _), _| connected.contains(key.as_str()));
-    if !sound_at.is_empty() {
-        let mut sound_keys = BTreeSet::new();
-        for reading in providers
-            .values()
-            .flatten()
-            .filter(|r| !settings.device(&r.key).is_some_and(|d| d.hidden))
-        {
-            let identities = sound_identities(reading);
-            if let Some(serial) = &identities[1]
-                && sound_at.contains_key(serial)
-                && conflicting_serial_containers(reading, providers, settings)
-            {
-                // Once a serial is known to describe different containers,
-                // an older shared cooldown cannot be assigned to either one.
-                sound_at.remove(serial);
-            }
-            sound_keys.extend(identities.into_iter().flatten());
-        }
-        sound_at.retain(|key, _| sound_keys.contains(key));
-    }
+    let Some(sound_at) = sound_at else { return };
+    sound_at.entries.retain(|stored, _| {
+        providers.values().flatten().any(|r| {
+            !settings.device(&r.key).is_some_and(|d| d.hidden)
+                && match stored.split_once(':') {
+                    Some(("key", value)) => r.key == value,
+                    Some(("serial", value)) => {
+                        r.serial
+                            .as_deref()
+                            .and_then(trusted_identity)
+                            .is_some_and(|s| s.eq_ignore_ascii_case(value))
+                            && !conflicting_serial_containers(r, providers, settings)
+                    }
+                    Some(("container", value)) => r
+                        .container
+                        .as_deref()
+                        .and_then(trusted_identity)
+                        .is_some_and(|s| {
+                            s.eq_ignore_ascii_case(value) && container_sound_owner(r, s, providers)
+                        }),
+                    _ => false,
+                }
+        })
+    });
 }
 
 fn resolved_readings<'a>(
@@ -701,17 +748,78 @@ fn reading_replaces(old: &Reading, new: &Reading) -> bool {
     new.online()
         && (!old.online() || (new.level.is_some() && (old.level.is_none() || new.via == "usb")))
 }
-fn sound_identities(r: &Reading) -> [Option<String>; 3] {
+fn distinct_sound_units(a: &Reading, b: &Reading) -> bool {
+    a.key != b.key
+        && ((a.source == "logitech" && b.source == "logitech")
+            || a.serial
+                .as_deref()
+                .and_then(trusted_identity)
+                .zip(b.serial.as_deref().and_then(trusted_identity))
+                .is_some_and(|(left, right)| !left.eq_ignore_ascii_case(right)))
+}
+// Format lookups in one reusable buffer. Only a newly active alias owns a string.
+#[derive(Default)]
+struct SoundCooldowns {
+    entries: BTreeMap<String, f64>,
+    lookup: String,
+}
+type SoundId<'a> = (&'static str, &'a str);
+impl SoundCooldowns {
+    fn prepare(&mut self, (kind, value): SoundId<'_>) {
+        self.lookup.clear();
+        self.lookup.push_str(kind);
+        self.lookup.push(':');
+        let start = self.lookup.len();
+        self.lookup.push_str(value);
+        if kind != "key" {
+            self.lookup[start..].make_ascii_lowercase();
+        }
+    }
+    fn get(&mut self, id: SoundId<'_>) -> Option<f64> {
+        self.prepare(id);
+        self.entries.get(&self.lookup).copied()
+    }
+    fn remove(&mut self, id: SoundId<'_>) {
+        self.prepare(id);
+        self.entries.remove(&self.lookup);
+    }
+    fn insert(&mut self, id: SoundId<'_>, at: f64) {
+        self.prepare(id);
+        if let Some(old) = self.entries.get_mut(&self.lookup) {
+            *old = at;
+        } else {
+            self.entries.insert(self.lookup.clone(), at);
+        }
+    }
+}
+fn container_sound_owner(
+    r: &Reading,
+    container: &str,
+    providers: &BTreeMap<String, Vec<Reading>>,
+) -> bool {
+    !providers.values().flatten().any(|other| {
+        other
+            .container
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(container))
+            && distinct_sound_units(r, other)
+    })
+}
+fn sound_identities<'a>(
+    r: &'a Reading,
+    providers: &BTreeMap<String, Vec<Reading>>,
+) -> [Option<SoundId<'a>>; 3] {
     [
-        Some(format!("key:{}", r.key)),
+        Some(("key", &r.key)),
         r.serial
             .as_deref()
             .and_then(trusted_identity)
-            .map(|serial| format!("serial:{}", serial.to_ascii_lowercase())),
+            .map(|s| ("serial", s)),
         r.container
             .as_deref()
             .and_then(trusted_identity)
-            .map(|container| format!("container:{}", container.to_ascii_lowercase())),
+            .filter(|s| container_sound_owner(r, s, providers))
+            .map(|s| ("container", s)),
     ]
 }
 
@@ -758,18 +866,21 @@ fn conflicting_serial_containers(
     false
 }
 
-fn related_sound_identities(
-    r: &Reading,
-    providers: &BTreeMap<String, Vec<Reading>>,
-    settings: &Settings,
-) -> Vec<String> {
+fn related_sound_identities<'a>(
+    r: &'a Reading,
+    providers: &'a BTreeMap<String, Vec<Reading>>,
+    settings: &'a Settings,
+) -> impl Iterator<Item = SoundId<'a>> + 'a {
     let container = r.container.as_deref().and_then(trusted_identity);
     let serial = r.serial.as_deref().and_then(trusted_identity);
     let ambiguous_serial = conflicting_serial_containers(r, providers, settings);
     providers
         .values()
         .flatten()
-        .filter(|other| {
+        .filter(move |other| {
+            if distinct_sound_units(r, other) {
+                return false;
+            }
             let other_container = other.container.as_deref().and_then(trusted_identity);
             let same_serial = serial
                 .zip(other.serial.as_deref().and_then(trusted_identity))
@@ -788,8 +899,7 @@ fn related_sound_identities(
                     .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
                 || (!ambiguous_serial && same_serial)
         })
-        .flat_map(|other| sound_identities(other).into_iter().flatten())
-        .collect()
+        .flat_map(move |other| sound_identities(other, providers).into_iter().flatten())
 }
 
 /// Containers are stronger than vendor serials. Conflicting containers cannot

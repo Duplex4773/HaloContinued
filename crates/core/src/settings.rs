@@ -10,6 +10,12 @@ pub struct DevicePreferences {
     pub icon: Option<String>,
     pub low: Option<u8>,
     pub requested_polling_rate: Option<crate::PollingRate>,
+    /// Windows container that confirmed this startup rate. Older keyboard bindings use the original field name.
+    #[serde(
+        alias = "polling_keyboard_container",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub polling_owner_container: Option<String>,
     /// Opt-in target for Windows-reported exclusive fullscreen applications.
     pub fullscreen_boost_rate: Option<crate::PollingRate>,
 }
@@ -172,6 +178,12 @@ impl Settings {
                                         .and_then(|v| v.as_u64())
                                         .and_then(|n| u32::try_from(n).ok())
                                         .and_then(|n| crate::PollingRate::try_from(n).ok()),
+                                    polling_owner_container: fields
+                                        .get("polling_owner_container")
+                                        .or_else(|| fields.get("polling_keyboard_container"))
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty() && s.len() <= 256)
+                                        .map(str::to_owned),
                                     fullscreen_boost_rate: fields
                                         .get("fullscreen_boost_rate")
                                         .and_then(|v| v.as_u64())

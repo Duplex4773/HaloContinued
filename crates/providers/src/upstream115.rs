@@ -376,6 +376,7 @@ impl HidProvider {
             channel.write(&[0x10, slot, 0x81, register, 0, 0, 0])?;
             let deadline = (c.clock.monotonic() + Duration::from_millis(600)).min(c.deadline);
             let mut answered = false;
+            let mut wait_ms = 5;
             while c.active() && c.clock.monotonic() < deadline && !answered {
                 for channel in 0..2 {
                     let r = if channel == 0 {
@@ -383,10 +384,10 @@ impl HidProvider {
                     } else {
                         short.as_mut().unwrap().read(64, Duration::ZERO)?
                     };
-                    if r.len() < 4 || r[1] != slot {
+                    let Some(r) = hidpp_frame(&r, slot) else {
                         continue;
-                    }
-                    if r.len() >= 6 && [0x8f, 0xff].contains(&r[2]) && r[3..5] == [0x81, register] {
+                    };
+                    if [0x8f, 0xff].contains(&r[2]) && r[3..5] == [0x81, register] {
                         answered = true;
                         break;
                     }
@@ -399,7 +400,11 @@ impl HidProvider {
                     }
                 }
                 if !answered {
-                    c.sleep(Duration::from_millis(5));
+                    c.sleep(
+                        Duration::from_millis(wait_ms)
+                            .min(deadline.saturating_sub(c.clock.monotonic())),
+                    );
+                    wait_ms = (wait_ms * 2).min(40);
                 }
             }
         }
@@ -418,7 +423,14 @@ impl HidProvider {
         let (name, kind, unit) = self
             .logitech_identity
             .get(&slot_key)
-            .cloned()
+            .map(|identity| {
+                let unit = if identity.unit == [0; 4] {
+                    String::new()
+                } else {
+                    crate::hex::encode(&identity.unit, true, false)
+                };
+                (identity.name.clone(), identity.kind.clone(), unit)
+            })
             .unwrap_or_else(|| {
                 if info.product_id == 0x0ac4 {
                     ("Logitech G535".into(), "headset".into(), String::new())
@@ -426,11 +438,8 @@ impl HidProvider {
                     ("Logitech device".into(), String::new(), String::new())
                 }
             });
-        let key = if unit.is_empty() {
-            format!("logitech:{group}:{:04x}:{slot}", info.product_id)
-        } else {
-            format!("logitech:{unit}")
-        };
+        let unit = (!unit.is_empty()).then_some(unit);
+        let (key, serial) = logitech_reading_identity(info, group, slot, unit);
         if let Some(old) = self.logitech_slots.insert(slot_key, key.clone())
             && old != key
         {
@@ -439,7 +448,7 @@ impl HidProvider {
         }
         let mut reading = Reading::new(&key, name, "logitech", c.clock.unix());
         reading.kind = kind;
-        reading.serial = (!unit.is_empty()).then_some(unit);
+        reading.serial = serial;
         reading.container = info.container.clone();
         let charging = b.charging;
         set_battery(&mut reading, b);
@@ -530,6 +539,7 @@ impl HidProvider {
                     &i.path,
                 )
             });
+            let failed_before = self.unreadable.len();
             let mut current: Option<Reading> = None;
             let mut disconnected = false;
             let count = if self.id == "steam" {
@@ -557,6 +567,7 @@ impl HidProvider {
                     Ok(s) => s,
                     Err(e) => {
                         self.log(format!("{}: {e}", info.path));
+                        UnreadableCollection::record(&mut self.unreadable, &key, info);
                         errors.push(e);
                         continue;
                     }
@@ -672,9 +683,13 @@ impl HidProvider {
                     Ok(None) => {}
                     Err(e) => {
                         self.log(format!("{}: {e}", info.path));
+                        UnreadableCollection::record(&mut self.unreadable, &key, info);
                         errors.push(e);
                     }
                 }
+            }
+            if disconnected || current.is_some() {
+                self.unreadable.truncate(failed_before);
             }
             if let Some(r) = current {
                 self.last_observed.insert(key.clone(), c.clock.monotonic());

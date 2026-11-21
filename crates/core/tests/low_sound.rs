@@ -268,3 +268,31 @@ fn suspend_resume_clock_reset_and_confirmed_reconnect_require_fresh_readings() {
     }
     assert_eq!(poll(&mut e, reading(Some(10)), 312.0), Some(10));
 }
+
+#[test]
+fn distinct_slots_on_one_receiver_have_independent_sound_cooldowns() {
+    let mut engine = engine();
+    let make = |unit: &str, level| {
+        let mut row = reading(Some(level));
+        row.key = format!("logitech:{unit}");
+        row.source = "logitech".into();
+        row.serial = Some(unit.into());
+        row.container = Some("shared receiver".into());
+        row
+    };
+    for (at, second, expected) in [
+        (0, 70, Some(10)),
+        (60, 70, None),
+        (120, 8, Some(8)),
+        (180, 70, None),
+        (300, 70, Some(10)),
+    ] {
+        engine.apply(
+            "logitech",
+            Ok(vec![make("unit-a", 10), make("unit-b", second)]),
+            at as f64,
+            false,
+        );
+        assert_eq!(engine.take_low_battery_sound(), expected);
+    }
+}

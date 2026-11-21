@@ -325,12 +325,23 @@ fn battery_provider_delay(
 }
 fn release_inactive_provider_handles(
     providers: &mut BTreeMap<&str, Box<dyn BatteryProvider>>,
+    pending_release: &mut BTreeSet<&'static str>,
     settings: &Settings,
     suspended: bool,
 ) {
-    for (id, provider) in providers.iter_mut() {
+    for id in hb_providers::provider::FAMILIES
+        .iter()
+        .map(|p| p.0)
+        .chain(["bluetooth", "xinput"])
+    {
         if suspended || !settings.enabled(id) {
-            provider.invalidate();
+            if let Some(provider) = providers.get_mut(id) {
+                provider.deactivate();
+            } else {
+                // A worker owns it. Remember this stop even if monitoring is
+                // enabled again before the native call returns.
+                pending_release.insert(id);
+            }
         }
     }
 }
@@ -345,9 +356,6 @@ mod passive_lifecycle_tests {
         }
         fn poll(&mut self, _: &dyn HidTransport, _: &PollContext<'_>) -> PollResult {
             Ok(vec![])
-        }
-        fn diagnostics(&self) -> Vec<String> {
-            vec![]
         }
         fn invalidate(&mut self) {
             self.1.fetch_add(1, Ordering::Relaxed);
@@ -368,15 +376,41 @@ mod passive_lifecycle_tests {
             ),
         ]);
         let mut settings = Settings::default();
-        release_inactive_provider_handles(&mut providers, &settings, false);
+        let mut pending_release = BTreeSet::new();
+        release_inactive_provider_handles(&mut providers, &mut pending_release, &settings, false);
         assert_eq!(jbl.load(Ordering::Relaxed), 0);
         settings.disabled_providers.insert("jbl".into());
-        release_inactive_provider_handles(&mut providers, &settings, false);
+        release_inactive_provider_handles(&mut providers, &mut pending_release, &settings, false);
         assert_eq!(jbl.load(Ordering::Relaxed), 1);
         assert_eq!(other.load(Ordering::Relaxed), 0);
-        release_inactive_provider_handles(&mut providers, &settings, true);
+        release_inactive_provider_handles(&mut providers, &mut pending_release, &settings, true);
         assert_eq!(jbl.load(Ordering::Relaxed), 2);
         assert_eq!(other.load(Ordering::Relaxed), 1);
+
+        // A quick disable/enable cannot make an outstanding result fresh again.
+        providers.remove("jbl");
+        release_inactive_provider_handles(&mut providers, &mut pending_release, &settings, false);
+        settings.disabled_providers.remove("jbl");
+        release_inactive_provider_handles(&mut providers, &mut pending_release, &settings, false);
+        assert!(pending_release.remove("jbl"));
+        assert!(!pending_release.contains("razer"));
+    }
+    #[test]
+    fn quiet_sampling_coalesces_bursts_and_refreshes_after_idle_or_reenable() {
+        let mut sample = QuietModeSample::default();
+        let now = Instant::now();
+        let mut calls = 0;
+        for millis in 0..32 {
+            assert!(sample.get(true, now + Duration::from_millis(millis), || {
+                calls += 1;
+                true
+            }));
+        }
+        assert_eq!(calls, 1);
+        let later = now + Duration::from_millis(250);
+        assert!(!sample.get(true, later, || false));
+        assert!(!sample.get(false, later, || panic!("disabled")));
+        assert!(sample.get(true, later, || true));
     }
     #[test]
     fn quiet_mode_throttles_queries_but_keeps_bounded_passive_collection() {
@@ -468,6 +502,25 @@ fn poll_is_due(
 ) -> bool {
     !paused && settings.enabled(id) && due.is_some_and(|t| t <= now)
 }
+#[derive(Default)]
+struct QuietModeSample(Option<(Instant, bool)>);
+impl QuietModeSample {
+    // A batch of worker completions shares the shell read. No timer is armed.
+    fn get(&mut self, enabled: bool, now: Instant, sample: impl FnOnce() -> bool) -> bool {
+        if !enabled {
+            self.0 = None;
+            return false;
+        }
+        if let Some((at, quiet)) = self.0
+            && now.saturating_duration_since(at) < Duration::from_millis(250)
+        {
+            return quiet;
+        }
+        let quiet = sample();
+        self.0 = Some((now, quiet));
+        quiet
+    }
+}
 fn leave_quiet_mode<'a>(
     was_quiet: bool,
     quiet: bool,
@@ -542,18 +595,19 @@ pub(super) fn return_notification(
         Err(TrySendError::Full(_)) => unreachable!(),
     }
 }
-fn update_diagnostics(
+fn update_diagnostics<'a>(
     diagnostics: &mut BTreeMap<String, Vec<String>>,
     key: &str,
-    value: Vec<String>,
+    value: impl Into<std::borrow::Cow<'a, [String]>>,
 ) -> bool {
+    let value = value.into();
     if let Some(previous) = diagnostics.get_mut(key) {
-        if *previous == value {
+        if previous.as_slice() == value.as_ref() {
             return false;
         }
-        *previous = value;
+        *previous = value.into_owned();
     } else {
-        diagnostics.insert(key.into(), value);
+        diagnostics.insert(key.into(), value.into_owned());
     }
     true
 }
@@ -686,7 +740,17 @@ fn completed_observations(
     if !allowed {
         return Vec::new();
     }
-    let mut observations = result.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
+    // Bluetooth checks the link between property reads. Replaying an identical
+    // property snapshot is useful for alert delivery but adds no history evidence.
+    let reported = result.as_deref().unwrap_or_default();
+    if reported.first().is_some_and(|r| r.source == "bluetooth") && reported == previous {
+        return Vec::new();
+    }
+    let mut observations: Vec<_> = reported
+        .iter()
+        .filter(|reading| reading.source != "bluetooth" || !previous.contains(reading))
+        .cloned()
+        .collect();
     for reading in &mut observations {
         if reading.level.is_some_and(|level| level > 100) {
             reading.level = None;
@@ -694,7 +758,7 @@ fn completed_observations(
     }
     for old in previous {
         if old.connection != Connection::Stale
-            && !observations.iter().any(|reading| reading.key == old.key)
+            && !reported.iter().any(|reading| reading.key == old.key)
         {
             observations.push(availability_boundary(old.clone(), Connection::Stale, now));
         }
@@ -1813,6 +1877,7 @@ fn finish_sleep_recovery(
 }
 
 struct RecoveryContext<'a> {
+    unreadable: &'a [UnreadableCollection],
     settings: &'a Settings,
     generation: u64,
     saver: &'a mut crate::battery_saver::BatterySaver,
@@ -1863,11 +1928,15 @@ fn recover_available(
         // Apply that same confirmed inventory before any control is scheduled,
         // including charging and coordinated boost/saver ownership. This adds
         // no discovery, timer or steady-state inventory pass.
-        context.saver.observe_provider(provider, readings, now);
+        context
+            .saver
+            .observe_inventory(provider, readings, now, context.unreadable);
         context
             .saver
             .coordinate_charging_boost(provider, context.boost);
-        context.boost.observe_provider(provider, readings, now);
+        context
+            .boost
+            .observe_inventory(provider, readings, now, context.unreadable);
     }
     pending
 }
@@ -2687,7 +2756,7 @@ impl StartupPolling {
 /// evidence of hardware state. All requests use the ordinary guarded controller.
 struct StartupPollingRestore {
     until: Instant,
-    pending: BTreeMap<String, PollingRate>,
+    pending: BTreeMap<String, (PollingRate, Option<String>)>,
     inflight: BTreeMap<u64, (ConfigurationDevice, Arc<AtomicBool>)>,
     next_request: u64,
 }
@@ -2700,9 +2769,12 @@ impl StartupPollingRestore {
                     .devices
                     .iter()
                     .filter_map(|(key, settings)| {
-                        settings
-                            .requested_polling_rate
-                            .map(|rate| (key.clone(), rate))
+                        settings.requested_polling_rate.map(|rate| {
+                            (
+                                key.clone(),
+                                (rate, settings.polling_owner_container.clone()),
+                            )
+                        })
                     })
                     .take(512)
                     .collect()
@@ -2772,13 +2844,19 @@ impl StartupPollingRestore {
             let preference_key = device
                 .shared_preference_key()
                 .unwrap_or_else(|| device.key.clone());
-            let Some(rate) = self
-                .pending
-                .remove(&preference_key)
-                .or_else(|| self.pending.remove(&device.key))
-            else {
+            let saved_key = if self.pending.contains_key(&preference_key) {
+                &preference_key
+            } else {
+                &device.key
+            };
+            let Some((rate, owner)) = self.pending.get(saved_key) else {
                 continue;
             };
+            if !device.owns_polling_choice(owner.as_deref()) {
+                continue;
+            }
+            let rate = *rate;
+            self.pending.remove(&preference_key);
             self.pending.remove(&device.key);
             if device.kind == "mouse"
                 && !hb_providers::controls::polling_menu_rates(&device).contains(&rate.hz())
@@ -3783,10 +3861,18 @@ fn run(
     let (winrt, winrt_rx) = bounded(2);
     let (results, result_rx) = bounded(4);
     let mut workers = Vec::new();
-    let mut providers: BTreeMap<&str, Box<dyn BatteryProvider>> = hb_providers::providers()
+    let mut providers: BTreeMap<&str, Box<dyn BatteryProvider>> = crate::hid_providers(&dir)
         .into_iter()
         .map(|p| (p.id(), p))
         .collect();
+    if !simulate {
+        for key in engine.settings.devices.keys() {
+            if let Err(error) = hb_storage::remember_qualified_receiver(&dir, key) {
+                let _ = events.send(Event::Error(format!("Receiver identity settings: {error}")));
+                break;
+            }
+        }
+    }
     providers.insert("bluetooth", Box::new(BluetoothProvider::default()));
     providers.insert("xinput", Box::new(ControllerProvider));
     let gates = Arc::new(WorkerAccess {
@@ -3834,6 +3920,7 @@ fn run(
     let mut due: BTreeMap<&str, Instant> =
         providers.keys().map(|id| (*id, Instant::now())).collect();
     let mut invalidated = BTreeSet::new();
+    let mut pending_release = BTreeSet::new();
     let mut last_bluetooth_refresh = None;
     let mut bluetooth_property_due = None;
     let mut diagnostics = BTreeMap::new();
@@ -3859,11 +3946,13 @@ fn run(
     let mut usage_tracker = UsageTracker::new(hid.generation(), engine.settings.polling_controls);
     let mut estimator_dirty = false;
     let mut estimator_checkpoint = Instant::now();
+    let mut next_estimator_prune = clock.unix().saturating_add(86400);
     let _ = events.send(Event::PollingInvalidated(hid.generation()));
     let mut stop = false;
     let mut suspended = false;
     let mut applied_resume_epoch = None;
     let mut was_quiet = false;
+    let mut quiet_sample = QuietModeSample::default();
     let mut failed_delivery: BTreeMap<(String, NotificationKind), (Instant, Notification)> =
         BTreeMap::new();
     loop {
@@ -3895,7 +3984,12 @@ fn run(
             snapshots.changed = true;
             let remove = engine.settings.status_file && !s.status_file;
             engine.update_settings(s.clone());
-            release_inactive_provider_handles(&mut providers, &engine.settings, suspended);
+            release_inactive_provider_handles(
+                &mut providers,
+                &mut pending_release,
+                &engine.settings,
+                suspended,
+            );
             let current = engine.readings();
             let removed = previous
                 .into_iter()
@@ -3942,7 +4036,12 @@ fn run(
             let _ = events.send(Event::PollingInvalidated(hid.generation()));
             if suspended {
                 applied_resume_epoch = None;
-                release_inactive_provider_handles(&mut providers, &engine.settings, true);
+                release_inactive_provider_handles(
+                    &mut providers,
+                    &mut pending_release,
+                    &engine.settings,
+                    true,
+                );
                 engine.suspend();
                 let boundaries = engine
                     .readings()
@@ -3992,7 +4091,11 @@ fn run(
         // Capture changes before snapshot publication clears its dirty flag.
         saver_dirty |= snapshots.changed || saver_generation != hid.generation();
         saver_generation = hid.generation();
-        let quiet = engine.settings.quiet_fullscreen && hb_windows::system::gaming();
+        let quiet = quiet_sample.get(
+            engine.settings.quiet_fullscreen,
+            Instant::now(),
+            hb_windows::system::gaming,
+        );
         leave_quiet_mode(
             was_quiet,
             quiet,
@@ -4289,8 +4392,16 @@ fn run(
         };
         let observed_now = clock.unix();
         if synchronize_battery_clock(&mut engine, &mut usage_tracker, observed_now) {
+            next_estimator_prune = observed_now.saturating_add(86400);
             snapshots.changed = true;
             estimator_dirty = true;
+        }
+        if observed_now >= next_estimator_prune {
+            next_estimator_prune = observed_now.saturating_add(86400);
+            if engine.estimator.prune_expired(observed_now) {
+                estimator_dirty = true;
+                snapshots.changed = true;
+            }
         }
         match work {
             Work::Command(Ok(Command::Hdr(request))) => {
@@ -4340,7 +4451,12 @@ fn run(
                 snapshots.changed = true;
                 suspended = true;
                 applied_resume_epoch = None;
-                release_inactive_provider_handles(&mut providers, &engine.settings, true);
+                release_inactive_provider_handles(
+                    &mut providers,
+                    &mut pending_release,
+                    &engine.settings,
+                    true,
+                );
                 control_cancel.store(true, Ordering::Relaxed);
                 hid.invalidate();
                 usage_tracker.invalidate(
@@ -4478,17 +4594,23 @@ fn run(
                 let timestamps_confirmed =
                     !reject_future_battery_readings(&mut r.result, observed_now);
                 let id = r.provider.id();
-                let current = battery_completion_current(
-                    &r,
-                    &engine.settings,
-                    permission.epoch.load(Ordering::Acquire),
-                    hid.generation(),
-                    suspended,
-                );
-                snapshots.changed |= current && battery_affects_snapshot(&engine, id, &r.result);
-                diagnostics_dirty |=
-                    update_diagnostics(&mut diagnostics, id, r.provider.diagnostics());
-                if !current {
+                let release =
+                    pending_release.remove(id) || suspended || !engine.settings.enabled(id);
+                let current = !release
+                    && battery_completion_current(
+                        &r,
+                        &engine.settings,
+                        permission.epoch.load(Ordering::Acquire),
+                        hid.generation(),
+                        suspended,
+                    );
+                if current {
+                    diagnostics_dirty |=
+                        update_diagnostics(&mut diagnostics, id, r.provider.diagnostics());
+                }
+                if release {
+                    r.provider.deactivate();
+                } else if !current {
                     r.provider.invalidate();
                 }
                 let delay = battery_provider_delay(
@@ -4509,7 +4631,19 @@ fn run(
                     current,
                 );
                 if current {
+                    let unreadable = r.provider.unreadable_collections();
+                    UnreadableCollection::preserve(
+                        unreadable,
+                        engine.provider_readings(id),
+                        &mut r.result,
+                    );
+                    snapshots.changed |= battery_affects_snapshot(&engine, id, &r.result);
                     let inventory_confirmed = r.result.is_ok() && timestamps_confirmed;
+                    let quiet = quiet_sample.get(
+                        engine.settings.quiet_fullscreen,
+                        Instant::now(),
+                        hb_windows::system::gaming,
+                    );
                     for n in engine.apply(id, r.result, clock.monotonic().as_secs_f64(), quiet) {
                         let _ = events.send(Event::Alert(n));
                     }
@@ -4519,9 +4653,19 @@ fn run(
                     // discovery of a missing/changed unit revokes its originals,
                     // except a bounded wait for a proven wired charging transition.
                     if inventory_confirmed {
-                        saver.observe_provider(id, engine.provider_readings(id), observed_now);
+                        saver.observe_inventory(
+                            id,
+                            engine.provider_readings(id),
+                            observed_now,
+                            unreadable,
+                        );
                         saver.coordinate_charging_boost(id, &mut boost);
-                        boost.observe_provider(id, engine.provider_readings(id), observed_now);
+                        boost.observe_inventory(
+                            id,
+                            engine.provider_readings(id),
+                            observed_now,
+                            unreadable,
+                        );
                         if let Some(pending) = flush_recovery_rearms(
                             &recovery,
                             &mut deferred_recovery_rearms,
@@ -4536,6 +4680,7 @@ fn run(
                                 engine.provider_readings(id),
                                 observed_now,
                                 RecoveryContext {
+                                    unreadable,
                                     settings: &engine.settings,
                                     generation: hid.generation(),
                                     saver: &mut saver,
@@ -4556,7 +4701,12 @@ fn run(
                     monitoring_started.elapsed(),
                     quiet,
                 );
-                schedule_completed_provider(&mut due, id, Instant::now(), delay);
+                schedule_completed_provider(
+                    &mut due,
+                    id,
+                    Instant::now(),
+                    if release { Duration::ZERO } else { delay },
+                );
                 if id == "bluetooth"
                     && let Some(next) = bluetooth_property_due
                 {
@@ -4581,11 +4731,14 @@ fn run(
             Work::Completed(Ok(WorkerCompleted::BatteryGateBusy(mut job))) => {
                 inflight = inflight.saturating_sub(1);
                 let id = job.provider.id();
-                let revoked = job.epoch != permission.epoch.load(Ordering::Acquire)
-                    || job.generation != hid.generation()
-                    || suspended
-                    || !engine.settings.enabled(id);
-                if revoked {
+                let release =
+                    pending_release.remove(id) || suspended || !engine.settings.enabled(id);
+                let revoked = release
+                    || job.epoch != permission.epoch.load(Ordering::Acquire)
+                    || job.generation != hid.generation();
+                if release {
+                    job.provider.deactivate();
+                } else if revoked {
                     job.provider.invalidate();
                 }
                 if !revoked {
@@ -5188,7 +5341,11 @@ fn run(
         }
         if !suspended
             && engine.has_held_notifications()
-            && (!engine.settings.quiet_fullscreen || !hb_windows::system::gaming())
+            && !quiet_sample.get(
+                engine.settings.quiet_fullscreen,
+                Instant::now(),
+                hb_windows::system::gaming,
+            )
         {
             for n in engine.flush_held() {
                 let _ = events.send(Event::Alert(n));
@@ -5642,6 +5799,7 @@ mod tests {
             std::slice::from_ref(&reading),
             100,
             RecoveryContext {
+                unreadable: &[],
                 settings: &settings,
                 generation: 1,
                 saver: &mut saver,
@@ -5844,6 +6002,7 @@ mod tests {
                 &readings,
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -5910,6 +6069,7 @@ mod tests {
                 &readings,
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -5955,6 +6115,7 @@ mod tests {
                 std::slice::from_ref(&reading),
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -6080,6 +6241,7 @@ mod tests {
             std::slice::from_ref(&reading),
             100,
             RecoveryContext {
+                unreadable: &[],
                 settings: &settings,
                 generation: 3,
                 saver: &mut saver,
@@ -6140,6 +6302,7 @@ mod tests {
                     std::slice::from_ref(&reading),
                     100,
                     RecoveryContext {
+                        unreadable: &[],
                         settings: &settings,
                         generation: 1,
                         saver: &mut saver,
@@ -6224,6 +6387,7 @@ mod tests {
                 std::slice::from_ref(&reading),
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -6333,6 +6497,7 @@ mod tests {
             std::slice::from_ref(&reading),
             100,
             RecoveryContext {
+                unreadable: &[],
                 settings: &settings,
                 generation: 1,
                 saver: &mut saver,
@@ -6394,6 +6559,7 @@ mod tests {
                 std::slice::from_ref(&reading),
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -6438,6 +6604,7 @@ mod tests {
                 std::slice::from_ref(&reading),
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -6472,6 +6639,7 @@ mod tests {
             std::slice::from_ref(&reading),
             100,
             RecoveryContext {
+                unreadable: &[],
                 settings: &settings,
                 generation: 1,
                 saver: &mut saver,
@@ -6527,6 +6695,7 @@ mod tests {
                 std::slice::from_ref(&reading),
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -6598,6 +6767,7 @@ mod tests {
                 std::slice::from_ref(&reading),
                 100,
                 RecoveryContext {
+                    unreadable: &[],
                     settings: &settings,
                     generation: 1,
                     saver: &mut saver,
@@ -7019,6 +7189,7 @@ mod tests {
             std::slice::from_ref(&reading),
             100,
             RecoveryContext {
+                unreadable: &[],
                 settings: &settings,
                 generation: 2,
                 saver: &mut saver,
@@ -7329,9 +7500,6 @@ mod tests {
             fn id(&self) -> &'static str {
                 self.0
             }
-            fn diagnostics(&self) -> Vec<String> {
-                vec![]
-            }
             fn poll(&mut self, _: &dyn HidTransport, _: &PollContext<'_>) -> PollResult {
                 unreachable!()
             }
@@ -7417,6 +7585,31 @@ mod tests {
         assert_eq!(collision.connection, Connection::Sleeping);
         let backwards = availability_boundary(old, Connection::Stale, 50);
         assert_eq!(backwards.timestamp, 50);
+    }
+    #[test]
+    fn bluetooth_status_replays_produce_no_history_until_the_observation_changes() {
+        let old = Reading::new("bluetooth:a", "Headset", "bluetooth", 100);
+        let previous = std::slice::from_ref(&old);
+        let result = Ok(vec![old.clone()]);
+        for now in (102..160).step_by(2) {
+            assert!(completed_observations(previous, &result, now, true).is_empty());
+        }
+        let mut changed = old.clone();
+        changed.connection = Connection::ConnectedLastKnown;
+        assert_eq!(
+            completed_observations(previous, &Ok(vec![changed.clone()]), 160, true),
+            [changed]
+        );
+        assert_eq!(
+            completed_observations(previous, &Ok(vec![]), 162, true)[0].connection,
+            Connection::Stale
+        );
+        let mut reconnect = old.clone();
+        reconnect.timestamp = 164;
+        assert_eq!(
+            completed_observations(previous, &Ok(vec![reconnect.clone()]), 164, true),
+            [reconnect]
+        );
     }
     #[test]
     fn provider_completion_stores_fresh_rows_and_missing_devices_only() {
@@ -8097,12 +8290,17 @@ mod tests {
         assert_eq!(rate.hz(), 250);
     }
     #[test]
-    fn unchanged_empty_diagnostics_do_not_allocate_provider_keys() {
+    fn unchanged_provider_diagnostics_do_not_allocate() {
         let mut diagnostics = BTreeMap::new();
-        update_diagnostics(&mut diagnostics, "razer", Vec::new());
+        let lines = vec!["Device replied".to_owned(), "Battery read".to_owned()];
+        update_diagnostics(&mut diagnostics, "razer", lines.as_slice());
         let (_, allocations) = crate::allocation_counter::measure(|| {
             for _ in 0..1000 {
-                assert!(!update_diagnostics(&mut diagnostics, "razer", Vec::new()));
+                assert!(!update_diagnostics(
+                    &mut diagnostics,
+                    "razer",
+                    lines.as_slice()
+                ));
             }
         });
         println!("1,000 unchanged diagnostic updates: {allocations:?}");
@@ -8618,9 +8816,6 @@ mod tests {
             fn id(&self) -> &'static str {
                 "simulation"
             }
-            fn diagnostics(&self) -> Vec<String> {
-                vec![]
-            }
             fn poll(&mut self, _: &dyn HidTransport, context: &PollContext<'_>) -> PollResult {
                 if self.0 == 1 || self.0 == 2 {
                     context.sleep(Duration::from_secs(25));
@@ -8670,9 +8865,6 @@ mod tests {
     fn full_mode_setting_reaches_provider_context_and_cancelled_jobs_do_not_poll() {
         struct Provider(Arc<Mutex<Vec<bool>>>);
         impl BatteryProvider for Provider {
-            fn diagnostics(&self) -> Vec<String> {
-                vec![]
-            }
             fn id(&self) -> &'static str {
                 "playstation"
             }
@@ -9392,6 +9584,34 @@ mod tests {
         );
     }
     #[test]
+    fn replacement_mouse_cannot_receive_another_receivers_saved_rate() {
+        let now = Instant::now();
+        let mut r = Reading::new("razer:00bf:SAME-SERIAL", "Mouse", "razer", 0);
+        r.kind = "mouse".into();
+        r.via = "usb".into();
+        r.serial = Some("SAME-SERIAL".into());
+        let mut s = startup_settings();
+        s.devices.clear();
+        s.device_mut(&r.key).requested_polling_rate = Some(4000.try_into().unwrap());
+        r.container = Some("second".into());
+        let next = |startup: &mut StartupPollingRestore, r: &Reading| {
+            startup.next(
+                now,
+                0,
+                1,
+                std::iter::once(ConfigurationDevice::from_reading(r)),
+                None,
+            )
+        };
+        assert!(next(&mut StartupPollingRestore::new(&s, now), &r).is_none());
+        s.device_mut(&r.key).polling_owner_container = Some("first".into());
+        let mut startup = StartupPollingRestore::new(&s, now);
+        assert!(next(&mut startup, &r).is_none());
+        r.container = Some("FIRST".into());
+        assert!(matches!(next(&mut startup, &r), Some(Command::Polling(..))));
+    }
+
+    #[test]
     fn startup_alias_keeps_the_wired_target_and_rejects_rates_above_its_ceiling() {
         let now = Instant::now();
         for (wired_pid, wireless_pid, hz, applies) in
@@ -9404,8 +9624,10 @@ mod tests {
             reading.serial = Some("TESTUNIT1234".into());
             let mut s = startup_settings();
             s.devices.clear();
-            s.device_mut(&format!("razer:{wireless_pid}:TESTUNIT1234"))
-                .requested_polling_rate = Some(hz.try_into().unwrap());
+            reading.container = Some("confirmed-unit".into());
+            let pref = s.device_mut(&format!("razer:{wireless_pid}:TESTUNIT1234"));
+            pref.requested_polling_rate = Some(hz.try_into().unwrap());
+            pref.polling_owner_container = reading.container.clone();
             let mut startup = StartupPollingRestore::new(&s, now);
             let result = startup.next(
                 now,
@@ -9430,6 +9652,7 @@ mod tests {
         wireless.source = "razer".into();
         wireless.via = "usb".into();
         wireless.serial = Some("TESTUNIT1234".into());
+        wireless.container = Some("first-unit".into());
         let wireless = ConfigurationDevice::from_reading(&wireless);
         let mut wired = wireless.clone();
         wired.key = "razer:00be:TESTUNIT1234".into();
@@ -9439,7 +9662,10 @@ mod tests {
         let mut settings = startup_settings();
         settings.devices.clear();
         settings.device_mut(&wireless.key).requested_polling_rate = Some(8000.try_into().unwrap());
+        other.container = Some("other-unit".into());
         settings.device_mut(&other.key).requested_polling_rate = Some(1000.try_into().unwrap());
+        settings.device_mut(&wireless.key).polling_owner_container = wireless.container.clone();
+        settings.device_mut(&other.key).polling_owner_container = other.container.clone();
 
         let mut pending = StartupPollingRestore::new(&settings, now);
         pending.cancel_device(&wired);
@@ -9620,11 +9846,15 @@ mod tests {
         let now = Instant::now();
         let mut settings = startup_settings();
         let mut keyboard = simulated_keyboards().remove(0);
-        settings
-            .devices
-            .entry(keyboard.key.clone())
-            .or_default()
-            .requested_polling_rate = PollingRate::try_from(1000).ok();
+        let preferences = settings.device_mut(&keyboard.key);
+        preferences.requested_polling_rate = PollingRate::try_from(1000).ok();
+        // An unbound legacy choice must be explicitly confirmed once.
+        assert!(
+            StartupPollingRestore::new(&settings, now)
+                .next(now, 0, 1, std::iter::once(keyboard.clone()), Some(3))
+                .is_none()
+        );
+        settings.device_mut(&keyboard.key).polling_owner_container = keyboard.container.clone();
         let mut startup = StartupPollingRestore::new(&settings, now);
         let mut mouse = ConfigurationDevice::from_reading(&control_reading());
         mouse.connection = Connection::Stale;
@@ -9644,6 +9874,13 @@ mod tests {
         assert!(
             startup
                 .next(now, 0, 1, std::iter::once(mouse), None)
+                .is_none()
+        );
+        let mut replacement = keyboard.clone();
+        replacement.container = Some("SECOND".into());
+        assert!(
+            startup
+                .next(now, 0, 1, std::iter::once(replacement), Some(3))
                 .is_none()
         );
         keyboard.capability = PollingCapability::Unavailable("unsupported".into());

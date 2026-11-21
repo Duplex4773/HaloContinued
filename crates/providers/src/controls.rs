@@ -31,6 +31,7 @@ pub fn polling_menu_candidate(device: &ConfigurationDevice) -> bool {
             };
             // Mirrors the mouse-only PID scope in razer_controls::protocol.
             !identity.trim().is_empty()
+                && !identity.contains(":physical:")
                 && matches!(pid, "00be" | "00bf" | "009f" | "00c1" | "00b6" | "00b7")
         }
         "logitech" if device.via.is_empty() || device.via == "usb" => {

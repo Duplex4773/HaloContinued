@@ -67,7 +67,29 @@ pub fn providers() -> Vec<Box<dyn BatteryProvider>> {
         .map(|(id, _)| Box::new(HidProvider::new(id)) as Box<dyn BatteryProvider>)
         .collect()
 }
+struct LogitechIdentity {
+    name: String,
+    kind: String,
+    unit: [u8; 4],
+    direct_verified: bool,
+}
+type CollisionMarker = Box<dyn Fn(&str, bool) -> Result<bool, ProviderError> + Send>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverIdentity {
+    Unique,
+    Qualified,
+    PendingMarker,
+}
+#[derive(Default)]
+struct RazerInventory {
+    snapshot: Option<HidSnapshot>,
+    // Only currently enumerated serials are cached. The profile remembers collisions.
+    qualified: BTreeMap<String, ReceiverIdentity>,
+    marker: Option<CollisionMarker>,
+}
 pub struct HidProvider {
+    razer_inventory: Option<Box<RazerInventory>>,
     community_enabled: bool,
     // Allocated only when an enumerated, reviewed device needs these protocols.
     community: Option<Box<crate::community::Community>>,
@@ -76,11 +98,12 @@ pub struct HidProvider {
     // The catalog is static; retain its ordered vendor set across polls.
     vendors: Box<[u16]>,
     diagnostics: Vec<String>,
+    unreadable: Vec<UnreadableCollection>,
     last: BTreeMap<String, Reading>,
     first_seen: BTreeMap<String, Duration>,
     last_observed: BTreeMap<String, Duration>,
     stuck: BTreeMap<String, u8>,
-    logitech_identity: BTreeMap<String, (String, String, String)>,
+    logitech_identity: BTreeMap<String, LogitechIdentity>,
     logitech_asleep: BTreeSet<String>,
     logitech_slots: BTreeMap<String, String>,
     logitech_error: Option<u8>,
@@ -109,6 +132,7 @@ pub struct HidProvider {
 impl HidProvider {
     pub fn new(id: &'static str) -> Self {
         Self {
+            razer_inventory: None,
             community_enabled: DEVICES.iter().any(|d| {
                 d.provider == id
                     && (d.variant.starts_with("pr:") || id == "gwolves" && d.pid == 0x3854)
@@ -124,6 +148,7 @@ impl HidProvider {
                 .into_iter()
                 .collect(),
             diagnostics: Vec::new(),
+            unreadable: Vec::new(),
             last: BTreeMap::new(),
             first_seen: BTreeMap::new(),
             last_observed: BTreeMap::new(),
@@ -205,7 +230,13 @@ impl HidProvider {
                 Err(error) => {
                     self.log(format!("{}: {error}", info.path));
                     failures.push(error.to_string());
-                    if let Some(mut r) = self.last.get(&key).cloned() {
+                    UnreadableCollection::record(&mut self.unreadable, &key, info);
+                    if let Some(mut r) = self
+                        .last
+                        .get(&key)
+                        .filter(|r| UnreadableCollection::matches(&self.unreadable, r))
+                        .cloned()
+                    {
                         r.connection = Connection::Stale;
                         out.push(r);
                     }
@@ -240,6 +271,105 @@ impl HidProvider {
             Ok(out)
         }
     }
+    pub fn with_razer_collision_markers(
+        mut self,
+        marker: impl Fn(&str, bool) -> Result<bool, ProviderError> + Send + 'static,
+    ) -> Self {
+        self.razer_inventory = Some(Box::new(RazerInventory {
+            marker: Some(Box::new(marker)),
+            ..Default::default()
+        }));
+        self
+    }
+    fn update_razer_inventory(&mut self, snapshot: Option<&HidSnapshot>) {
+        let Some(snapshot) = snapshot else {
+            if let Some(inventory) = self.razer_inventory.as_mut() {
+                inventory.snapshot = None;
+                inventory
+                    .qualified
+                    .retain(|_, state| *state == ReceiverIdentity::PendingMarker);
+            }
+            return;
+        };
+        let inventory = self.razer_inventory.get_or_insert_with(Default::default);
+        if inventory
+            .snapshot
+            .as_ref()
+            .is_some_and(|old| std::ptr::eq(&**old, &**snapshot))
+        {
+            return;
+        }
+        let mut present = BTreeMap::new();
+        for info in snapshot.iter().filter(|i| usable_identity_value(&i.serial)) {
+            let key = format!("razer:{:04x}:{}", info.product_id, trusted_identity(info));
+            let (first, shared) = present.entry(key).or_insert((None::<&str>, false));
+            if let Some(container) = info
+                .container
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| usable_identity_value(s))
+            {
+                if let Some(other) = first {
+                    *shared |= !container.eq_ignore_ascii_case(other);
+                } else {
+                    *first = Some(container);
+                }
+            }
+        }
+        inventory.qualified.retain(|key, state| {
+            *state == ReceiverIdentity::PendingMarker || present.contains_key(key)
+        });
+        for (key, (_, shared)) in present {
+            let known = inventory.qualified.get(&key);
+            let shared = shared || known == Some(&ReceiverIdentity::PendingMarker);
+            if known == Some(&ReceiverIdentity::Qualified)
+                || !shared && known == Some(&ReceiverIdentity::Unique)
+            {
+                continue;
+            }
+            let result = inventory
+                .marker
+                .as_ref()
+                .map_or(Ok(shared), |marker| marker(&key, shared));
+            match result {
+                Ok(qualified) => {
+                    inventory.qualified.insert(
+                        key,
+                        if shared || qualified {
+                            ReceiverIdentity::Qualified
+                        } else {
+                            ReceiverIdentity::Unique
+                        },
+                    );
+                }
+                Err(error) => {
+                    // Unknown ownership must not enable a serial-only control target.
+                    // Leave the key uncached so the next enumeration retries the marker.
+                    if shared {
+                        inventory
+                            .qualified
+                            .insert(key, ReceiverIdentity::PendingMarker);
+                    }
+                    if self.diagnostics.len() < 120 {
+                        self.diagnostics
+                            .push(format!("Razer receiver identity: {error}"));
+                    }
+                }
+            }
+        }
+        inventory.snapshot = Some(snapshot.clone());
+    }
+    fn enumerated_key(&self, device: &Device, info: &HidInfo) -> String {
+        let key = reading_key(self.id, device, info);
+        if self.razer_inventory.as_ref().is_some_and(|inventory| {
+            usable_identity_value(&info.serial)
+                && inventory.qualified.get(&key) != Some(&ReceiverIdentity::Unique)
+        }) {
+            format!("{key}:physical:{}", receiver_key(info))
+        } else {
+            key
+        }
+    }
     /// Called only after all vendor enumerations succeeded. Absence is then
     /// evidence for releasing protocol hints, not a transient enumeration error.
     fn prune_enumerated(&mut self, infos: &[&HidInfo], now: Duration) {
@@ -270,7 +400,7 @@ impl HidProvider {
             .iter()
             .filter_map(|i| {
                 find_device(self.id, i.vendor_id, i.product_id)
-                    .map(|d| reading_key(self.id, d, i))
+                    .map(|d| self.enumerated_key(d, i))
                     .or_else(|| {
                         (self.id == "mchose" && [0x5253, 0x3837].contains(&i.vendor_id))
                             .then(|| format!("mchose:{:04x}:{}", i.vendor_id, trusted_identity(i)))
@@ -519,7 +649,7 @@ impl HidProvider {
         s: &mut dyn HidSession,
         c: &PollContext<'_>,
     ) -> Result<Option<Battery>, ProviderError> {
-        let cache_key = format!("{:04x}:{}", d.pid, trusted_identity(info));
+        let cache_key = format!("{:04x}:{}", d.pid, receiver_key(info));
         let cached_tid = self
             .razer_cache
             .get(&cache_key)
@@ -1447,41 +1577,45 @@ impl HidProvider {
         long.write(&packet)?;
         let deadline =
             (c.clock.monotonic() + Duration::from_millis(self.logitech_timeout)).min(c.deadline);
+        let mut wait_ms = 5;
         while c.active() && c.clock.monotonic() < deadline {
             for channel in 0..2 {
-                let r = if channel == 0 {
+                let mut report = if channel == 0 {
                     long.read(64, Duration::ZERO)?
                 } else if let Some(s) = short {
                     s.read(64, Duration::ZERO)?
                 } else {
                     continue;
                 };
-                if r.len() < 4 || r[1] != slot {
+                let Some(r) = hidpp_frame(&report, slot) else {
                     continue;
-                }
-                if [0x8f, 0xff].contains(&r[2]) && r.len() >= 6 && r[3] == feature && r[4] == token
-                {
+                };
+                if [0x8f, 0xff].contains(&r[2]) && r[3] == feature && r[4] == token {
                     self.logitech_error = Some(r[5]);
                     return Ok(None);
                 }
                 if r[2] == feature && r[3] == token {
-                    let mut payload = r[4..].to_vec();
-                    payload.resize(payload.len().max(16), 0);
-                    return Ok(Some(payload));
+                    let length = r.len();
+                    report.copy_within(4..length, 0);
+                    report.truncate(length - 4);
+                    return Ok(Some(report));
                 }
             }
-            c.sleep(Duration::from_millis(5));
+            c.sleep(
+                Duration::from_millis(wait_ms).min(deadline.saturating_sub(c.clock.monotonic())),
+            );
+            wait_ms = (wait_ms * 2).min(40);
         }
         Ok(None)
     }
-    fn logitech_identity_read(
+    fn logitech_description(
         &mut self,
         long: &mut dyn HidSession,
         short: &mut Option<Box<dyn HidSession>>,
         c: &PollContext<'_>,
         slot: u8,
-    ) -> Result<(String, String, String), ProviderError> {
-        let (mut name, mut kind, mut unit) = (String::new(), String::new(), String::new());
+    ) -> Result<(String, String), ProviderError> {
+        let (mut name, mut kind) = (String::new(), String::new());
         if let Some(feature) = self
             .logitech_request(long, short, c, slot, 0, 0, &[0, 5])?
             .map(|r| r[0])
@@ -1497,7 +1631,7 @@ impl HidProvider {
                 else {
                     break;
                 };
-                bytes.extend_from_slice(&chars[..16]);
+                bytes.extend_from_slice(&chars);
             }
             name = String::from_utf8_lossy(&bytes[..bytes.len().min(length as usize)])
                 .trim()
@@ -1511,16 +1645,45 @@ impl HidProvider {
                 .into();
             }
         }
-        if let Some(feature) = self
-            .logitech_request(long, short, c, slot, 0, 0, &[0, 3])?
-            .map(|r| r[0])
-            .filter(|f| *f != 0)
-            && let Some(r) = self.logitech_request(long, short, c, slot, feature, 0, &[])?
-            && r[1..5].iter().any(|b| *b != 0)
-        {
-            unit = crate::hex::encode(&r[1..5], true, false);
+        Ok((name, kind))
+    }
+    fn logitech_unit(
+        &mut self,
+        long: &mut dyn HidSession,
+        short: &mut Option<Box<dyn HidSession>>,
+        c: &PollContext<'_>,
+        slot: u8,
+    ) -> Result<Option<[u8; 4]>, ProviderError> {
+        let Some(feature) = self.logitech_request(long, short, c, slot, 0, 0, &[0, 3])? else {
+            return Ok(None);
+        };
+        if feature[0] == 0 {
+            return Ok(Some([0; 4]));
         }
-        Ok((name, kind, unit))
+        Ok(self
+            .logitech_request(long, short, c, slot, feature[0], 0, &[])?
+            .and_then(|r| r.get(1..5)?.try_into().ok()))
+    }
+    fn forget_logitech_slot(&mut self, slot_key: &str) {
+        self.logitech_identity.remove(slot_key);
+        if let Some(old) = self.logitech_slots.remove(slot_key)
+            && !self.logitech_slots.values().any(|key| key == &old)
+        {
+            self.last.remove(&old);
+            self.last_observed.remove(&old);
+        }
+    }
+    fn logitech_access_failure(&mut self, pid: u16, group: &str, slots: impl Iterator<Item = u8>) {
+        for slot in slots {
+            let slot_key = format!("{pid:04x}:{group}:{slot}");
+            if let Some(reading) = self
+                .logitech_slots
+                .get(&slot_key)
+                .and_then(|key| self.last.get(key))
+            {
+                UnreadableCollection::record_reading(&mut self.unreadable, reading);
+            }
+        }
     }
     fn logitech_poll(
         &mut self,
@@ -1570,6 +1733,7 @@ impl HidProvider {
         self.last
             .retain(|key, _| self.logitech_slots.values().any(|live| live == key));
         let mut failure = None;
+        let mut completed_group = false;
         let mut found: BTreeMap<String, Reading> = BTreeMap::new();
         for ((pid, group), paths) in &groups {
             if !c.active() {
@@ -1581,10 +1745,18 @@ impl HidProvider {
                     .and_then(|mut session| Self::query_g535(&mut *session, c))
                 {
                     Ok(Some(battery)) => {
+                        let slot_key = format!("{pid:04x}:{group}:255");
+                        if self.logitech_identity.contains_key(&slot_key) {
+                            self.forget_logitech_slot(&slot_key);
+                        }
                         self.keep_logitech_register(battery, info, group, 255, c, &mut found)
                     }
-                    Ok(None) => self.log("Logitech G535: no charge register reply"),
+                    Ok(None) => {
+                        completed_group = true;
+                        self.log("Logitech G535: no charge register reply");
+                    }
                     Err(error) => {
+                        self.logitech_access_failure(*pid, group, 255..=255);
                         self.log(format!("Logitech G535: {error}"));
                         failure = Some(error);
                     }
@@ -1592,17 +1764,27 @@ impl HidProvider {
                 continue;
             }
             let Some(long_info) = paths.get(&2) else {
+                self.logitech_access_failure(*pid, group, (1..=6).chain([255]));
                 continue;
             };
             let mut long = match hid.open(long_info) {
                 Ok(s) => s,
                 Err(e) => {
+                    self.logitech_access_failure(*pid, group, (1..=6).chain([255]));
                     self.log(format!("open: {e}"));
                     failure = Some(e);
                     continue;
                 }
             };
-            let mut short = paths.get(&1).and_then(|i| hid.open(i).ok());
+            let mut short = paths.get(&1).and_then(|i| {
+                hid.open(i)
+                    .map_err(|e| {
+                        self.log(format!("open short channel: {e}"));
+                        failure = Some(e);
+                    })
+                    .ok()
+            });
+            let short_inaccessible = paths.contains_key(&1) && short.is_none();
             self.counter = 0;
             let receiver = DEVICES
                 .iter()
@@ -1622,6 +1804,9 @@ impl HidProvider {
                     let ping = self.logitech_request(&mut *long, &mut short, c, slot, 0, 1, &[])?;
                     self.logitech_timeout = 600;
                     if ping.is_none() && self.logitech_error == Some(1) {
+                        if self.logitech_identity.contains_key(&slot_key) {
+                            self.forget_logitech_slot(&slot_key);
+                        }
                         self.log(format!("slot {slot}: HID++ 1.0; reading battery registers"));
                         if let Some(b) = self.logitech_registers(&mut *long, &mut short, c, slot)? {
                             self.keep_logitech_register(b, long_info, group, slot, c, &mut found);
@@ -1638,31 +1823,61 @@ impl HidProvider {
                             });
                             self.logitech_asleep.remove(&slot_key);
                             if error == 8 {
-                                self.logitech_identity.remove(&slot_key);
-                                if let Some(old) = self.logitech_slots.remove(&slot_key) {
-                                    self.last.remove(&old);
-                                    self.last_observed.remove(&old);
-                                }
+                                self.forget_logitech_slot(&slot_key);
                             }
                         } else {
+                            if short_inaccessible {
+                                self.logitech_access_failure(*pid, group, std::iter::once(slot));
+                            }
                             self.log(format!("slot {slot}: no reply, device asleep"));
                             self.logitech_asleep.insert(slot_key);
                         }
                         continue;
                     }
                     self.logitech_asleep.remove(&slot_key);
-                    let (name, mut kind, unit) =
-                        if let Some(identity) = self.logitech_identity.get(&slot_key) {
-                            identity.clone()
-                        } else {
-                            let identity =
-                                self.logitech_identity_read(&mut *long, &mut short, c, slot)?;
-                            if !identity.0.is_empty() || !identity.2.is_empty() {
-                                self.logitech_identity
-                                    .insert(slot_key.clone(), identity.clone());
-                            }
-                            identity
-                        };
+                    // A receiver can replace the occupant without an empty-slot report or
+                    // a Windows device change. Only reuse a description for a proven unit.
+                    let observed = if !receiver
+                        && let Some(identity) = self.logitech_identity.get(&slot_key)
+                        && identity.direct_verified
+                    {
+                        Some(identity.unit)
+                    } else {
+                        self.logitech_unit(&mut *long, &mut short, c, slot)?
+                    };
+                    if observed.is_none() && self.logitech_identity.contains_key(&slot_key) {
+                        // A timeout cannot establish whether the old unit is still here.
+                        continue;
+                    }
+                    let unit = observed.unwrap_or_default();
+                    let (name, mut kind) = if let Some(cached) =
+                        self.logitech_identity.get_mut(&slot_key)
+                        && cached.unit == unit
+                        && (unit != [0; 4] || cached.direct_verified)
+                    {
+                        cached.direct_verified = !receiver;
+                        (cached.name.clone(), cached.kind.clone())
+                    } else {
+                        if self.logitech_identity.contains_key(&slot_key) || unit != [0; 4] {
+                            self.forget_logitech_slot(&slot_key);
+                        }
+                        let description =
+                            self.logitech_description(&mut *long, &mut short, c, slot)?;
+                        if unit != [0; 4]
+                            || (!receiver && observed.is_some() && !description.0.is_empty())
+                        {
+                            self.logitech_identity.insert(
+                                slot_key.clone(),
+                                LogitechIdentity {
+                                    name: description.0.clone(),
+                                    kind: description.1.clone(),
+                                    unit,
+                                    direct_verified: !receiver,
+                                },
+                            );
+                        }
+                        description
+                    };
                     let headset = DEVICES.iter().find(|d| {
                         d.provider == "logitech" && d.pid == *pid && d.variant == "headset"
                     });
@@ -1708,19 +1923,19 @@ impl HidProvider {
                         else {
                             continue;
                         };
-                        let key = if unit.is_empty() {
-                            format!("logitech:{group}:{pid:04x}:{slot}")
-                        } else {
-                            format!("logitech:{unit}")
-                        };
+                        let serial =
+                            (unit != [0; 4]).then(|| crate::hex::encode(&unit, true, false));
+                        let (key, serial) =
+                            logitech_reading_identity(long_info, group, slot, serial);
                         if let Some(old) = self.logitech_slots.insert(slot_key.clone(), key.clone())
                             && old != key
                         {
                             self.last.remove(&old);
+                            self.last_observed.remove(&old);
                         }
                         let mut reading = Reading::new(&key, &name, "logitech", c.clock.unix());
                         reading.kind = kind.clone();
-                        reading.serial = (!unit.is_empty()).then(|| unit.clone());
+                        reading.serial = serial;
                         reading.container = long_info.container.clone();
                         set_battery(&mut reading, battery);
                         if !found.contains_key(&key) || reading.charging == Some(true) {
@@ -1738,8 +1953,11 @@ impl HidProvider {
                 Ok(())
             })();
             if let Err(e) = result {
+                self.logitech_access_failure(*pid, group, (1..=6).chain([255]));
                 self.log(format!("channel error: {e}"));
                 failure = Some(e);
+            } else if !short_inaccessible && c.active() {
+                completed_group = true;
             }
             self.logitech_timeout = 600;
         }
@@ -1751,6 +1969,13 @@ impl HidProvider {
         let now = c.clock.monotonic();
         self.last.retain(|key, reading| {
             if found.contains_key(key) {
+                true
+            } else if UnreadableCollection::matches(&self.unreadable, reading) {
+                let mut stale = reading.clone();
+                stale.connection = Connection::Stale;
+                stale.charging = None;
+                stale.charging_inferred = false;
+                out.push(stale);
                 true
             } else if self.logitech_slots.values().any(|live| live == key)
                 && self
@@ -1769,6 +1994,7 @@ impl HidProvider {
         self.last_observed
             .retain(|key, _| self.last.contains_key(key));
         if found.is_empty()
+            && !completed_group
             && let Some(error) = failure
         {
             Err(error)
@@ -1871,12 +2097,63 @@ fn set_battery(r: &mut Reading, b: Battery) {
         r.approx = b.label.or_else(|| Some(format!("about {}%", b.level)));
     }
 }
+fn identify_controller(r: &mut Reading, info: &HidInfo) {
+    r.kind = "gamepad".into();
+    r.via = if is_bluetooth(&info.path) {
+        "bluetooth"
+    } else {
+        "usb"
+    }
+    .into();
+    r.serial = (!info.serial.is_empty()).then(|| info.serial.clone());
+    r.container.clone_from(&info.container);
+}
+
 pub fn is_bluetooth(path: &str) -> bool {
     let p = path.to_lowercase();
     p.contains("vid&") || p.contains("00001124-0000-1000-8000-00805f9b34fb")
 }
+// HIDAPI can return a padded buffer. Ignore padding and require a complete
+// short or long HID++ report before inspecting a reply, including errors.
+fn hidpp_frame(report: &[u8], slot: u8) -> Option<&[u8]> {
+    let length = match report.first()? {
+        0x10 => 7,
+        0x11 => 20,
+        _ => return None,
+    };
+    report.get(..length).filter(|r| r[1] == slot)
+}
+fn logitech_reading_identity(
+    info: &HidInfo,
+    group: &str,
+    slot: u8,
+    unit: Option<String>,
+) -> (String, Option<String>) {
+    if let Some(unit) = unit {
+        return (format!("logitech:{unit}"), Some(unit));
+    }
+    let key = format!("logitech:{group}:{:04x}:{slot}", info.product_id);
+    // The dedicated G535 receiver's HID serial can distinguish replacements.
+    // A multi-device receiver serial never identifies the peripheral in a slot.
+    if info.product_id == 0x0ac4
+        && slot == 255
+        && let Some(serial) = valid_identity_value(&info.serial)
+    {
+        return (format!("{key}:receiver:{serial}"), Some(serial));
+    }
+    (key, None)
+}
 fn reading_key(id: &str, d: &Device, i: &HidInfo) -> String {
-    let identity = trusted_identity(i);
+    // Split headsets exchange reports across collections. Their serial can
+    // be shared by multiple receivers, so group by the physical receiver.
+    let identity = if matches!(
+        id,
+        "hyperx_cloud3s" | "steelseries_elite" | "logitech_centurion"
+    ) {
+        receiver_key(i)
+    } else {
+        trusted_identity(i)
+    };
     if id == "gwolves" && !d.variant.is_empty() {
         format!(
             "gwolves:{}:{identity}",
@@ -2136,8 +2413,11 @@ impl BatteryProvider for HidProvider {
     fn id(&self) -> &'static str {
         self.id
     }
-    fn diagnostics(&self) -> Vec<String> {
-        self.diagnostics.clone()
+    fn unreadable_collections(&self) -> &[UnreadableCollection] {
+        &self.unreadable
+    }
+    fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
     }
     fn next_poll_delay(&self) -> Option<Duration> {
         if self.id == "jbl" {
@@ -2147,6 +2427,12 @@ impl BatteryProvider for HidProvider {
     }
     fn invalidate(&mut self) {
         self.jbl.clear();
+        if self.id == "logitech" {
+            // Direct endpoints have no occupied-slot transition to detect.
+            for identity in self.logitech_identity.values_mut() {
+                identity.direct_verified = false;
+            }
+        }
         if self.id == "mchose" {
             self.path_retry_after.clear();
             self.mchose_models.clear();
@@ -2157,6 +2443,7 @@ impl BatteryProvider for HidProvider {
         }
     }
     fn poll(&mut self, hid: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
+        self.unreadable = Vec::new();
         if !c.active() {
             if self.id == "jbl" {
                 self.jbl.clear();
@@ -2179,6 +2466,9 @@ impl BatteryProvider for HidProvider {
                 inventories.push(devices);
             }
         }
+        if self.id == "razer" {
+            self.update_razer_inventory(inventories.first());
+        }
         let infos: Vec<_> = inventories
             .iter()
             .flat_map(|devices| devices.iter())
@@ -2191,7 +2481,7 @@ impl BatteryProvider for HidProvider {
             });
         if self.community_enabled && (community_queryable || self.community.is_some()) {
             let state = self.community.get_or_insert_with(Default::default);
-            community_result = state.poll(self.id, &infos, hid, c);
+            community_result = state.poll(self.id, &infos, hid, c, &mut self.unreadable);
             self.diagnostics.append(&mut state.diagnostics);
             if !community_queryable && state.is_empty() {
                 self.community = None;
@@ -2302,11 +2592,11 @@ impl BatteryProvider for HidProvider {
                         && (d.variant.contains(":wired:")
                             || d.variant.is_empty() && i.product_id != 0x3854)),
                 if self.id == "razer" {
-                    let key = format!("{:04x}:{}", i.product_id, trusted_identity(i));
-                    if self
-                        .razer_cache
-                        .get(&key)
-                        .is_some_and(|(path, _)| path == &i.path)
+                    if !self.razer_cache.is_empty()
+                        && self
+                            .razer_cache
+                            .get(&format!("{:04x}:{}", i.product_id, receiver_key(i)))
+                            .is_some_and(|(path, _)| path == &i.path)
                     {
                         0
                     } else if razer_keyboard_interface(i.product_id) == Some(i.interface) {
@@ -2328,7 +2618,7 @@ impl BatteryProvider for HidProvider {
                     0
                 },
                 if i.interface < 0 { 99 } else { i.interface },
-                i.path.clone(),
+                i.path.as_str(),
             )
         });
         let mut output = Vec::new();
@@ -2384,7 +2674,7 @@ impl BatteryProvider for HidProvider {
             {
                 continue;
             }
-            let key = reading_key(self.id, &d, i);
+            let key = self.enumerated_key(&d, i);
             if self.id == "corsair"
                 && d.variant == "bragi"
                 && answered_bragi.contains(&(key.clone(), d.pid))
@@ -2425,6 +2715,7 @@ impl BatteryProvider for HidProvider {
                     .get(&i.path)
                     .is_some_and(|until| *until > c.clock.monotonic())
             {
+                UnreadableCollection::record(&mut self.unreadable, &key, i);
                 continue;
             }
             let mut session = match hid.open(i) {
@@ -2466,11 +2757,11 @@ impl BatteryProvider for HidProvider {
                                 );
                             }
                         }
-                        reading.kind = "gamepad".into();
-                        reading.charging = Some(false);
+                        identify_controller(&mut reading, i);
                         seen.insert(key);
                         output.push(reading);
                     } else {
+                        UnreadableCollection::record(&mut self.unreadable, &key, i);
                         errors.push(e);
                     }
                     continue;
@@ -2479,7 +2770,7 @@ impl BatteryProvider for HidProvider {
             let razer_cached = self.id == "razer"
                 && self
                     .razer_cache
-                    .get(&format!("{:04x}:{}", d.pid, trusted_identity(i)))
+                    .get(&format!("{:04x}:{}", d.pid, receiver_key(i)))
                     .is_some_and(|(path, _)| path == &i.path);
             self.last_reply_accepted = false;
             let mut result = self.read(&d, i, &mut *session, c);
@@ -2535,7 +2826,7 @@ impl BatteryProvider for HidProvider {
             }
             if self.id == "razer" && [0x555, 0x556, 0x583].contains(&d.pid) && self.pa_accepted {
                 self.razer_cache.insert(
-                    format!("{:04x}:{}", d.pid, trusted_identity(i)),
+                    format!("{:04x}:{}", d.pid, receiver_key(i)),
                     (i.path.clone(), 0),
                 );
                 if result.as_ref().is_ok_and(|r| r.is_none()) {
@@ -2738,13 +3029,7 @@ impl BatteryProvider for HidProvider {
                                 );
                             }
                         }
-                        r.kind = "gamepad".into();
-                        r.via = if is_bluetooth(&i.path) {
-                            "bluetooth"
-                        } else {
-                            "usb"
-                        }
-                        .into();
+                        identify_controller(&mut r, i);
                         seen.insert(key);
                         output.push(r);
                     } else if self.id == "barracuda" {
@@ -2774,6 +3059,7 @@ impl BatteryProvider for HidProvider {
                 }
                 Err(e) => {
                     self.log(e.to_string());
+                    UnreadableCollection::record(&mut self.unreadable, &key, i);
                     errors.push(e)
                 }
             }
@@ -2799,7 +3085,12 @@ impl BatteryProvider for HidProvider {
                     let key = format!("razer:{:04x}:{}", device.pid, trusted_identity(info));
                     if (errors.is_empty() || !output.is_empty())
                         && !output.iter().any(|r| r.key == key)
-                        && self.last.get(&key).is_some_and(|r| r.kind == "mouse")
+                        && self.last.get(&key).is_some_and(|r| {
+                            r.kind == "mouse"
+                                && r.container == info.container
+                                && r.serial.as_deref()
+                                    == (!info.serial.is_empty()).then_some(info.serial.as_str())
+                        })
                         && let Some(reading) = self.cached(&key, c.clock.monotonic())
                     {
                         output.push(reading);
@@ -2826,6 +3117,9 @@ impl BatteryProvider for HidProvider {
                 self.wl_backoff.0
             };
         }
+        // A responding collection for the same device takes precedence, including
+        // a protocol-confirmed empty receiver slot.
+        self.unreadable.retain(|f| !seen.contains(&f.key));
         match community_result {
             Ok(readings) => output.extend(readings),
             Err(error) => errors.push(error),
@@ -3258,7 +3552,12 @@ mod cache_retention_tests {
             let key = format!("invented-{index}");
             provider.logitech_identity.insert(
                 key.clone(),
-                ("Invented".into(), "mouse".into(), key.clone()),
+                LogitechIdentity {
+                    name: "Invented".into(),
+                    kind: "mouse".into(),
+                    unit: [1; 4],
+                    direct_verified: false,
+                },
             );
             provider.logitech_asleep.insert(key.clone());
             provider.logitech_slots.insert(key.clone(), key.clone());

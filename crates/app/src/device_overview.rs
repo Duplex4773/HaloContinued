@@ -52,7 +52,7 @@ fn boost_menu_rates(
         .collect()
 }
 
-fn card_battery_value(reading: &Reading) -> String {
+pub(super) fn card_battery_value(reading: &Reading) -> String {
     reading.level.map_or_else(
         || "—".into(),
         |level| {
@@ -383,7 +383,7 @@ impl State {
             );
             self.label(
                 472,
-                "Battery alerts are turned off in Settings.",
+                "Pop-up notifications are turned off in Settings.",
                 190,
                 112,
                 500,

@@ -166,6 +166,12 @@ fn discharging(reading: &Reading) -> bool {
 }
 
 impl InsightsBuilder {
+    /// Whether the next observation starts a different physical battery.
+    pub fn replaces_device(&self, reading: &Reading) -> bool {
+        self.previous
+            .as_ref()
+            .is_some_and(|previous| !reading.same_battery_identity(&previous.reading))
+    }
     /// Earliest event context belonging to the latest observed physical unit.
     pub fn identity_since(&self) -> Option<i64> {
         self.identity_since
@@ -243,11 +249,7 @@ impl InsightsBuilder {
             }
         });
         let reading = &observation.reading;
-        if self
-            .previous
-            .as_ref()
-            .is_some_and(|previous| !reading.same_battery_identity(&previous.reading))
-        {
+        if self.replaces_device(reading) {
             // Preserve historical sessions/totals, but do not lend their drain
             // model or recent-rate mix to a different physical battery.
             let since = self.recent.since.max(reading.timestamp);

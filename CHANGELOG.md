@@ -1,3 +1,28 @@
+# Unreleased changes since v1.1.8
+
+Provisional changelog for the `main` branch.
+
+## Device identity and recovery
+
+- Startup polling restoration now checks the Windows device identity saved when you applied the rate. If you saved a mouse rate in v1.1.8, apply it once on your usual connection to enable restoration for that connection.
+- Razer mice that report the same serial keep separate history and tray icons after a restart, even when only one is plugged in. A replacement Logitech G535 receiver with a different HID serial also gets its own battery history.
+- Logitech receivers recheck which device occupies each slot. If one receiver or headset battery interface stops responding, Halo Continued keeps its last reading marked stale while other devices continue updating. Game boost and Battery saver can resume restoration when the matching mouse responds again.
+- Disabling Bluetooth monitoring releases its connections. Enabling it again starts fresh discovery. Sleeping devices can retain their last known percentage, and the tray only shows charging when the connection confirms it.
+
+## History, Insights and alerts
+
+- The History graph keeps the last confirmed point of a flat stretch before drawing a battery drop. Calendar history also preserves sleep and wake transitions when fitting many readings onto the screen.
+- History and battery-life estimates start again when a different physical device reuses a receiver slot. Insights excludes ambiguous boost activity when two sessions share a timestamp. Repeated checks of an unchanged Bluetooth reading no longer add usage evidence.
+- Insights marks approximate battery percentages consistently with Devices. The dashboard and tray discard polling messages and late replies from a device that has been replaced.
+- Devices sharing a receiver keep independent low-battery sound reminders. Settings also makes it clearer when notification pop-ups are disabled.
+
+## Resource use and packaging
+
+- Silent Logitech receivers use fewer battery-report reads while keeping the existing timeouts. In a simulated HID++ 1.0 slot test, the same 1.2-second timeout took 72 reads, down from 480.
+- In a simulation with eight devices and one low battery, 100 refreshes made 1,800 allocations with sounds enabled, down from 14,100. The sound-disabled run also made 1,800.
+- Settings creates the brand checkboxes when needed. Bursts of device updates share a Windows fullscreen check, and unchanged diagnostics avoid unnecessary allocations.
+- The packaged README links to the matching version of the changelog and device catalog. Packaging tests check that local links resolve.
+
 # Halo Continued 1.1.8
 
 Released 20 November 2026 for Windows 11 x64.

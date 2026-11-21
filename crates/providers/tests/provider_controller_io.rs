@@ -513,6 +513,38 @@ fn playstation_normalized_usb_collections_preserve_identity_without_blank_serial
 }
 
 #[test]
+fn controller_fallbacks_keep_identity_and_transport_when_the_battery_is_unreadable() {
+    for (family, pid, path, full, pending) in [
+        (
+            "playstation",
+            0xce6,
+            BT,
+            ps(true, true, 7),
+            vec![rd(&basic())],
+        ),
+        ("eightbitdo", 0x6006, EBT, eight(1, 75), empty(8)),
+    ] {
+        let mut info = d(family, pid, path, "synthetic-pad");
+        info.container = Some("synthetic-container".into());
+        let readable = FakeHid::new(vec![info.clone()], vec![rd(&full)]);
+        let known = poll(family, &readable).remove(0);
+        assert!(known.level.is_some());
+        readable.done();
+        for hid in [
+            FakeHid::new(vec![info.clone()], vec![]).fail_open(path, "busy"),
+            FakeHid::new(vec![info], pending),
+        ] {
+            let waiting = poll(family, &hid).remove(0);
+            assert_eq!(waiting.level, None);
+            assert_eq!(waiting.current_charging(), None);
+            assert!(known.same_battery_identity(&waiting));
+            assert_eq!(known.via, waiting.via);
+            hid.done();
+        }
+    }
+}
+
+#[test]
 fn controller_read_errors_preserve_transport_diagnostics() {
     for (family, pid, path) in [("playstation", 0x0ce6, BT), ("eightbitdo", 0x6006, EBT)] {
         let hid = FakeHid::new(

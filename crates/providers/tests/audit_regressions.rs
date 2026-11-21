@@ -41,6 +41,24 @@ fn removed_receiver_does_not_borrow_another_receivers_presence() {
     assert_ne!(first[0].key, second[0].key);
 }
 #[test]
+fn g535_replacement_on_the_same_port_cannot_inherit_history() {
+    let mut provider = HidProvider::new("logitech");
+    let mut previous = None;
+    for serial in ["receiver-one", "receiver-two"] {
+        provider.invalidate();
+        let mut info = headset("fixed-port");
+        info.serial = serial.into();
+        let hid = FakeHid::new(vec![info], battery_steps());
+        let row = read(&mut provider, &hid).unwrap().remove(0);
+        if let Some(old) = previous {
+            assert!(!row.same_battery_identity(&old));
+            assert_ne!(old.key, row.key);
+        }
+        previous = Some(row);
+        hid.done();
+    }
+}
+#[test]
 fn access_failure_is_not_successful_empty_discovery() {
     let device = headset("A");
     let hid = FakeHid::new(vec![device.clone()], vec![]).fail_open(device.path, "access denied");

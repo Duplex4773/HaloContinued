@@ -23,6 +23,24 @@ fn learned() -> Estimator {
 }
 
 #[test]
+fn returning_after_expiry_matches_restart_without_pruning_active_devices() {
+    let mut live = learned();
+    let last = live.devices["device"].seen;
+    let cutoff = last + 60 * 86400;
+    assert!(!live.prune_expired(cutoff - 1));
+    let mut reopened = Estimator::from_value(serde_json::to_value(&live).unwrap(), cutoff);
+    let mut pruned = live.clone();
+    assert!(pruned.prune_expired(cutoff));
+    assert!(pruned.devices.is_empty());
+    live.pause("device");
+    for fit in [&mut live, &mut reopened] {
+        record_at(fit, 85, cutoff);
+        assert_eq!(fit.seconds_left("device", Some(85)), None);
+        assert_eq!(fit.devices["device"].samples, [(0.0, 85)]);
+    }
+}
+
+#[test]
 fn unobserved_loss_preserves_learned_slope_without_counting_boundary_time() {
     for boundary in ["pause", "gap", "restart", "backwards", "unknown"] {
         let mut estimator = learned();

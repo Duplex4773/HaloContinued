@@ -6,7 +6,19 @@ pub(super) const SETTINGS_HEIGHT: i32 = 930;
 pub(super) const ADVANCED_HEIGHT: i32 = 1490;
 
 impl State {
-    pub(super) fn build_settings(&mut self) {
+    pub(super) fn create_brand_controls(&mut self) {
+        for (i, p) in providers().iter().enumerate() {
+            self.check(
+                300 + i as u16,
+                provider_label(p),
+                self.settings.enabled(p),
+                20 + (i as i32 % 4) * 184,
+                966 + (i as i32 / 4) * 28,
+                180,
+            );
+        }
+    }
+    pub(super) fn build_settings(&mut self, restore_brand_draft: bool) {
         let advanced_y = |y| y + settings_provider_tail(providers().len());
         let value = serde_json::to_value(&self.settings).unwrap_or_default();
         self.heading(221, "Settings", 20, 76, PAGE_WIDTH);
@@ -130,16 +142,10 @@ impl State {
         );
         self.control(216, w!("STATIC"), "Change polling rate, sensitivity (DPI) and sleep time for supported devices on Devices.", WINDOW_STYLE::default(), 36, 806, PAGE_WIDTH - 32, 40);
         self.heading(207, "Device brands to monitor", 20, 932, PAGE_WIDTH);
-        for (i, p) in providers().iter().enumerate() {
-            self.check(
-                300 + i as u16,
-                provider_label(p),
-                self.settings.enabled(p),
-                20 + (i as i32 % 4) * 184,
-                966 + (i as i32 / 4) * 28,
-                180,
-            );
+        if self.more_options || restore_brand_draft {
+            self.create_brand_controls();
         }
+
         self.button(
             212,
             if self.more_options {

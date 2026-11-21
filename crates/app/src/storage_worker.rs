@@ -217,6 +217,11 @@ pub(super) fn run(
 ) {
     let path = folder.join("history.db");
     let mut database = Store::open(&path);
+    if let Ok(db) = &database
+        && let Err(error) = db.restore_receiver_markers(&folder)
+    {
+        let _ = events.send(Event::Error(format!("Receiver identity history: {error}")));
+    }
     let initial = database
         .as_ref()
         .ok()

@@ -221,6 +221,44 @@ fn reused_keys_do_not_mix_previous_units_drain_or_boost_events_and_keep_raw_hist
 }
 
 #[test]
+fn boost_at_shared_receiver_timestamp_requires_unambiguous_session_ownership() {
+    use hb_core::{PollingActivity, PollingActivityKind};
+    for new_session in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&directory.path().join("history.db")).unwrap();
+        for (ts, serial, session, hz) in [
+            (60, "A", 1, 4000),
+            (120, "A", 1, 4000),
+            (120, "B", new_session, 4000),
+            (180, "B", new_session, 4000),
+        ] {
+            let mut row = observation(ts, 80, Some(hz), Some(session));
+            row.reading.serial = Some(serial.into());
+            store.record_usage(&row).unwrap();
+        }
+        store
+            .record_polling_activity(&PollingActivity {
+                key: "synthetic-a".into(),
+                timestamp: 120,
+                session: 1,
+                sequence: 1,
+                kind: PollingActivityKind::Boost,
+                rate: PollingRate::try_from(4000).unwrap(),
+                previous: PollingRate::try_from(2000).ok(),
+            })
+            .unwrap();
+        store.flush().unwrap();
+        let insights = store.query_insights("synthetic-a", 180).unwrap();
+        assert_eq!(insights.recent.boost_sessions, 0);
+        assert_eq!(insights.recent.boost_seconds, 0);
+        assert_ne!(
+            insights.recent.normal_rate,
+            PollingRate::try_from(2000).ok()
+        );
+    }
+}
+
+#[test]
 fn linked_activity_uses_insertion_order_when_event_timestamps_match() {
     use hb_core::{PollingActivity, PollingActivityKind};
     for last_boost in [false, true] {

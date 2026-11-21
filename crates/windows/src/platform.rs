@@ -193,8 +193,7 @@ impl Drop for Link {
     }
 }
 struct CachedLevel {
-    level: u8,
-    observed: i64,
+    sample: Option<(u8, i64)>,
     container: Option<String>,
 }
 #[derive(Default)]
@@ -290,7 +289,7 @@ impl BluetoothProvider {
         }
         Ok(())
     }
-    fn battery_level(&mut self, mac: &str, node: &Node, now: i64) -> Option<(u8, i64)> {
+    fn has_battery_evidence(&mut self, mac: &str, node: &Node) -> bool {
         // Never lend a Windows container's last reading to a replacement.
         if self
             .levels
@@ -301,27 +300,39 @@ impl BluetoothProvider {
             self.links.remove(mac);
             self.link_status.remove(mac);
         }
-        if let Some(level) = node.level {
-            if let Some(cached) = self.levels.get_mut(mac) {
-                cached.level = level;
-                cached.observed = now;
-            } else {
+        if node.level.is_some() {
+            if !self.levels.contains_key(mac) {
+                // Remember which container owns a newly opened link, even if
+                // its first connection check fails. No level is confirmed yet.
                 self.levels.insert(
                     mac.into(),
                     CachedLevel {
-                        level,
-                        observed: now,
+                        sample: None,
                         container: node.container.clone(),
                     },
                 );
             }
+            return true;
         }
-        if let Some(cached) = self.levels.get(mac) {
-            return Some((cached.level, cached.observed));
+        if self
+            .levels
+            .get(mac)
+            .is_some_and(|cached| cached.sample.is_some())
+        {
+            return true;
         }
         self.links.remove(mac);
         self.link_status.remove(mac);
-        None
+        false
+    }
+
+    // Only called once Windows has confirmed this connection.
+    fn battery_level(&mut self, mac: &str, node: &Node, now: i64) -> Option<(u8, i64)> {
+        let cached = self.levels.get_mut(mac)?;
+        if let Some(level) = node.level {
+            cached.sample = Some((level, now));
+        }
+        cached.sample
     }
     fn snapshot(&mut self, c: &PollContext<'_>) -> PollResult {
         let set = DeviceSet(
@@ -424,9 +435,9 @@ impl BluetoothProvider {
         self.diagnostics.clear();
         for (mac, node) in nodes {
             // Nodes without battery evidence do not need a WinRT link.
-            let Some((level, observed)) = self.battery_level(&mac, &node, clock.unix()) else {
+            if !self.has_battery_evidence(&mac, &node) {
                 continue;
-            };
+            }
             let key = format!("bluetooth:{mac}");
             match bluetooth_connection(native_connection(self, &mac, &node), node.fallback) {
                 Ok(connected) => {
@@ -450,6 +461,9 @@ impl BluetoothProvider {
                     continue;
                 }
             }
+            let Some((level, observed)) = self.battery_level(&mac, &node, clock.unix()) else {
+                continue;
+            };
             let name = if !node.root_name.is_empty() {
                 node.root_name
             } else if !node.name.is_empty() {
@@ -490,6 +504,28 @@ impl BatteryProvider for BluetoothProvider {
     fn invalidate(&mut self) {
         BluetoothProvider::invalidate(self);
     }
+    fn deactivate(&mut self) {
+        // Dropping each link unregisters its event handler and closes the device.
+        // Keep only container-bound last levels for a sleeping device on resume.
+        if !self.links.is_empty() {
+            // The state owner can receive a completed WinRT provider outside
+            // the worker apartment. Close its agile devices in a COM apartment.
+            use windows::Win32::System::Com::{
+                COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize,
+            };
+            let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            self.links.clear();
+            if initialized {
+                unsafe { CoUninitialize() };
+            }
+        }
+        self.link_status.clear();
+        self.readings = Vec::new();
+        self.snapshot_error = None;
+        self.retries.clear();
+        self.diagnostics.clear();
+        self.invalidate();
+    }
     fn next_poll_delay(&self) -> Option<Duration> {
         let discovery = self
             .retries
@@ -508,8 +544,8 @@ impl BatteryProvider for BluetoothProvider {
             discovery.min(Duration::from_secs(2))
         })
     }
-    fn diagnostics(&self) -> Vec<String> {
-        self.diagnostics.clone()
+    fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
     }
     fn poll(&mut self, _: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
         let now = c.clock.monotonic();
@@ -630,9 +666,6 @@ impl BatteryProvider for ControllerProvider {
     }
     fn id(&self) -> &'static str {
         "xinput"
-    }
-    fn diagnostics(&self) -> Vec<String> {
-        vec![]
     }
     fn poll(&mut self, hid: &dyn HidTransport, c: &PollContext<'_>) -> PollResult {
         if !c.active() {
@@ -762,6 +795,17 @@ fn single_vendor_controller(wgi_gamepads: usize, xinput_slots: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn connected_level(
+        provider: &mut BluetoothProvider,
+        mac: &str,
+        node: &Node,
+        now: i64,
+    ) -> Option<(u8, i64)> {
+        if !provider.has_battery_evidence(mac, node) {
+            return None;
+        }
+        provider.battery_level(mac, node, now)
+    }
     #[test]
     fn controller_transport_requires_evidence() {
         assert_eq!(controller_transport(Some(false), true), "usb");
@@ -777,7 +821,7 @@ mod tests {
             level,
             ..Default::default()
         };
-        let mut snapshot = |time, node| {
+        let mut snapshot = |time, node, connected| {
             struct At(i64);
             impl Clock for At {
                 fn unix(&self) -> i64 {
@@ -794,16 +838,17 @@ mod tests {
                 .snapshot_from_nodes(
                     BTreeMap::from([("unit".into(), node)]),
                     &At(time),
-                    |_, _, _| Some(true),
+                    |_, _, _| Some(connected),
                 )
                 .unwrap()
         };
-        assert_eq!(snapshot(100, make("A", Some(75)))[0].timestamp, 100);
-        let cached = snapshot(160, make("A", None));
+        assert_eq!(snapshot(100, make("A", Some(75)), true)[0].timestamp, 100);
+        assert!(snapshot(130, make("A", Some(80)), false).is_empty());
+        let cached = snapshot(160, make("A", None), true);
         assert_eq!(cached[0].connection, Connection::ConnectedLastKnown);
         assert_eq!((cached[0].timestamp, cached[0].level), (100, Some(75)));
         assert!(!cached[0].online());
-        assert!(snapshot(220, make("B", None)).is_empty());
+        assert!(snapshot(220, make("B", None), true).is_empty());
         provider.complete_snapshot(Ok(vec![]), Duration::from_secs(220));
         provider.refresh_properties();
         assert!(provider.refresh_due(Duration::from_secs(222)));
@@ -829,15 +874,13 @@ mod tests {
             ..Default::default()
         };
         provider.link_status.insert("unrelated".into(), Some(true));
-        assert_eq!(
-            provider.battery_level("unrelated", &Node::default(), 0),
-            None
-        );
+        assert!(!provider.has_battery_evidence("unrelated", &Node::default()));
         assert!(provider.links.is_empty());
         assert!(provider.link_status.is_empty());
         assert_eq!(provider.next_poll_delay(), Some(Duration::from_secs(60)));
         assert_eq!(
-            provider.battery_level(
+            connected_level(
+                &mut provider,
                 "mouse",
                 &Node {
                     level: Some(42),
@@ -848,7 +891,7 @@ mod tests {
             Some((42, 100))
         );
         assert_eq!(
-            provider.battery_level("mouse", &Node::default(), 160),
+            connected_level(&mut provider, "mouse", &Node::default(), 160),
             Some((42, 100))
         );
     }
@@ -1004,7 +1047,8 @@ mod tests {
     #[test]
     fn bluetooth_level_cache_tracks_inventory_and_retains_sleeping_paired_devices() {
         let mut provider = BluetoothProvider::default();
-        provider.battery_level(
+        connected_level(
+            &mut provider,
             "sleeping-paired",
             &Node {
                 level: Some(75),
@@ -1012,7 +1056,8 @@ mod tests {
             },
             1,
         );
-        provider.battery_level(
+        connected_level(
+            &mut provider,
             "removed-pairing",
             &Node {
                 level: Some(40),
@@ -1023,14 +1068,12 @@ mod tests {
         let mut nodes = BTreeMap::new();
         nodes.insert("sleeping-paired".into(), Node::default());
         provider.retain_inventory(&nodes);
-        assert_eq!(
-            provider.levels.get("sleeping-paired").map(|c| c.level),
-            Some(75)
-        );
+        assert_eq!(provider.levels["sleeping-paired"].sample, Some((75, 1)));
         assert!(!provider.levels.contains_key("removed-pairing"));
         for index in 0..1000 {
             let mac = format!("new-pairing-{index}");
-            provider.battery_level(
+            connected_level(
+                &mut provider,
                 &mac,
                 &Node {
                     level: Some(50),
@@ -1043,7 +1086,7 @@ mod tests {
             provider.retain_inventory(&nodes);
             assert_eq!(provider.levels.len(), 2);
         }
-        assert_eq!(provider.levels["sleeping-paired"].level, 75);
+        assert_eq!(provider.levels["sleeping-paired"].sample, Some((75, 1)));
     }
     #[test]
     fn service_node_mac_and_boundaries() {
@@ -1179,6 +1222,18 @@ mod scheduling_tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].timestamp, 99);
         assert_eq!(p.next_poll_delay(), Some(Duration::from_secs(59)));
+    }
+    #[test]
+    fn deactivation_discards_connection_state_and_requires_fresh_discovery() {
+        let mut p = BluetoothProvider::default();
+        p.link_status.insert("device".into(), Some(true));
+        p.complete_snapshot(
+            Ok(vec![Reading::new("device", "Mouse", "bluetooth", 10)]),
+            Duration::from_secs(10),
+        );
+        p.deactivate();
+        assert!(p.link_status.is_empty() && p.readings.is_empty());
+        assert!(p.refresh_due(Duration::from_secs(11)));
     }
     #[test]
     fn empty_bluetooth_inventory_waits_for_discovery_and_keeps_arrival_retries() {
